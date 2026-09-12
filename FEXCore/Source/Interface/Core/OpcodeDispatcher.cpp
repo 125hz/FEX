@@ -110,7 +110,10 @@ void OpDispatchBuilder::SyscallOp(OpcodeArgs, bool IsSyscallInst) {
 
 void OpDispatchBuilder::ThunkOp(OpcodeArgs) {
   const auto GPRSize = GetGPROpSize();
-  uint8_t* sha256 = (uint8_t*)(Op->PC + 2);
+  // MADEIRA: Op->PC is a guest RIP and the SHA256 literal lives in guest code immediately after the
+  // thunk opcode, so reading it is a guest read and needs the window. CTX->Config.GuestBase is 0 for
+  // every identity-mapped configuration, including all 64-bit modes.
+  uint8_t* sha256 = (uint8_t*)(CTX->Config.GuestBase + Op->PC + 2);
 
   if (Is64BitMode) {
     // x86-64 ABI puts the function argument in RDI

@@ -22,7 +22,32 @@ namespace FEX::Windows {
  */
 class InvalidationTracker {
 public:
-  InvalidationTracker(FEXCore::Context::Context& CTX, const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads);
+  // MADEIRA: address namespace.
+  //
+  // Every address this class stores, queries and hands to the OS (VirtualQuery,
+  // NtQueryVirtualMemory, NtProtectVirtualMemory) is a HOST address, because every one of its
+  // callers - wow64.dll's BTCpuNotifyMemory* callbacks, the exception path's fault address, and
+  // the image-map notifications - is already speaking host addresses, and because the interval
+  // bookkeeping has to line up with what the OS reports.
+  //
+  // FEXCore, by contrast, keys code invalidation, the lookup caches and executable-range queries
+  // on GUEST addresses. The conversion therefore happens at exactly two places:
+  //   - inside this class, at the handful of calls into FEXCore (InvalidateIntervalInternalLocked),
+  //     using GuestBase below;
+  //   - in the WoW64 module's SyscallHandler overrides, which take guest addresses from FEXCore,
+  //     add GuestBase on the way in and subtract it from anything returned.
+  // That satisfies the design's invariant that the FEXCore <-> InvalidationTracker *boundary* is in
+  // the guest namespace, without having to re-express any of the OS-facing logic.
+  //
+  // GuestBase is 0 for ARM64EC and for every identity-mapped configuration, making all of this a
+  // no-op there.
+  InvalidationTracker(FEXCore::Context::Context& CTX, const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads,
+                      uint64_t GuestBase = 0);
+
+  // Host address of guest address 0, or 0 when identity mapped.
+  uint64_t GetGuestBase() const {
+    return GuestBase;
+  }
   void HandleMemoryProtectionNotification(uint64_t Address, uint64_t Size, ULONG Prot);
   void HandleProcessExecuteFlagsChange(ULONG Flags);
   void HandleImageMap(std::string_view Name, uint64_t Address);
@@ -63,6 +88,7 @@ private:
   std::shared_mutex IntervalsLock;
   FEXCore::Context::Context& CTX;
   const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads;
+  const uint64_t GuestBase {0};
   bool SMCDetectionDisabled {false};                    // Protected by IntervalsLock
   bool DEPDisabled {false};                             // Protected by IntervalsLock
   FEXCore::IntervalList<uint64_t> DEPPromotedIntervals; // Protected by IntervalsLock

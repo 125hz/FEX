@@ -2375,6 +2375,14 @@ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState*
   }
   FEXCore::Utils::SpinWaitLock::UniqueSpinMutex lk(BPFutex, FEXCore::Utils::SpinWaitLock::adopt_lock);
 
+  // MADEIRA: every backpatch below re-encodes the faulting instruction keeping the SAME AddrReg and
+  // the SAME immediate, and every address this file handles is read straight out of GPRs[AddrReg].
+  // That is correct under the 32-bit guest window only because the JIT materialises the complete
+  // host address into a single base register before every atomic (see Arm64JITCore::GetGuestMemReg;
+  // the address register already holds GuestBase + EA at fault time, so nothing here may add the
+  // base again). If an atomic path is ever given a `[Xbase, Xoffset]` register-offset form - e.g.
+  // by folding the window base into the addressing mode instead of an explicit add - these
+  // rewrites would silently emit an instruction with a different effective address.
   if ((Instr & LDAXR_MASK) == LDAR_INST ||  // LDAR*
       (Instr & LDAXR_MASK) == LDAPR_INST) { // LDAPR*
     uint32_t LDR = LDR_INST;

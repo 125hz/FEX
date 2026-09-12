@@ -97,6 +97,10 @@ int rpm_cas_snapshot_take(struct rpm_cas_snapshot* out);
  * thread leaks callret entries; need to confirm WHICH thread leaks and
  * separate game-thread vs render-thread vs FMOD-worker activity). 4 thread
  * slots hashed by Frame pointer. */
+/* MADEIRA: ARM64EC-only, matching the reader in CompileBlock. The probe is keyed on hardcoded
+ * 64-bit guest RIPs and dereferences guest GPRs directly, neither of which is meaningful (or safe)
+ * in 32-bit mode under a guest window. */
+#ifdef ARCHITECTURE_arm64ec
 static volatile uint64_t g_madeira_hot_count[12] = {0,0,0,0,0,0,0,0,0,0,0,0};
 static volatile uint64_t g_madeira_max_alloc_size = 0;
 static volatile uint64_t g_madeira_last_str = 0;
@@ -115,6 +119,7 @@ static volatile uint64_t g_madeira_thr_crsp_max[4] = {0,0,0,0};
 static volatile uint64_t g_madeira_thr_crsp_last[4] = {0,0,0,0};
 static volatile uint64_t g_madeira_thr_count[4] = {0,0,0,0};
 static volatile uint64_t g_madeira_thr_last_rip[4] = {0,0,0,0};
+#endif // ARCHITECTURE_arm64ec
 
 /* iOS-Madeira 2026-05-18 low-noise CompileBlock instrumentation counters. */
 static volatile uint64_t g_cb_total = 0;
@@ -135,6 +140,15 @@ ContextImpl::ContextImpl(const FEXCore::HostFeatures& Features)
   if (!Config.Is64BitMode()) {
     // When operating in 32-bit mode, the virtual memory we care about is only the lower 32-bits.
     Config.VirtualMemSize = 1ULL << 32;
+
+    // MADEIRA: Resolve the guest window base. See Context.h for the invariants. Note that
+    // VirtualMemSize deliberately stays 4GiB: it describes the *guest* address space, which the
+    // window does not enlarge.
+    Config.GuestBase = Config.Guest32BaseOption();
+    LOGMAN_THROW_A_FMT((Config.GuestBase & (FEXCore::Utils::FEX_PAGE_SIZE - 1)) == 0, "GUEST32BASE must be page aligned");
+  } else {
+    // The 64-bit (and ARM64EC) path is always identity mapped.
+    Config.GuestBase = 0;
   }
 #ifdef FEX_IOS_HOST
   /* iOS-Madeira: shrink the per-thread LookupCache L2 page table from 128MB
@@ -791,7 +805,8 @@ static void IRDumper(FEXCore::Core::InternalThreadState* Thread, IR::IREmitter* 
 };
 
 bool ContextImpl::CheckIfBlockIsCacheable(FEXCore::Core::InternalThreadState& Thread, uint64_t GuestRIP, uint64_t MaxInst) {
-  return Thread.FrontendDecoder->CheckIfCacheable(Thread, reinterpret_cast<const uint8_t*>(GuestRIP), GuestRIP, MaxInst);
+  // MADEIRA: as in GenerateIR, the byte pointer is a host pointer and the RIP stays guest.
+  return Thread.FrontendDecoder->CheckIfCacheable(Thread, reinterpret_cast<const uint8_t*>(Config.GuestBase + GuestRIP), GuestRIP, MaxInst);
 }
 
 /* iOS-Madeira ml623: targeted IR capture (PassManager.cpp). FEX_MadeiraIRCapTarget is the
@@ -855,7 +870,10 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
 
   if (!HasCustomIR) {
     const uint8_t* GuestCode {};
-    GuestCode = reinterpret_cast<const uint8_t*>(GuestRIP);
+    // MADEIRA: instruction fetch reads from `GuestBase + RIP`. GuestRIP itself is passed through
+    // unchanged below - BeginFunction, the block info, the LookupCache and every downstream
+    // consumer key on the guest address, and only this byte pointer is a host pointer.
+    GuestCode = reinterpret_cast<const uint8_t*>(Config.GuestBase + GuestRIP);
 
     /* perf-silenced GenerateIR GuestCode log */
 
@@ -933,7 +951,9 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
 
 #ifdef ZYDIS_DISASSEMBLER
         if (FEXCore::Config::Get_X86DISASSEMBLE()) {
-          const uint8_t* InstBytes = reinterpret_cast<const uint8_t*>(InstAddress);
+          // MADEIRA: the byte pointer is a host pointer, but the runtime address Zydis uses to
+          // render RIP-relative operands must stay guest - same split as _ValidateCode.
+          const uint8_t* InstBytes = reinterpret_cast<const uint8_t*>(Config.GuestBase + InstAddress);
           ZydisDisassembledInstruction ZydisInst;
           if (ZYAN_SUCCESS(ZydisDisassembleIntel(ZydisMachineMode, InstAddress, InstBytes, DecodedInfo->InstSize, &ZydisInst))) {
             LogMan::Msg::IFmt("    {:#x}: {}", InstAddress, ZydisInst.text);
@@ -964,7 +984,10 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
         }
 
         if (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection) {
-          auto ExistingCodePtr = reinterpret_cast<uint8_t*>(Block.Entry + BlockInstructionsLength);
+          // MADEIRA: snapshotting the guest's current code bytes is a guest read, so it goes through
+          // the window. The address handed to _ValidateCode below stays guest (it is an entrypoint
+          // offset), and DEF_OP(ValidateCode) applies the window itself.
+          auto ExistingCodePtr = reinterpret_cast<uint8_t*>(Config.GuestBase + Block.Entry + BlockInstructionsLength);
           auto InstAddressReg = Thread->OpDispatcher->_EntrypointOffset(GPRSize, InstAddress - GuestRIP);
           std::array<uint8_t, 0x10> CodeOriginal;
           memcpy(CodeOriginal.data(), ExistingCodePtr, DecodedInfo->InstSize);
@@ -1254,6 +1277,7 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
 }
 
 #ifdef FEX_IOS_HOST
+#ifdef ARCHITECTURE_arm64ec
 /* iOS-Madeira ml306 (task #51): CallbackPtr entry-state capture buffer, defined in Dispatcher.cpp
  * and written by emitted code at CallbackPtr entry. Read by the [cb-entry] reporter below. */
 extern "C" uint64_t IosCbEntryLog[8];
@@ -1263,6 +1287,20 @@ extern "C" uint64_t IosJitReverseTranslate(uint64_t Addr);
 /* iOS-Madeira ml316: ExitToX64's FFS-bypass counters, defined in Module.cpp and written by
  * the bypass asm in Module.S. Reported below the same way as [cb-entry]. */
 extern "C" uint64_t IosFfsBypassLog[4];
+#else
+/* MADEIRA: the WoW64 module (libwow64fex.dll) is a plain aarch64 PE. It has no Module.S, no EC
+ * entry thunks and no FFS bypass path, so the three symbols above simply do not exist in that
+ * link. Provide zeroed storage rather than sprinkling a second guard around every use: the
+ * reporters below compare against a counter that nothing increments, so they never fire. This is
+ * "the event genuinely cannot happen here", not a silenced diagnostic. */
+static uint64_t IosCbEntryLog[8] {};
+static uint64_t IosFfsBypassLog[4] {};
+static inline uint64_t IosJitReverseTranslate(uint64_t Addr) {
+  /* No PE-image-to-pool alias table in the WoW64 module: guest images are mapped normally, and the
+   * only alias this module has is the JIT code pool's RX/RW pair, which is not a guest address. */
+  return Addr;
+}
+#endif
 #endif
 
 #ifdef FEX_IOS_HOST
@@ -1341,7 +1379,10 @@ static void IosMonoTryActivate(ContextImpl* CTX, FEXCore::Core::InternalThreadSt
     return;
   }
   static constexpr uint8_t XChgOp = 0x87;
-  const uint8_t* Code = reinterpret_cast<const uint8_t*>(InsnRIP);
+  // MADEIRA: ios_fex_rip_from_hostpc returns a GUEST rip, so reading the opcode byte at it is a
+  // guest read. BlockEntry below stays guest - it is a MarkMonoBackpatcherBlock /
+  // InvalidateGuestCodeRange key, not a pointer.
+  const uint8_t* Code = reinterpret_cast<const uint8_t*>(CTX->Config.GuestBase + InsnRIP);
   if (Code[0] != XChgOp && Code[1] != XChgOp) {
     LogMan::Msg::EFmt("[mono-bridge] ml648 REJECT: not an XCHG at {:#x} ({:#x} {:#x})", InsnRIP, Code[0], Code[1]);
     return;
@@ -1421,6 +1462,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
    * reached via its x64 fast-forward sequence -- preserves the x4/x5 varargs contract that
    * the emulation round trip destroys; see Module.S). Same change-detection pattern as
    * [cb-entry] below: CompileBlock runs often enough to notice promptly. */
+#ifdef FEX_IOS_HOST
   {
     static uint64_t FfsLastCount = 0;
     static uint32_t FfsReports = 0;
@@ -1447,6 +1489,8 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
                         IosCbEntryLog[4], IosCbEntryLog[5], IosCbEntryLog[7]);
     }
   }
+
+#endif
 
   /* iOS-Madeira: refuse to compile obviously-invalid guest RIPs. After a
    * NULL-vtable virtual call (`call [rax+8]` with rax=0), control flow
@@ -1537,7 +1581,15 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
    * as "pool" produced 17 false positives. IsAddressInCodeBuffer is the exact discriminator that
    * was missing -- FEX knows its own code-buffer bounds, so a guest RIP inside them is
    * unambiguously a host-PC leak with no possibility of a guest-image false positive. */
-  const bool RIPInFEXCodeBuffer = IsAddressInCodeBuffer(Thread, GuestRIP);
+  /* MADEIRA: IsAddressInCodeBuffer compares against HOST code-buffer bounds, so a guest RIP has to
+   * be lifted into the host namespace for the comparison to mean anything. Under a guest window a
+   * raw guest RIP is always below 4GiB and so could never fall inside a code buffer - the probe
+   * would silently stop catching the host-PC leak it exists for.
+   *
+   * The 0x7400000000 band test below deliberately stays on the raw GuestRIP: that one asks "is this
+   * value obviously a host address that leaked into a guest RIP field?", which is a question about
+   * the un-based value. */
+  const bool RIPInFEXCodeBuffer = IsAddressInCodeBuffer(Thread, Config.GuestBase + GuestRIP);
 
   /* iOS-Madeira ml300 (task #52): ALSO catch pool MODULE-COPY addresses, not just FEX's code buffer.
    *
@@ -1918,6 +1970,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
    * block dispatch, not just hot RIPs). 4-slot hash table keyed by Frame
    * pointer (unique per FEX thread). Identifies WHICH thread is leaking
    * callret entries vs healthy. */
+  /* MADEIRA: ARM64EC-only, together with the HOTRIP probe below that reports it - see the note on
+   * the g_madeira_* globals at the top of this file. */
+#ifdef ARCHITECTURE_arm64ec
   {
     uintptr_t fk = reinterpret_cast<uintptr_t>(Frame);
     int slot = (int)((fk >> 6) & 3);
@@ -1940,6 +1995,12 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
    * initialization, which appears to trip a stack-cookie check on
    * ARM64EC mingw. POD types only — no constructors. Atomicity isn't
    * critical for telemetry; occasional torn reads are fine. */
+  /* MADEIRA: ARM64EC-only. Two reasons, both hard:
+   *  - it is keyed on hardcoded 64-bit guest RIPs (0x140006fe6, fmod at 0xeaa1d0000), so it can
+   *    never match in 32-bit mode, and
+   *  - it dereferences guest register values (RBX/RCX below) directly as host pointers, which is
+   *    exactly what the 32-bit guest window forbids.
+   * It also pulls in time(), which the WoW64 module's -nostdlib link does not provide. */
   {
     /* RIPs depend on FMOD's mapped base (0xeaa1d0000 in current runs).
      * The two critsection wrappers GPT identified live at fmod+0xba27a
@@ -2037,6 +2098,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
       }
     }
   }
+#endif // ARCHITECTURE_arm64ec
 
   static_cast<ContextImpl*>(Thread->CTX)->SyscallHandler->PreCompile();
 
@@ -2370,7 +2432,9 @@ void ContextImpl::MonoBackpatcherWrite(FEXCore::Core::CpuStateFrame* Frame, uint
   {
     auto lk = GuardSignalDeferringSection(CTX->CodeInvalidationMutex, Thread);
 
-    uint64_t Dest = Address;
+    // MADEIRA: `Address` is a guest address - it is what InvalidateGuestCodeRange below is keyed on -
+    // so the window has to be applied for the dereference and only for the dereference.
+    uint64_t Dest = Address + CTX->Config.GuestBase;
 #ifdef FEX_IOS_HOST
     /* ml648: THE STORE MUST GO TO THE WRITABLE ALIAS.
      *
@@ -2382,7 +2446,9 @@ void ContextImpl::MonoBackpatcherWrite(FEXCore::Core::CpuStateFrame* Frame, uint
      *
      * A miss is counted and falls through to the direct store, which faults and
      * is emulated as before: degraded, never wrong. */
-    const uint64_t RW = IosMonoResolveRW(Address, Size);
+    // The alias table is keyed by the address actually mapped in this process, i.e. the host
+    // address. Identical to `Address` for every identity-mapped configuration.
+    const uint64_t RW = IosMonoResolveRW(Dest, Size);
     if (RW) {
       Dest = RW;
     }

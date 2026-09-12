@@ -61,12 +61,29 @@ FEX_DEFAULT_VISIBILITY void ClearHooks();
 extern "C" {
 extern uintptr_t ios_fex_band_base;
 extern uintptr_t ios_fex_band_end;
+/* MADEIRA: the dual-mapped JIT pool's RX range; defined next to the band in rpmalloc.c and
+ * published by the CPU module at process init. Zero until then. See the check in the Execute
+ * path below. */
+extern uintptr_t ios_fex_jit_pool_rx;
+extern uintptr_t ios_fex_jit_pool_end;
 }
 
 inline void* VirtualAlloc(void* Base, size_t Size, bool Execute = false, bool Commit = true) {
   // Allocate top-down to avoid polluting the lower VA space, as even on 64-bit some programs (i.e. LuaJIT) require allocations below 4GB.
   DWORD Flags = (Commit ? MEM_COMMIT : 0) | MEM_RESERVE | MEM_TOP_DOWN;
-#ifdef ARCHITECTURE_arm64ec
+  /* MADEIRA: the iOS WoW64 CPU module (xtajit.dll) is an ordinary aarch64 PE, so it does not
+   * define ARCHITECTURE_arm64ec - but it runs in the same process, with the same 4 GiB __PAGEZERO,
+   * the same guest/host VA bands and the same dual-mapped JIT pool as the ARM64EC module, and it
+   * applies the same FEXCore::DualMap::WriteOffset to every JIT write (JIT.cpp, Dispatcher.cpp,
+   * both gated on FEX_IOS_HOST alone). Gating the *allocation* side on ARCHITECTURE_arm64ec while
+   * the *write* side is gated on FEX_IOS_HOST is exactly what killed the SIXTH DEVICE RUN: the
+   * dispatcher's 16 KiB code buffer came from a plain top-down VirtualAlloc in the furniture band
+   * (0x70ff6b0000), the first emitted instruction was written to buffer+WriteOffset
+   * (0xdfe2f38000), and that address is not mapped at all.
+   *
+   * So select this path for the iOS host build too. Linux and plain Windows (no FEX_IOS_HOST) are
+   * untouched, and the ARM64EC iOS build reaches the same code it did before. */
+#if defined(ARCHITECTURE_arm64ec) || defined(FEX_IOS_HOST)
 #ifdef FEX_IOS_HOST
   /* iOS-Madeira ml321: keep FEX's host structures OUT of the guest VA band.
    *
@@ -129,8 +146,34 @@ inline void* VirtualAlloc(void* Base, size_t Size, bool Execute = false, bool Co
     Parameter.Type = MemExtendedParameterAttributeFlags;
     Parameter.ULong64 = MEM_EXTENDED_PARAMETER_EC_CODE;
   };
-  return ::VirtualAlloc2(nullptr, Base, Size, Flags, Execute ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE, Execute ? &Parameter : nullptr,
-                         Execute ? 1 : 0);
+  void* Ret = ::VirtualAlloc2(nullptr, Base, Size, Flags, Execute ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE,
+                              Execute ? &Parameter : nullptr, Execute ? 1 : 0);
+#ifdef FEX_IOS_HOST
+  /* MADEIRA: an executable allocation that is not inside the JIT pool is unusable, and silently so.
+   *
+   * The EC_CODE attribute above is what makes ntdll-unix carve this from the pool tail
+   * (virtual_ios.c NtAllocateVirtualMemoryEx). If that carve is ever skipped - a missing attribute,
+   * a pool that was never published, a caller that supplied its own base - the generic path hands
+   * back ordinary band memory instead. That memory is not executable on iOS (StikDebug is gone by
+   * then) AND its `+ WriteOffset` alias does not exist, so the first emit stores into nothing. Both
+   * halves of the invariant are checked here, at the one place every code buffer comes from:
+   * everything the emitter writes is `pool RX + WriteOffset`, everything the dispatcher runs is
+   * pool RX.
+   *
+   * Refuse rather than degrade: CodeBuffer's ctor already halves down and then forces a
+   * recognisable fault, which is a diagnosable failure instead of a wild store. */
+  if (Execute && Ret && ios_fex_jit_pool_rx) {
+    const uintptr_t Addr = reinterpret_cast<uintptr_t>(Ret);
+    if (Addr < ios_fex_jit_pool_rx || Addr + Size > ios_fex_jit_pool_end) {
+      LogMan::Msg::EFmt("[jit-pool] EXEC ALLOC OUTSIDE POOL: [{:#x}, {:#x}) is not in [{:#x}, {:#x}) - refusing, because every "
+                        "emitter write to it would land at +WriteOffset in unmapped memory",
+                        Addr, Addr + Size, ios_fex_jit_pool_rx, ios_fex_jit_pool_end);
+      ::VirtualFree(Ret, 0, MEM_RELEASE);
+      return nullptr;
+    }
+  }
+#endif
+  return Ret;
 #else
   return ::VirtualAlloc(Base, Size, Flags, Execute ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE);
 #endif

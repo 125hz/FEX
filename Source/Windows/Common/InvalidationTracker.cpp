@@ -25,9 +25,11 @@ extern "C" void ios_fex_mono_arm(uint64_t Base, uint64_t End);
 #endif
 
 namespace FEX::Windows {
-InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX, const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads)
+InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX,
+                                         const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads, uint64_t GuestBase)
   : CTX {CTX}
-  , Threads {Threads} {
+  , Threads {Threads}
+  , GuestBase {GuestBase} {
   FEX_CONFIG_OPT(SMCChecks, SMCCHECKS);
   SMCDetectionDisabled = (SMCChecks == FEXCore::Config::CONFIG_SMC_NONE);
 
@@ -454,7 +456,12 @@ void InvalidationTracker::DetectMonoBackpatcherBlock(FEXCore::Core::InternalThre
     return;
   }
 
-  uint64_t RIP = CTX.RestoreRIPFromHostPC(Thread, HostPc);
+  // MADEIRA: RestoreRIPFromHostPC returns a GUEST rip, while MonoBase/MonoEnd come from
+  // HandleImageMap and are therefore HOST addresses (see the namespace note in the header). Lift
+  // the RIP into the host namespace for the module-range test and for the code reads below; the
+  // BlockEntry used further down stays guest, because it is a FEXCore invalidation key.
+  const uint64_t GuestRIP = CTX.RestoreRIPFromHostPC(Thread, HostPc);
+  const uint64_t RIP = GuestRIP ? GuestRIP + GuestBase : 0;
   if (!RIP || RIP < MonoBase || RIP >= MonoEnd) {
     return;
   }
@@ -481,10 +488,11 @@ void InvalidationTracker::DetectMonoBackpatcherBlock(FEXCore::Core::InternalThre
     if (!Reported) {
       Reported = true;
       const auto* Bytes = reinterpret_cast<const uint8_t*>(RIP);
+      // MADEIRA: BlockEntry is guest, MonoBase is host, so lift the block entry for the RVA.
       LogMan::Msg::EFmt("[mono-site] ml712 FIRST detect rip={:#x} (mono+{:#x}) block={:#x} (mono+{:#x}) "
                         "bytes={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
-                        RIP, RIP - MonoBase, BlockEntry, BlockEntry - MonoBase, Bytes[0], Bytes[1], Bytes[2], Bytes[3],
-                        Bytes[4], Bytes[5], Bytes[6], Bytes[7]);
+                        RIP, RIP - MonoBase, BlockEntry, BlockEntry + GuestBase - MonoBase, Bytes[0], Bytes[1], Bytes[2],
+                        Bytes[3], Bytes[4], Bytes[5], Bytes[6], Bytes[7]);
     }
   }
 #ifndef FEX_IOS_HOST
@@ -499,7 +507,8 @@ void InvalidationTracker::DetectMonoBackpatcherBlock(FEXCore::Core::InternalThre
     std::scoped_lock CodeLock(CTX.GetCodeInvalidationMutex());
     CTX.MarkMonoBackpatcherBlock(BlockEntry);
   }
-  InvalidateAlignedInterval(BlockEntry, FEXCore::Utils::FEX_PAGE_SIZE, false);
+  // MADEIRA: InvalidateAlignedInterval takes host addresses like the rest of this class.
+  InvalidateAlignedInterval(BlockEntry + GuestBase, FEXCore::Utils::FEX_PAGE_SIZE, false);
 }
 
 void InvalidationTracker::DisableSMCDetection() {
@@ -542,6 +551,19 @@ void InvalidationTracker::InvalidateIntervalInternal(uint64_t Address, uint64_t 
 
 void InvalidationTracker::InvalidateIntervalInternalLocked(uint64_t Address, uint64_t Size) {
   // NOTE: This assumes CodeInvalidationMutex is locked by the caller
+  //
+  // MADEIRA: this is the boundary. `Address` is a host address (see the namespace note in the
+  // header); FEXCore's code buffers and per-thread lookup caches are keyed on guest addresses, so
+  // convert here. A host address outside the window has no guest counterpart and cannot name guest
+  // code, so there is nothing to invalidate - this is how the FEX code pool's own addresses, which
+  // also flow through the BTCpuNotifyMemory* callbacks, get filtered out.
+  if (GuestBase) {
+    if (Address < GuestBase || (Address - GuestBase) >= (1ULL << 32)) {
+      return;
+    }
+    Address -= GuestBase;
+  }
+
   CTX.InvalidateCodeBuffersCodeRange(Address, Size);
   for (auto Thread : Threads) {
     CTX.InvalidateThreadCachedCodeRange(Thread.second, Address, Size);

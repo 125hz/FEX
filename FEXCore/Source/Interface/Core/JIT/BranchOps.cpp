@@ -511,7 +511,11 @@ DEF_OP(Thunk) {
 DEF_OP(ValidateCode) {
   auto Op = IROp->C<IR::IROp_ValidateCode>();
   auto OldCode = Op->CodeOriginal.data();
-  auto Base = GetReg(Op->Header.Args[0]).X();
+  // MADEIRA: this reads guest code bytes to compare against the recorded originals, so it is a
+  // guest load like any other and needs the window applied. TMP1/TMP2 are consumed by the
+  // comparison below and Base has to stay live across the whole unrolled check, which the reserved
+  // REG_GUEST_ADDR_TMP guarantees.
+  auto Base = GetGuestMemReg(Op->Header.Args[0]).X();
   int len = Op->CodeLength;
   int Offset = 0;
   ARMEmitter::ForwardLabel Fail;

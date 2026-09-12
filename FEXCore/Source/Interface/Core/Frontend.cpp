@@ -1345,6 +1345,19 @@ const Decoder::DecodeStream Decoder::AdjustAddrForSpecialRegion(const uint8_t* _
   constexpr uint64_t VSyscall_Base = 0xFFFF'FFFF'FF60'0000ULL;
   constexpr uint64_t VSyscall_End = VSyscall_Base + 0x1000;
 
+  // MADEIRA: DecodeStream deliberately carries two address domains, and under a guest window they
+  // stop being the same value:
+  //  - InstStream is the *guest* address. It is only ever used as an integer, by
+  //    CheckRangeExecutable and by the relocation lookup in ReadData. Executable ranges, section
+  //    bounds and relocation offsets are all registered in guest addresses, so feeding a host
+  //    address in here would make every block decode as non-executable.
+  //  - AdjustedInstStream is the host pointer the instruction bytes are actually read from. Callers
+  //    pass `_InstStream` as the host pointer for EntryPoint, i.e. GuestBase + EntryPoint, so the
+  //    existing `_InstStream - EntryPoint + RIP` already produces GuestBase + RIP.
+  // With no window the two are identical and this is exactly what upstream computed.
+  const uint8_t* const GuestStream = reinterpret_cast<const uint8_t*>(RIP);
+  const uint8_t* const HostStream = _InstStream - EntryPoint + RIP;
+
   if (OSABI == FEXCore::HLE::SyscallOSABI::OS_LINUX64 && RIP >= VSyscall_Base && RIP < VSyscall_End) {
     // VSyscall
     // This doesn't exist on AArch64 and on x86_64 hosts this is emulated with faults to a region mapped with --xp permissions
@@ -1353,14 +1366,14 @@ const Decoder::DecodeStream Decoder::AdjustAddrForSpecialRegion(const uint8_t* _
     // Offset 0x800: vgetcpu
     uint64_t Offset = RIP - VSyscall_Base;
     return DecodeStream {
-      .InstStream = _InstStream - EntryPoint + RIP,
+      .InstStream = GuestStream,
       .AdjustedInstStream = VSyscallData + Offset,
     };
   }
 
   return DecodeStream {
-    .InstStream = _InstStream - EntryPoint + RIP,
-    .AdjustedInstStream = _InstStream - EntryPoint + RIP,
+    .InstStream = GuestStream,
+    .AdjustedInstStream = HostStream,
   };
 }
 

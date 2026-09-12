@@ -50,6 +50,18 @@ constexpr size_t MAX_DISPATCHER_CODE_SIZE = FEXCore::Utils::FEX_PAGE_SIZE * 4;
 Dispatcher::Dispatcher(FEXCore::Context::ContextImpl* ctx)
   : Arm64Emitter(ctx, FEXCore::Allocator::VirtualAlloc(MAX_DISPATCHER_CODE_SIZE, true), MAX_DISPATCHER_CODE_SIZE)
   , CTX {ctx} {
+#ifdef FEX_IOS_HOST
+  /* MADEIRA: the dispatcher is the FIRST thing emitted in a process, so this allocation is where a
+   * broken JIT-pool setup shows up. FEXCore::Allocator::VirtualAlloc now refuses an executable
+   * allocation outside the pool, which means a null buffer here - and emitting into
+   * `nullptr + WriteOffset` is precisely the wild store the refusal exists to prevent. There is no
+   * degraded mode: a CPU module that cannot emit its dispatcher cannot run anything. */
+  if (!GetBufferBase()) {
+    ERROR_AND_DIE_FMT("[jit-pool] dispatcher code buffer allocation failed ({} bytes, WriteOffset={:#x}) - no executable JIT-pool "
+                      "memory is available, so nothing can be emitted",
+                      MAX_DISPATCHER_CODE_SIZE, FEXCore::DualMap::WriteOffset);
+  }
+#endif
   SetWriteOffset(FEXCore::DualMap::WriteOffset);
   EmitDispatcher();
 

@@ -86,6 +86,11 @@ extern "C" uint64_t IosFfsBypassLog[4];
  * Discovered and published by wine's ntdll-unix; imported in ProcessInit.
  * Defined in FEXCore Arm64Emitter.cpp, where the JIT emitters also read it. */
 extern "C" uint32_t IosTebTsdOffset;
+/* MADEIRA: the dual-mapped JIT pool's RX range, defined in rpmalloc.c beside ios_fex_band_base.
+ * Published in ProcessInit next to FEXCore::DualMap::WriteOffset; read by
+ * FEXCore::Allocator::VirtualAlloc to reject an executable allocation outside the pool. */
+extern "C" uintptr_t ios_fex_jit_pool_rx;
+extern "C" uintptr_t ios_fex_jit_pool_end;
 /* uint32_t, not bool: a 1-byte global here misaligned the adrp/ldr pair
  * lld generates for the neighbouring word ("misaligned ldr/str offset"). */
 static uint32_t IosTebTsdImportFound = 0;
@@ -960,9 +965,19 @@ NTSTATUS ProcessInit() {
   {
     const char *rw_env = getenv("WINE_IOS_JIT_RW");
     const char *rx_env = getenv("WINE_IOS_JIT_RX");
+    const char *size_env = getenv("WINE_IOS_JIT_SIZE");
     uint64_t rw = rw_env ? strtoull(rw_env, nullptr, 16) : 0;
     uint64_t rx = rx_env ? strtoull(rx_env, nullptr, 16) : 0;
+    uint64_t pool_size = size_env ? strtoull(size_env, nullptr, 16) : 0;
     int64_t off = (rw && rx) ? (int64_t)(rw - rx) : 0;
+    /* MADEIRA: publish the pool's RX range so FEXCore::Allocator::VirtualAlloc can refuse an
+     * executable allocation that did not come from the pool (see the check there). Both values
+     * are needed or the check stays off; it never weakens an allocation that already succeeds,
+     * so the ARM64EC path behaves exactly as before on a healthy pool. */
+    if (rx && pool_size) {
+      ios_fex_jit_pool_rx = (uintptr_t)rx;
+      ios_fex_jit_pool_end = (uintptr_t)(rx + pool_size);
+    }
     HANDLE stderr_h = NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters
         ? reinterpret_cast<HANDLE>(reinterpret_cast<RTL_USER_PROCESS_PARAMETERS64*>(
               NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters)->hStdError)

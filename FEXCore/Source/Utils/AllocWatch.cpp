@@ -53,10 +53,34 @@ namespace {
   }
 
   uint64_t CurrentThreadId() {
-    // Cheap, allocation-free thread identity: the address of a TLS byte. Only used
-    // to tell "same thread" from "different thread", never to name a thread.
+    // Cheap, allocation-free thread identity. Only ever compared for equality, never
+    // used to name a thread.
+#if defined(FEX_IOS_HOST) && defined(_WIN32) && defined(__aarch64__)
+    /* ⛔ NOT the address of a `thread_local` byte here. `thread_local` IS BANNED IN THE WINDOWS PE
+     * BUILDS OF FEXCORE (xtajit64.dll / xtajit.dll) and this function is reached from
+     * AllocWatch::Clear(), which RedundantFlagCalculationElimination.cpp:1018 calls on EVERY block
+     * compile - so this was a guaranteed fault, not a corner case.
+     *
+     * Two independent reasons native TLS cannot work in a CPU module:
+     *   1. Wine's loader enters the CPU DLL from `init_wow64()` (wine/dlls/ntdll/loader.c:5518 for
+     *      the initial thread, :5585 for every other), and that call never returns to the
+     *      `alloc_thread_tls()` at :5608/:5644 - it runs the 32-bit program. So
+     *      TEB->ThreadLocalStoragePointer is NULL for the whole life of every thread in a WoW64
+     *      process, and the compiler's `ldr x8, [x9, x8, lsl #3]` indexes off a null array.
+     *   2. The sequence reads the TEB through x18, which on an iOS host is the platform register
+     *      the kernel wipes on return to EL0 - the reason every hand-written TEB read in these
+     *      modules goes through TPIDRRO_EL0 instead (Source/Windows/WOW64/IosTeb.h).
+     *
+     * TPIDRRO_EL0 is the pthread TSD base: preserved across context switches, unique per thread,
+     * one instruction, no memory access. Exactly the identity token this needs. */
+    uint64_t Tpidrro;
+    __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(Tpidrro));
+    return Tpidrro & ~uint64_t(7);
+#else
+    // The address of a TLS byte, as upstream.
     static thread_local char Anchor {};
     return reinterpret_cast<uint64_t>(&Anchor);
+#endif
   }
 
   const char* EventName(uint32_t Event) {

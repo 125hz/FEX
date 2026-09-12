@@ -291,12 +291,47 @@ namespace x32 {
     ARMEmitter::Reg::r19,
   };
 
+  // MADEIRA: RA with the two guest-window registers removed. Selected instead of RA only when a
+  // non-zero GUEST32BASE is configured, so identity-mapped 32-bit builds keep the full 14-register
+  // pool and produce byte-identical code.
+  //
+  // Derived from RA by dropping its last two entries rather than being written out by hand, so the
+  // two lists cannot drift: reordering or extending RA automatically reshapes this one, and the
+  // static_asserts below fail the build if the tail stops being exactly the guest-window pair.
+  // RAPairs only covers RA's first 10 entries, so dropping from the tail leaves pairing untouched.
+  // ARMEmitter::Register has no default constructor, so the array is built by pack expansion over
+  // an index sequence rather than filled in a loop.
+  constexpr auto RA_GuestBase = []<size_t... I>(std::index_sequence<I...>) {
+    return std::array<ARMEmitter::Register, sizeof...(I)> {RA[I]...};
+  }(std::make_index_sequence<RA.size() - 2> {});
+
+  // The two dropped registers must be exactly REG_GUEST_ADDR_TMP and REG_GUEST_BASE, in that order.
+  static_assert(RA[RA.size() - 2] == REG_GUEST_ADDR_TMP.R() && RA[RA.size() - 1] == REG_GUEST_BASE.R(),
+                "x32::RA's last two entries must be the guest-window registers, since RA_GuestBase "
+                "is RA with its tail dropped");
+  static_assert(RA.size() == RA_GuestBase.size() + 2, "RA_GuestBase must drop exactly two registers");
+  // Nothing that survived the filter may alias either reserved register.
+  static_assert(
+    []() {
+      for (auto Reg : RA_GuestBase) {
+        if (Reg == REG_GUEST_BASE.R() || Reg == REG_GUEST_ADDR_TMP.R()) {
+          return false;
+        }
+      }
+      return true;
+    }(),
+    "RA_GuestBase still contains a reserved guest-window register");
+
   constexpr std::array<ARMEmitter::Register, 7> NotPreserved_Dynamic = {
     ARMEmitter::Reg::r12, ARMEmitter::Reg::r13, ARMEmitter::Reg::r14, ARMEmitter::Reg::r15,
     ARMEmitter::Reg::r16, ARMEmitter::Reg::r17, ARMEmitter::Reg::r30,
   };
 
   constexpr unsigned RAPairs = 10;
+
+  // MADEIRA: pair allocation indexes the leading RAPairs entries of whichever RA span is selected,
+  // so dropping the guest-window registers from the tail must not reach into that prefix.
+  static_assert(RAPairs <= RA_GuestBase.size(), "Reserving the guest-window registers ate into the pair-allocatable prefix");
 
   // All are caller saved
   constexpr std::array<ARMEmitter::VRegister, 8> SRAFPR = {
@@ -407,6 +442,9 @@ Arm64Emitter::Arm64Emitter(FEXCore::Context::ContextImpl* ctx, void* EmissionPtr
   }
 #endif
 
+  // MADEIRA: resolved once by ContextImpl's constructor, and forced to 0 in 64-bit mode.
+  GuestBase = EmitterCTX->Config.GuestBase;
+
   // Number of register available is dependent on what operating mode the proccess is in.
   if (EmitterCTX->Config.Is64BitMode()) {
     StaticRegisters = x64::SRA;
@@ -419,12 +457,31 @@ Arm64Emitter::Arm64Emitter(FEXCore::Context::ContextImpl* ctx, void* EmissionPtr
     PairRegisters = x32::RAPairs;
 
     StaticRegisters = x32::SRA;
-    GeneralRegisters = x32::RA;
+    // MADEIRA: reserve REG_GUEST_BASE and REG_GUEST_ADDR_TMP out of the dynamic pool, but only when
+    // a guest window is actually configured - with no window the full pool is used and codegen is
+    // identical to upstream.
+    GeneralRegisters = GuestBase ? std::span<const ARMEmitter::Register> {x32::RA_GuestBase} :
+                                   std::span<const ARMEmitter::Register> {x32::RA};
     GeneralRegistersNotPreserved = x32::NotPreserved_Dynamic;
 
     StaticFPRegisters = x32::SRAFPR;
     GeneralFPRegisters = x32::RAFPR;
   }
+}
+
+// MADEIRA: Materialise REG_GUEST_BASE. Called from FillStaticRegs, which every JIT entry and
+// re-entry path goes through - including AbsoluteLoopTopAddressFillSRA, which is where the Windows
+// exception path resumes the JIT from a CONTEXT that may predate the register being set up.
+//
+// x19 is callee-saved, so this is redundant after an ordinary host call and costs at most four
+// instructions on a path that is already spilling the whole register file. A window that is 4GiB
+// aligned (which is what Madeira reserves) encodes as a single movz.
+void Arm64Emitter::LoadGuestBaseReg() {
+  if (!GuestBase) {
+    return;
+  }
+
+  LoadConstant(ARMEmitter::Size::i64Bit, REG_GUEST_BASE.R(), GuestBase);
 }
 
 FEXCore::X86State::X86Reg Arm64Emitter::GetX86RegRelationToARMReg(ARMEmitter::Register Reg) {
@@ -843,6 +900,9 @@ void Arm64Emitter::FillStaticRegs(FillStaticRegOptions Options) {
 #endif
 
   ldr(REG_CALLRET_SP, STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
+
+  // MADEIRA: no-op unless a guest window is configured.
+  LoadGuestBaseReg();
 
   if (Options.NZCV) {
     // Regardless of what GPRs/FPRs we're filling, we need to fill NZCV since it

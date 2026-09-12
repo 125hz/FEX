@@ -112,6 +112,32 @@ extern "C" uint32_t IosTebTsdOffset;
 constexpr uint64_t EC_CODE_BITMAP_MAX_ADDRESS = 1ULL << 47;
 #endif
 
+// MADEIRA: Guest window registers ("the base register"). These are reserved *only* in 32-bit mode
+// and *only* when a non-zero GUEST32BASE has been configured (ContextImpl::Config.GuestBase). In
+// every other configuration - all 64-bit modes, ARM64EC, and identity-mapped 32-bit Linux - they
+// stay in the 32-bit dynamic register-allocation pool (x32::RA), nothing below changes, and the
+// emitted code is byte-identical to upstream.
+//
+// REG_GUEST_BASE holds the host address of guest address 0 for the lifetime of a JIT entry.
+// REG_GUEST_ADDR_TMP receives `REG_GUEST_BASE + zext32(EA)` immediately before a guest memory
+// access; see Arm64JITCore::GetGuestMemReg. It is never register-allocated, so no emitter site has
+// to reason about whether it collides with TMP1-TMP4 or with a live IR value.
+//
+// Both are taken from the *tail* of x32::RA:
+//  - x19 and x24 are AAPCS64 callee-saved, so they survive every host call the JIT makes
+//    (including `preserve_all` calls, which clobber only X0-X8/X16-X18/X30) and every OS callback.
+//    Neither needs spilling or filling around calls.
+//  - Neither is inside x32::RA's leading pair-allocatable range (x32::RAPairs == 10, covering
+//    r20,r21,r22,r23,r12,r13,r14,r15,r16,r17), so removing them does not disturb pair allocation.
+//  - Neither appears in x32::NotPreserved_Dynamic or x32::PreserveAll_Dynamic.
+// x18 is the only register genuinely unused by 32-bit mode, but it is the platform register on both
+// Windows (TEB) and iOS, so it cannot be used.
+//
+// Declared unconditionally because namespace x32 in Arm64Emitter.cpp is compiled for ARM64EC too;
+// GuestBase is always zero there so neither register is ever actually reserved.
+constexpr auto REG_GUEST_BASE = ARMEmitter::XReg::x19;
+constexpr auto REG_GUEST_ADDR_TMP = ARMEmitter::XReg::x24;
+
 // Will force one single instruction block to be generated first if set when entering the JIT filling SRA.
 // FillStaticRegs must preserve this
 constexpr auto ENTRY_FILL_SRA_SINGLE_INST_REG = TMP2;
@@ -144,6 +170,13 @@ public:
 
 protected:
   FEXCore::Context::ContextImpl* EmitterCTX;
+
+  // MADEIRA: Host address of guest address 0, or 0 for the usual identity mapping.
+  // Mirrors ContextImpl::Config.GuestBase and is only ever non-zero in 32-bit mode.
+  uint64_t GuestBase {};
+
+  // Emits the load of REG_GUEST_BASE. No-op unless a guest window is configured.
+  void LoadGuestBaseReg();
 
   std::span<const ARMEmitter::Register> StaticRegisters {};
   std::span<const ARMEmitter::Register> GeneralRegisters {};

@@ -315,6 +315,45 @@ private:
     return IsFPR(IR::PhysicalRegister(Wrap).AsRegClass());
   }
 
+  // MADEIRA: Guest window support. See Arm64Emitter.h (REG_GUEST_BASE) and Context.h
+  // (Config.GuestBase) for the contract.
+  //
+  // Every IR op that dereferences a guest address must convert it to a host address exactly once,
+  // and the conversion must be applied to the *completed* effective address - never to one component
+  // of it. Adding a displacement on top of an already-converted address is wrong two ways: an x86
+  // effective address wraps modulo 2^32 (so `Base + zext32(EA) + disp` can leave the window at the
+  // top) and a negative displacement can take the access *below* the window base, into whatever
+  // another pseudo-process owns. GuestMemAddr therefore folds any offset into the guest address
+  // first, at 32-bit width, and only then adds the base.
+  struct GuestMemAddr {
+    // Host address base register for the access.
+    ARMEmitter::Register Base;
+    // Offset still to be encoded into the memory operand. Always invalid when a guest window is
+    // active, because the offset has already been folded into Base.
+    IR::OrderedNodeWrapper Offset;
+    IR::MemOffsetType OffsetType;
+    uint8_t OffsetScale;
+  };
+
+  // Converts a guest address operand (plus its offset) into a host addressing description.
+  // Without a guest window this is the identity and emits nothing, so identity-mapped builds are
+  // unchanged. `Tmp` defaults to the reserved REG_GUEST_ADDR_TMP, which is never register
+  // allocated; pass a different scratch only when an op needs two converted addresses live at once
+  // (MemCpy is the only such op).
+  [[nodiscard]]
+  GuestMemAddr GetGuestMemAddr(IR::OpSize AccessSize, IR::OrderedNodeWrapper Addr, IR::OrderedNodeWrapper Offset,
+                               IR::MemOffsetType OffsetType, uint8_t OffsetScale, ARMEmitter::Register Tmp = REG_GUEST_ADDR_TMP.R());
+
+  // Shorthand for the (common) case of an address with no separate offset operand.
+  [[nodiscard]]
+  ARMEmitter::Register GetGuestMemReg(IR::OrderedNodeWrapper Addr, ARMEmitter::Register Tmp = REG_GUEST_ADDR_TMP.R());
+
+  // Converts an already-materialised guest address held in `GuestReg` into a host address in `Tmp`.
+  // Used by ops that compute a guest pointer themselves (MemSet/MemCpy working pointers, gather
+  // bases) rather than taking one straight out of an IR operand.
+  [[nodiscard]]
+  ARMEmitter::Register ApplyGuestBase(ARMEmitter::Register GuestReg, ARMEmitter::Register Tmp = REG_GUEST_ADDR_TMP.R());
+
   [[nodiscard]]
   ARMEmitter::ExtendedMemOperand GenerateMemOperand(IR::OpSize AccessSize, ARMEmitter::Register Base, IR::OrderedNodeWrapper Offset,
                                                     IR::MemOffsetType OffsetType, uint8_t OffsetScale);

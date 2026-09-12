@@ -325,6 +325,19 @@ public:
     uint64_t VirtualMemSize {1ULL << 36};
     uint64_t TSCScale = 0;
 
+    // MADEIRA: Host address that guest address 0 lives at ("the guest window"), 32-bit mode only.
+    //
+    // Resolved once in the ContextImpl constructor from the GUEST32BASE config option, and forced
+    // to 0 whenever Is64BitMode() is set. Zero means the guest address space is identity mapped,
+    // which is what every non-Madeira configuration uses and what keeps the 64-bit/ARM64EC path
+    // bit-for-bit unchanged.
+    //
+    // When non-zero the JIT pins REG_GUEST_BASE to this value and forms host addresses as
+    // `GuestBase + zext32(EA)`. Everything that is *not* a dereferenced pointer - guest RIP,
+    // LookupCache keys, VirtualMemSize, segment bases, AddCustomIREntrypoint, and
+    // InvalidateGuestCodeRange - stays in the guest namespace.
+    uint64_t GuestBase {0};
+
     // Used if the JIT needs to have its interrupt fault code emitted.
     bool NeedsPendingInterruptFaultCheck {false};
 
@@ -332,6 +345,7 @@ public:
     FEX_CONFIG_OPT(SingleStepConfig, SINGLESTEP);
     FEX_CONFIG_OPT(GdbServer, GDBSERVER);
     FEX_CONFIG_OPT(Is64BitMode, IS64BIT_MODE);
+    FEX_CONFIG_OPT(Guest32BaseOption, GUEST32BASE);
     FEX_CONFIG_OPT(TSOEnabled, TSOENABLED);
     FEX_CONFIG_OPT(VectorTSOEnabled, VECTORTSOENABLED);
     FEX_CONFIG_OPT(MemcpySetTSOEnabled, MEMCPYSETTSOENABLED);
