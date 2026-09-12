@@ -603,10 +603,20 @@ ARMEmitter::Register Arm64JITCore::GetGuestMemReg(IR::OrderedNodeWrapper Addr, A
 }
 
 Arm64JITCore::GuestMemAddr Arm64JITCore::GetGuestMemAddr(IR::OpSize AccessSize, IR::OrderedNodeWrapper Addr, IR::OrderedNodeWrapper Offset,
-                                                         IR::MemOffsetType OffsetType, uint8_t OffsetScale, ARMEmitter::Register Tmp) {
+                                                         IR::MemOffsetType OffsetType, uint8_t OffsetScale, ARMEmitter::Register Tmp,
+                                                         bool HostAddr) {
   const auto AddrReg = GetReg(Addr);
   if (!GuestBase) {
     // Identity mapped: nothing to do, and nothing is emitted.
+    return {AddrReg, Offset, OffsetType, OffsetScale};
+  }
+
+  if (HostAddr) {
+    // The operand is already a host pointer (IROp_LoadMem/IROp_StoreMem::HostAddr - FEXCore's own
+    // context-relative storage, never anything an x86 instruction can name). Leave the address and
+    // its offset exactly as the identity-mapped path would, so the emitted access is the same
+    // instruction it has always been. IREmitter::IsContextRelativeAddress validates the converse at
+    // IR-emission time: a context-relative address may not reach here without this flag.
     return {AddrReg, Offset, OffsetType, OffsetScale};
   }
 
@@ -786,7 +796,7 @@ DEF_OP(LoadMem) {
   const auto Op = IROp->C<IR::IROp_LoadMem>();
   const auto OpSize = IROp->Size;
 
-  const auto Guest = GetGuestMemAddr(OpSize, Op->Addr, Op->Offset, Op->OffsetType, Op->OffsetScale);
+  const auto Guest = GetGuestMemAddr(OpSize, Op->Addr, Op->Offset, Op->OffsetType, Op->OffsetScale, REG_GUEST_ADDR_TMP.R(), Op->HostAddr);
   const auto MemReg = Guest.Base;
   const auto MemSrc = GenerateMemOperand(OpSize, MemReg, Guest.Offset, Guest.OffsetType, Guest.OffsetScale);
 
@@ -1837,7 +1847,7 @@ DEF_OP(StoreMem) {
   const auto Op = IROp->C<IR::IROp_StoreMem>();
   const auto OpSize = IROp->Size;
 
-  const auto Guest = GetGuestMemAddr(OpSize, Op->Addr, Op->Offset, Op->OffsetType, Op->OffsetScale);
+  const auto Guest = GetGuestMemAddr(OpSize, Op->Addr, Op->Offset, Op->OffsetType, Op->OffsetScale, REG_GUEST_ADDR_TMP.R(), Op->HostAddr);
   const auto MemReg = Guest.Base;
   const auto MemSrc = GenerateMemOperand(OpSize, MemReg, Guest.Offset, Guest.OffsetType, Guest.OffsetScale);
 

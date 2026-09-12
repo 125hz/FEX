@@ -340,9 +340,13 @@ private:
   // unchanged. `Tmp` defaults to the reserved REG_GUEST_ADDR_TMP, which is never register
   // allocated; pass a different scratch only when an op needs two converted addresses live at once
   // (MemCpy is the only such op).
+  //
+  // `HostAddr` says the operand is already a host pointer (IROp_LoadMem/IROp_StoreMem::HostAddr,
+  // set only for FEXCore's own context-relative storage) and must be dereferenced as-is.
   [[nodiscard]]
   GuestMemAddr GetGuestMemAddr(IR::OpSize AccessSize, IR::OrderedNodeWrapper Addr, IR::OrderedNodeWrapper Offset,
-                               IR::MemOffsetType OffsetType, uint8_t OffsetScale, ARMEmitter::Register Tmp = REG_GUEST_ADDR_TMP.R());
+                               IR::MemOffsetType OffsetType, uint8_t OffsetScale, ARMEmitter::Register Tmp = REG_GUEST_ADDR_TMP.R(),
+                               bool HostAddr = false);
 
   // Shorthand for the (common) case of an address with no separate offset operand.
   [[nodiscard]]

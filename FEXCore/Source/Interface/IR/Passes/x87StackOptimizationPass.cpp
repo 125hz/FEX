@@ -438,6 +438,9 @@ inline Ref X87StackOptimization::GetOffsetTopAddressWithCache_Slow(uint8_t Offse
   }
 
   Ref OffsetRef = GetOffsetTopWithCache_Slow(Offset);
+  // MADEIRA: this is a HOST pointer (`STATE + index * 16`). Only the host-addressed memory ops
+  // (_LoadMemHostFPR / _StoreMemHostFPR) may dereference it; a plain _LoadMem/_StoreMem would have
+  // the 32-bit guest window base applied to it.
   TopOffsetAddressCache[Offset] = IREmit->_FormContextAddress(OpSize::i64Bit, OffsetRef, 16);
 
   return TopOffsetAddressCache[Offset];
@@ -474,7 +477,12 @@ inline Ref X87StackOptimization::LoadStackValueAtOffset_Slow(uint8_t Offset) {
   OrderedNode* TopOffsetAddress = GetOffsetTopAddressWithCache_Slow(Offset);
   auto Size = ReducedPrecisionMode ? OpSize::i64Bit : OpSize::i128Bit;
   if (!TopValueCache[Offset]) {
-    TopValueCache[Offset] = IREmit->_LoadMemFPR(Size, TopOffsetAddress, IREmit->_InlineConstant(MMBaseOffset()), Size, MemOffsetType::SXTX, 1);
+    // MADEIRA: TopOffsetAddress is `STATE + index * 16` from _FormContextAddress - a HOST pointer
+    // into FEXCore's own CPUState, not a guest effective address - so this must use the host-
+    // addressed form or the 32-bit guest window base would be added to it (and MMBaseOffset()
+    // folded into it) on the way to a wild access. Unchanged codegen when no window is configured.
+    TopValueCache[Offset] =
+      IREmit->_LoadMemHostFPR(Size, TopOffsetAddress, IREmit->_InlineConstant(MMBaseOffset()), Size, MemOffsetType::SXTX, 1);
   }
   return TopValueCache[Offset];
 }
@@ -607,7 +615,9 @@ void X87StackOptimization::FlushCachedRegs() {
   for (size_t i = 0; i < FlushValuesPending.size(); i++) {
     if (FlushValuesPending[i]) {
       OrderedNode* TopOffsetAddress = GetOffsetTopAddressWithCache_Slow(i);
-      IREmit->_StoreMemFPR(Size, TopValueCache[i], TopOffsetAddress, IREmit->_InlineConstant(MMBaseOffset()), Size, MemOffsetType::SXTX, 1);
+      // MADEIRA: host-addressed - see LoadStackValueAtOffset_Slow.
+      IREmit->_StoreMemHostFPR(Size, TopValueCache[i], TopOffsetAddress, IREmit->_InlineConstant(MMBaseOffset()), Size,
+                               MemOffsetType::SXTX, 1);
       // store
       FlushValuesPending[i] = false;
     }

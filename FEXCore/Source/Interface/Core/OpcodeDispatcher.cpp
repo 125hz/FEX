@@ -4205,7 +4205,13 @@ void OpDispatchBuilder::UpdatePrefixFromSegment(Ref Segment, uint32_t SegmentReg
   // Fun quirk, if we mask the selector then it is premultiplied by 8 which we need to do for accessing anyway.
   auto SegmentOffset = _And(OpSize::i32Bit, Segment, _Constant(0xfff8));
   Ref SegmentBase = _LoadContextGPRIndexed(GDT, OpSize::i64Bit, offsetof(FEXCore::Core::CPUState, segment_arrays[0]), 8);
-  Ref NewSegment = _LoadMemGPR(OpSize::i64Bit, SegmentBase, SegmentOffset, OpSize::i8Bit, MemOffsetType::UXTW, 1);
+  // MADEIRA: `segment_arrays` holds HOST pointers to FEXCore's own descriptor tables (see
+  // CoreState.h; the WOW64 module allocates them with `new[]`, Module.cpp), so the descriptor read
+  // must not have the 32-bit guest window base applied to it. Only the descriptor's *contents* - the
+  // segment base written into `*_cached` below - are guest values. This op is reached from every
+  // 32-bit segment-register write (mov Sreg / pop Sreg / iret / far jmp / far call / retf), which is
+  // precisely where a guest window is active.
+  Ref NewSegment = _LoadMemHostGPR(OpSize::i64Bit, SegmentBase, SegmentOffset, OpSize::i8Bit, MemOffsetType::UXTW, 1);
   CheckLegacySegmentWrite(NewSegment, SegmentReg);
 
   // Extract the 32-bit base from the GDT segment.
