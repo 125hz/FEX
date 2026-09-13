@@ -63,6 +63,16 @@ $end_info$
 #include <chrono>
 #include <cstring>
 
+#if defined(FEX_IOS_HOST) && defined(_WIN32)
+/* MADEIRA ml708: the dual-mapped JIT pool's RX range, defined in rpmalloc.c and published by the
+ * CPU module at process init (see AllocatorHooks.h). Zero until then. Used by the callret reset
+ * path below to reject host targets that cannot possibly be emitted code. */
+extern "C" {
+extern uintptr_t ios_fex_jit_pool_rx;
+extern uintptr_t ios_fex_jit_pool_end;
+}
+#endif
+
 /* iOS-Madeira ml622: mirror of rpmalloc's POD snapshot (rpmalloc.c). Declared here
  * rather than in a shared header because rpmalloc is C and vendored; keep the two
  * definitions in sync — the drain below is the only consumer. */
@@ -1848,6 +1858,41 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
       }
       /* Tier-1 reset to DefaultLocation, matching CallRetStack::HandleAccessViolation. */
       Frame->State.callret_sp = default_loc;
+
+#if defined(FEX_IOS_HOST) && defined(_WIN32)
+      /* MADEIRA ml708: REJECT NON-POOL HOST TARGETS ON THE RESET PATH.
+       *
+       * Every 16-byte callret frame is {guest_rip, host_code_ptr}, and the host half is a raw
+       * branch target (an intra-block `adr(&l_CallReturn)` label). After a reset the next pop
+       * reads whatever bytes happen to sit at DefaultLocation -- a frame this thread abandoned
+       * long ago, or, if the pointer had walked into a neighbouring mapping, bytes that were
+       * never a callret frame at all. A host half that is not inside the JIT pool can only ever
+       * be wrong: a sub-4GB value or a value inside the guest window is a GUEST address, and
+       * branching to one executes at `rip` instead of `GuestBase + rip`.
+       *
+       * So validate the frames the reset is about to expose and zero any that fail: a {0, 0}
+       * frame can never satisfy BranchOps' `sub TMP1, popped_rip, RipReg` compare, so the RET
+       * falls through to the L1 lookup, which is always correct. Nothing is branched to. */
+      if (ios_fex_jit_pool_rx && ios_fex_jit_pool_end) {
+        static volatile uint32_t reject_cnt = 0;
+        for (int i = 0; i < 4; ++i) {
+          uint64_t* Entry = reinterpret_cast<uint64_t*>(default_loc + i * 0x10);
+          const uint64_t EntryRip = Entry[0];
+          const uint64_t EntryHost = Entry[1];
+          if (!EntryRip && !EntryHost) {
+            continue;
+          }
+          if (EntryHost >= ios_fex_jit_pool_rx && EntryHost < ios_fex_jit_pool_end) {
+            continue;
+          }
+          if (__sync_add_and_fetch(&reject_cnt, 1) <= 16) {
+            LogMan::Msg::EFmt("[callret] rejected non-pool target host=0x{:x} rip=0x{:x}", EntryHost, EntryRip);
+          }
+          Entry[0] = 0;
+          Entry[1] = 0;
+        }
+      }
+#endif
     }
   }
 

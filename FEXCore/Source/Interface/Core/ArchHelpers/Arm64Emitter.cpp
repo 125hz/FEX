@@ -5,6 +5,7 @@
 
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Core/X86Enums.h>
+#include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/MathUtils.h>
 
@@ -483,6 +484,71 @@ void Arm64Emitter::LoadGuestBaseReg() {
 
   LoadConstant(ARMEmitter::Size::i64Bit, REG_GUEST_BASE.R(), GuestBase);
 }
+
+#ifdef FEX_IOS_HOST
+/* MADEIRA ml708: inline call-ret shadow-stack bounds guard + reset.
+ *
+ * WHY THIS EXISTS AT ALL
+ * ----------------------
+ * The call-ret stack is pushed on every guest CALL and popped only on a FEX-lowered guest RET.
+ * Guests do not balance those: SEH dispatch/RtlUnwind, longjmp and C++ throw abandon frames with
+ * no RET, so entries leak. Upstream bounds the leak with PAGE_NOACCESS guard pages either side of
+ * the allocation - a push that walks off the end faults, and CallRetStack::HandleAccessViolation
+ * resets the pointer to DefaultLocation. On iOS that fault NEVER happens: Wine's
+ * VirtualAlloc(MEM_RESERVE, PAGE_NOACCESS) does not enforce NOACCESS here (CallRetStack.h), so the
+ * pointer just keeps walking, out of its own 16MB allocation and into whatever is mapped below it.
+ *
+ * WHY IT IS GATED ON FEX_IOS_HOST AND NOT ON ARCHITECTURE_arm64ec
+ * --------------------------------------------------------------
+ * This guard used to be emitted only under `#ifdef ARCHITECTURE_arm64ec`, so the WoW64 CPU module
+ * (xtajit.dll, an ordinary aarch64 PE -> ARCHITECTURE_arm64, FEX_IOS_HOST) got no guard at all,
+ * while running on the same iOS host with the same unenforced guard pages. That is the identical
+ * mis-gating already documented in AllocatorHooks.h's VirtualAlloc comment. The observed result
+ * was a thread whose callret_sp ran 1,310,569 entries (~20MB) below its base, straight through the
+ * next region down - its own CpuStateFrame - so `stp {guest_ret, host_label}` pairs overwrote
+ * CpuStateFrame::Pointers. The JIT then loaded a fallback handler out of
+ * Pointers.FallbackHandlerPointers[..].Func and executed `blr x3` on a *guest* return address.
+ * The condition is a property of the host (iOS), not of the guest ABI, so the gate is the host.
+ *
+ * THE WINDOW
+ * ----------
+ * Bound the pointer to a window of CALLRET_STACK_SIZE/4 centred on DefaultLocation
+ * (= base + CALLRET_STACK_SIZE/4), i.e. [base + SIZE/8, base + 3*SIZE/8). The test is a single
+ * `sub` + `lsr` by log2(window) - zero means in-window. A whole-allocation test is not enough: a
+ * large-but-in-range leak sails straight through it, and by the time it leaves the 16MB region it
+ * has already scribbled over the neighbouring mapping.
+ *
+ * RESETTING IS SAFE, NOT A PAPERING-OVER
+ * --------------------------------------
+ * This stack is purely a return-address PREDICTOR. A stale or missing entry fails the
+ * `sub TMP, popped_guest_rip, RipReg` compare in BranchOps and falls through to the L1 lookup,
+ * which is always correct. A reset costs mispredictions and nothing else. */
+void Arm64Emitter::EmitCallRetStackGuard(ARMEmitter::XRegister Scratch) {
+  // Named in InternalThreadState.h so every site that bounds this pointer shares one definition.
+  constexpr uint64_t DefaultOffset = FEXCore::Core::InternalThreadState::CALLRET_DEFAULT_OFFSET;
+  constexpr uint64_t WindowLow = FEXCore::Core::InternalThreadState::CALLRET_LIVE_OFFSET;
+  constexpr uint64_t WindowSize = FEXCore::Core::InternalThreadState::CALLRET_LIVE_SIZE;
+  static_assert((WindowSize & (WindowSize - 1)) == 0, "Guard window must be a power of two for the lsr test");
+  static_assert(WindowLow + WindowSize / 2 == DefaultOffset, "Guard window must be centred on DefaultLocation");
+  const uint32_t WindowLog2 = FEXCore::ilog2(WindowSize);
+
+  ARMEmitter::ForwardLabel l_callret_ok;
+  ldr(Scratch, STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp_base));
+  add(ARMEmitter::Size::i64Bit, Scratch, Scratch, WindowLow);
+  sub(ARMEmitter::Size::i64Bit, Scratch, REG_CALLRET_SP, Scratch);
+  lsr(ARMEmitter::Size::i64Bit, Scratch, Scratch, WindowLog2);
+  (void)cbz(ARMEmitter::Size::i64Bit, Scratch, &l_callret_ok);
+  ldr(REG_CALLRET_SP, STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp_base));
+  add(ARMEmitter::Size::i64Bit, REG_CALLRET_SP, REG_CALLRET_SP, DefaultOffset);
+  /* A reset abandons every entry below the new top. Those abandoned 16-byte frames are
+   * {guest_rip, host_label} pairs and the host half is a raw branch target, so publish the reset
+   * to State.callret_sp *and* zero the frame at the new top: a subsequent pop then reads
+   * {0, 0}, which can never satisfy the guest-rip compare and can never be branched to. */
+  stp<ARMEmitter::IndexType::OFFSET>(ARMEmitter::XReg::zr, ARMEmitter::XReg::zr, REG_CALLRET_SP, 0);
+  str(REG_CALLRET_SP, STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
+  (void)Bind(&l_callret_ok);
+}
+#endif
 
 FEXCore::X86State::X86Reg Arm64Emitter::GetX86RegRelationToARMReg(ARMEmitter::Register Reg) {
   for (size_t i = 0; i < StaticRegisters.size(); ++i) {

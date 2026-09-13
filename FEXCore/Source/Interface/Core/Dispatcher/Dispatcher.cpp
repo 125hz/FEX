@@ -702,22 +702,17 @@ void Dispatcher::EmitDispatcher() {
 
     // load static regs
     FillStaticRegs();
-#ifdef ARCHITECTURE_arm64ec
-    // iOS-Madeira 2026-05-18: inline bounds-guard (Tier-2). The JITCallback
-    // sentinel push uses REG_CALLRET_SP after FillStaticRegs, which on iOS
-    // ARM64EC reloads x17 from State.callret_sp. If State has drifted OOB
-    // (e.g. underflow during prior dispatch), reset before stp to avoid
-    // writing the sentinel into JIT code memory.
-    {
-      ARMEmitter::ForwardLabel l_callret_ok;
-      ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp_base));
-      sub(ARMEmitter::Size::i64Bit, TMP1, REG_CALLRET_SP, TMP1);
-      lsr(ARMEmitter::Size::i64Bit, TMP1, TMP1, 24);
-      (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &l_callret_ok);
-      ldr(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp_base));
-      add(ARMEmitter::Size::i64Bit, REG_CALLRET_SP, REG_CALLRET_SP, 0x400000);
-      (void)Bind(&l_callret_ok);
-    }
+#ifdef FEX_IOS_HOST
+    /* MADEIRA ml708: inline bounds-guard before the JITCallback sentinel push. FillStaticRegs
+     * has just reloaded REG_CALLRET_SP from State.callret_sp; if State has drifted OOB (e.g. an
+     * underflow during prior dispatch) the sentinel would be written outside the stack.
+     *
+     * Was `#ifdef ARCHITECTURE_arm64ec` and tested only `(sp - base) >> 24`, i.e. the WHOLE 16MB
+     * allocation. Both were wrong: the gate excluded the WoW64 module on the same host, and the
+     * whole-region test let a multi-megabyte leak through. EmitCallRetStackGuard enforces the same
+     * 4MB window as every other site (see the ⚠️ note on CALLRET_LIVE_* in InternalThreadState.h,
+     * which called out this site by name as the one not bounded by the window). */
+    EmitCallRetStackGuard(TMP1);
 #endif
     stp<ARMEmitter::IndexType::PRE>(ARMEmitter::XReg::zr, ARMEmitter::XReg::zr, REG_CALLRET_SP, -0x10);
 

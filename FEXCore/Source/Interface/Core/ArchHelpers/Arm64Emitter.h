@@ -178,6 +178,16 @@ protected:
   // Emits the load of REG_GUEST_BASE. No-op unless a guest window is configured.
   void LoadGuestBaseReg();
 
+#ifdef FEX_IOS_HOST
+  /* MADEIRA: emits the inline call-ret shadow-stack bounds guard + reset.
+   *
+   * Must be emitted before every `stp ..., [REG_CALLRET_SP, #-0x10]!` push and every
+   * `ldp ..., [REG_CALLRET_SP], #0x10` pop. Clobbers only `Scratch`, which must be a
+   * caller-chosen dead temporary at the emission site. See Arm64Emitter.cpp for the
+   * window arithmetic and why a reset is semantically free. */
+  void EmitCallRetStackGuard(ARMEmitter::XRegister Scratch);
+#endif
+
   std::span<const ARMEmitter::Register> StaticRegisters {};
   std::span<const ARMEmitter::Register> GeneralRegisters {};
   std::span<const ARMEmitter::Register> GeneralRegistersNotPreserved {};

@@ -12,6 +12,10 @@
 extern "C" {
 extern uintptr_t ios_fex_band_base;
 extern uintptr_t ios_fex_band_end;
+/* MADEIRA ml708: the dual-mapped JIT pool's RX range, defined next to the band in rpmalloc.c and
+ * published by the CPU module at process init. Zero until then. */
+extern uintptr_t ios_fex_jit_pool_rx;
+extern uintptr_t ios_fex_jit_pool_end;
 }
 
 namespace FEX::Windows::CallRetStack {
@@ -139,11 +143,47 @@ void DestroyThread(FEXCore::Core::InternalThreadState* Thread) {
   ::VirtualFree(reinterpret_cast<void*>(CallRetStackInfo.AllocationBase), 0, MEM_RELEASE);
 }
 
+/* MADEIRA ml708: reject non-pool host targets on the reset path. Every 16-byte callret frame is
+ * {guest_rip, host_code_ptr} and the host half is a raw branch target, so a frame whose host half
+ * is outside the dual-mapped JIT pool can only ever be wrong -- a sub-4GB or in-guest-window value
+ * is a GUEST address, and branching to one executes at `rip` instead of `GuestBase + rip`. A reset
+ * exposes whatever bytes sit at DefaultLocation, which after an underflow into a neighbouring
+ * mapping need never have been a callret frame at all. Zeroing a rejected frame is safe and
+ * sufficient: {0, 0} can never satisfy BranchOps' popped-rip compare, so the RET falls through to
+ * the L1 lookup instead of branching. Shared by both reset paths; see the twin in Core.cpp. */
+inline void RejectNonPoolTargets(uint64_t DefaultLocation) {
+  if (!ios_fex_jit_pool_rx || !ios_fex_jit_pool_end) {
+    // Pool bounds not published yet; nothing can be judged, so judge nothing.
+    return;
+  }
+  static volatile uint32_t RejectCount = 0;
+  for (int i = 0; i < 4; ++i) {
+    uint64_t* Entry = reinterpret_cast<uint64_t*>(DefaultLocation + i * 0x10);
+    const uint64_t EntryRip = Entry[0];
+    const uint64_t EntryHost = Entry[1];
+    if (!EntryRip && !EntryHost) {
+      continue;
+    }
+    if (EntryHost >= ios_fex_jit_pool_rx && EntryHost < ios_fex_jit_pool_end) {
+      continue;
+    }
+    if (__sync_add_and_fetch(&RejectCount, 1) <= 16) {
+      LogMan::Msg::EFmt("[callret] rejected non-pool target host=0x{:x} rip=0x{:x}", EntryHost, EntryRip);
+    }
+    Entry[0] = 0;
+    Entry[1] = 0;
+  }
+}
+
 bool HandleAccessViolation(FEXCore::Core::InternalThreadState* Thread, uint64_t Address, uint64_t& CallRetSPReg) {
   auto CallRetStackInfo = GetInfoThread(Thread);
   if (Address >= CallRetStackInfo.AllocationBase && Address < CallRetStackInfo.AllocationEnd) {
     LogMan::Msg::DFmt("Call-ret stack inbalance: {:X}", Address);
+    RejectNonPoolTargets(CallRetStackInfo.DefaultLocation);
     CallRetSPReg = CallRetStackInfo.DefaultLocation;
+    /* Keep State in step with the register the exception context is about to resume with, so a
+     * subsequent Fill/Spill of REG_CALLRET_SP cannot resurrect the out-of-bounds value. */
+    Thread->CurrentFrame->State.callret_sp = CallRetStackInfo.DefaultLocation;
     return true;
   }
   return false;
