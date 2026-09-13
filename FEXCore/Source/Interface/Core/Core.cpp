@@ -819,6 +819,19 @@ bool ContextImpl::CheckIfBlockIsCacheable(FEXCore::Core::InternalThreadState& Th
   return Thread.FrontendDecoder->CheckIfCacheable(Thread, reinterpret_cast<const uint8_t*>(Config.GuestBase + GuestRIP), GuestRIP, MaxInst);
 }
 
+/* ml900: process-wide JIT accumulators behind the periodic [fex-stats] line.
+ *
+ * Deliberately NOT FEXCore::SHMStats/ProfileStats: that path publishes into a shared-memory
+ * block mapped by a FEXServer process, and on iOS everything is one Mach task with no server,
+ * so ProfileStats produces nothing a device log can show. These are three relaxed counters
+ * bumped once per real compile and printed from the existing CB_SUMMARY cadence, so the cost
+ * is bounded by the compile rate, not the execution rate. */
+namespace MadeiraStats {
+std::atomic<uint64_t> BlocksCompiled {};
+std::atomic<uint64_t> GuestInstsCompiled {};
+std::atomic<uint64_t> HostCodeBytes {};
+} // namespace MadeiraStats
+
 /* iOS-Madeira ml623: targeted IR capture (PassManager.cpp). FEX_MadeiraIRCapTarget is the
  * absolute guest address of the ONE instruction under investigation, published by the
  * Windows-side InvalidationTracker at module load. The decode loop below marks the
@@ -1222,6 +1235,19 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
   bool TFSet = Thread->CurrentFrame->State.flags[X86State::RFLAG_TF_RAW_LOC];
 
   auto CompiledCode = Thread->CPUBackend->CompileCode(GuestRIP, Length, TotalInstructions == 1, &*IRView, DebugData.get(), TFSet);
+
+  /* ml900: [fex-stats] accumulators. Three relaxed adds on the compile path (which already costs
+   * microseconds), no allocation, no formatting -- the printing happens in the CB_SUMMARY block.
+   *
+   * These are the four numbers a next-run log needs in order to judge a JIT setting change
+   * without a profiler: how many blocks were really compiled, how many guest instructions went
+   * into them (=> instructions per block, which is what Multiblock/MaxInst move), and how many
+   * host bytes came out (=> host bytes per guest instruction, which is what TSO and
+   * X87ReducedPrecision move). ProfileStats/SHMStats cannot be used for this on iOS: it needs a
+   * FEXServer to map the shared stats block, and there is none in this process. */
+  MadeiraStats::BlocksCompiled.fetch_add(1, std::memory_order_relaxed);
+  MadeiraStats::GuestInstsCompiled.fetch_add(TotalInstructions, std::memory_order_relaxed);
+  MadeiraStats::HostCodeBytes.fetch_add(DebugData->HostCodeSize, std::memory_order_relaxed);
 
   /* ml623: the final arm of the capture -- the host bytes actually emitted for the
    * target instruction, bounded to [its HostEntryOffset, the next one). This is the
@@ -1983,6 +2009,53 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
                         Frame ? Frame->State.L1Pointer : 0,
                         Frame ? Frame->State.L1Mask : 0,
                         (T && T->LookupCache) ? T->LookupCache->GetL1Pointer() : 0);
+
+      /* ml900: [fex-stats] -- the JIT's own shape, on a ~10s wall clock rather than on the
+       * CompileBlock cadence, so two runs can be compared at equal elapsed time even when one
+       * of them compiles far more.
+       *
+       * What each number is for, and what moves it:
+       *   blocks/s + insts/blk : Multiblock and MaxInst. A low insts/blk with Multiblock on
+       *                          means the frontend keeps hitting terminators (or the guest is
+       *                          call-heavy), and raising MaxInst will not help.
+       *   host_b/inst          : how much ARM64 one x86 instruction costs. TSO emulation and
+       *                          X87ReducedPrecision both show up here, and it is the only
+       *                          figure that says whether a codegen setting did anything.
+       *   cpp_dispatch/s       : C++ CompileBlock entries per second. These are dispatcher
+       *                          round-trips that the emitted inline L1 probe failed to
+       *                          resolve; at a 99% hit rate they are pure overhead and their
+       *                          RATE (not the hit rate) is the number that matters.
+       * All three counters are process-wide and monotonic, so a reader can also difference two
+       * consecutive lines. */
+      {
+        static std::atomic<uint64_t> LastStatsNs {0};
+        static std::atomic<uint64_t> LastStatsBlocks {0};
+        static std::atomic<uint64_t> LastStatsTotal {0};
+        const uint64_t NowNs = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+        uint64_t Last = LastStatsNs.load(std::memory_order_relaxed);
+        // First arrival seeds the baseline instead of printing a rate measured against the epoch.
+        // The CAS makes exactly one thread own each window; losers simply skip this line.
+        const bool DueAndWon = Last != 0 && (NowNs - Last) >= 10'000'000'000ULL &&
+                               LastStatsNs.compare_exchange_strong(Last, NowNs, std::memory_order_relaxed);
+        if (Last == 0) {
+          LastStatsNs.compare_exchange_strong(Last, NowNs, std::memory_order_relaxed);
+          LastStatsBlocks.store(MadeiraStats::BlocksCompiled.load(std::memory_order_relaxed), std::memory_order_relaxed);
+          LastStatsTotal.store(total, std::memory_order_relaxed);
+        } else if (DueAndWon) {
+          const uint64_t ElapsedMs = (NowNs - Last) / 1'000'000ULL;
+          const uint64_t Blocks = MadeiraStats::BlocksCompiled.load(std::memory_order_relaxed);
+          const uint64_t Insts = MadeiraStats::GuestInstsCompiled.load(std::memory_order_relaxed);
+          const uint64_t HostBytes = MadeiraStats::HostCodeBytes.load(std::memory_order_relaxed);
+          const uint64_t BlockDelta = Blocks - LastStatsBlocks.exchange(Blocks, std::memory_order_relaxed);
+          const uint64_t DispatchDelta = total - LastStatsTotal.exchange(total, std::memory_order_relaxed);
+          LogMan::Msg::EFmt("[fex-stats] rev=ml900 window_ms={} blocks={} (+{}, {}/s) insts/blk={} "
+                            "host_b/inst={} cpp_dispatch=+{} ({}/s) hit_rate={}%",
+                            ElapsedMs, Blocks, BlockDelta, ElapsedMs ? (BlockDelta * 1000 / ElapsedMs) : 0, Blocks ? (Insts / Blocks) : 0,
+                            Insts ? (HostBytes / Insts) : 0, DispatchDelta, ElapsedMs ? (DispatchDelta * 1000 / ElapsedMs) : 0,
+                            (total > 0) ? (100 * (total - reals) / total) : 0);
+        }
+      }
 
       /* iOS-Madeira ml622: drain the rpmalloc remote-free CAS snapshot HERE —
        * outside rpmalloc, where formatting is safe. The allocator side only ever

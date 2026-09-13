@@ -117,7 +117,25 @@ private:
 
   void DecodeREXIfValid(int8_t ExpectedOffset = -1);
 
+  /* Hard ceiling on how many decoded instructions one multiblock compile may hold.
+   * sizeof(DecodedInst) is 128 bytes, so this constant alone is an 8MB arena PER GUEST THREAD. */
   static constexpr size_t DefaultDecodedBufferSize = 0x10000;
+
+  /* ml900: the ceiling is not the cost. The decode loop stops at
+   * min(MaxInst, DefaultDecodedBufferSize) instructions, and MaxInst is a config option whose
+   * own default is 5000 -- so the last 60,536 entries of the default buffer are unreachable by
+   * construction and only exist to make the per-thread arena 13x larger than the largest block
+   * FEX will ever decode into it. At MaxInst=5000 this is 640KB instead of 8MB.
+   *
+   * Sized once per Decoder, from the same Config value the loop bounds itself with, and clamped
+   * to [MinDecodedBufferSize, DefaultDecodedBufferSize] so a hostile or zero MaxInst cannot
+   * produce a buffer the loop would run off. `DecodedBufferSize` (not the constant) is what the
+   * loop's termination test uses, so the two can never disagree.
+   *
+   * Declared before PoolObject: it is used to size PoolObject in the constructor's init list,
+   * and member initialisation follows declaration order. */
+  static constexpr size_t MinDecodedBufferSize = 0x100;
+  size_t DecodedBufferSize {DefaultDecodedBufferSize};
   FEXCore::X86Tables::DecodedInst* DecodedBuffer {};
   Utils::PoolBufferWithTimedRetirement<FEXCore::X86Tables::DecodedInst*, 5000, 500> PoolObject;
   size_t DecodedSize {};

@@ -227,6 +227,7 @@ protected:
               // We managed to take away ownership
               // Put it back in the regular pool and come back to it
               (*it)->CurrentClientOwnedFlag = nullptr;
+              Recycle((*it)->Ptr, (*it)->Size);
               UnclaimedBuffers.emplace_back(*it);
               it = ClaimedBuffers.erase(it);
               continue;
@@ -297,6 +298,7 @@ protected:
 
   void UnclaimBufferImpl(ContainerType::iterator Buffer) {
     (*Buffer)->CurrentClientOwnedFlag = nullptr;
+    Recycle((*Buffer)->Ptr, (*Buffer)->Size);
     UnclaimedBuffers.emplace_back(*Buffer);
     ClaimedBuffers.erase(Buffer);
   }
@@ -347,6 +349,32 @@ private:
    * @param Size buffer size
    */
   virtual void Free(void* Ptr, size_t Size) = 0;
+
+  /**
+   * @brief A buffer has just gone back to the allocator; return its physical pages if the
+   *        backing store can do that cheaply.
+   *
+   * ml900: the pool keeps a buffer's RESERVATION so the next claimant gets it without a
+   * mapping syscall, and that is the whole point of the pool. It has no reason to keep the
+   * buffer's PHYSICAL pages: `ReownOrClaimBufferWithSize()` documents that "the initial data
+   * in the buffer is undefined, even when the buffer is just reowned", and every consumer
+   * resets its own working state on reown (IREmitter::ReownOrClaimBuffer -> ResetWorkingList).
+   *
+   * Why it matters here: the two virtual-memory pools are per-guest-thread compiler arenas --
+   * FEXMem_OpDispatcher (IREmitter's 8MB data + 8MB list = 16MB) and FEXMem_Frontend (the
+   * decoded-instruction buffer). Each one keeps the HIGH-WATER MARK of the largest block that
+   * thread ever compiled, dirty, forever. In madeira-log 26 a single FEXMem_OpDispatcher
+   * arena showed 15232KB charged (2064KB resident + 13168KB compressed) at a point where the
+   * owning thread was idle, and 19 such arenas were live. On a host with a memory compressor
+   * and a hard jetsam limit, a dirty page held by an idle thread is not free.
+   *
+   * A buffer only reaches this function after it has been unclaimed (the client's usage rate
+   * fell below PoolBufferWithTimedRetirement's threshold) or after it has sat DISOWNED for
+   * DURATION (5s), so this is a cold path by construction, not a per-block cost.
+   *
+   * Default is a no-op: malloc-backed pools have nothing to hand back.
+   */
+  virtual void Recycle(void* Ptr, size_t Size) {}
 };
 
 /**
@@ -396,6 +424,11 @@ private:
     FEXCore::Allocator::VirtualFree(Ptr, Size);
   }
 
+  // ml900: hand the physical pages back but keep the reservation. See IntrusivePooledAllocator::Recycle.
+  void Recycle(void* Ptr, size_t Size) override {
+    FEXCore::Allocator::VirtualDontNeed(Ptr, Size);
+  }
+
   const char* Name {};
 };
 
@@ -430,6 +463,21 @@ private:
 
   void Free(void* Ptr, size_t Size) override {
     FEXCore::Allocator::VirtualFree(Ptr, Size);
+  }
+
+  /* ml900: hand the physical pages back but keep the reservation, STOPPING SHORT OF THE GUARD
+   * PAGE. VirtualDontNeed() re-commits with one protection taken from the range's first page,
+   * so covering the last page would silently turn the PAGE_NOACCESS guard this class exists to
+   * install back into PAGE_READWRITE. See IntrusivePooledAllocator::Recycle. */
+  void Recycle(void* Ptr, size_t Size) override {
+    if (Size <= FEXCore::Utils::FEX_PAGE_SIZE) {
+      return;
+    }
+    const uintptr_t LastPageAddr = AlignDown(reinterpret_cast<uintptr_t>(Ptr) + Size - 1, FEXCore::Utils::FEX_PAGE_SIZE);
+    const size_t Recyclable = LastPageAddr - reinterpret_cast<uintptr_t>(Ptr);
+    if (Recyclable) {
+      FEXCore::Allocator::VirtualDontNeed(Ptr, Recyclable);
+    }
   }
 
   const char* Name {};

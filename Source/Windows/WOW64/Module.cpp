@@ -1117,6 +1117,63 @@ void BTCpuProcessInit() {
   // wow64.dll will only initialise the cross-process queue if this is set
   GetTLS().Wow64Info().CpuFlags = WOW64_CPUFLAGS_SOFTWARE;
 
+  /* ml900: print the EFFECTIVE JIT configuration ONCE per process.
+   *
+   * Madeira ships no /usr/share/fex-emu/Config.json and no per-application AppConfig JSON -- the device log
+   * shows FEX probing for both and finding nothing -- so every one of these values is either a
+   * compiled-in default from Config.json.in or an FEX_<NAME> environment variable. A compiled-in
+   * default leaves no string in the binary, so without this line there is no way to read a log
+   * and know what the JIT was actually doing. TSOHandlerConfig already prints the TSO half for
+   * the same reason; this covers the rest of the knobs that change generated code.
+   *
+   * `src=env` vs `src=default` per option is deliberately reported as one bitmask-free list of
+   * the options that were overridden, so an A/B run is self-describing. */
+  {
+    FEX_CONFIG_OPT(CfgMultiblock, MULTIBLOCK);
+    FEX_CONFIG_OPT(CfgMaxInst, MAXINST);
+    FEX_CONFIG_OPT(CfgSMCChecks, SMCCHECKS);
+    FEX_CONFIG_OPT(CfgX87Reduced, X87REDUCEDPRECISION);
+    FEX_CONFIG_OPT(CfgDisableL2, DISABLEL2CACHE);
+    FEX_CONFIG_OPT(CfgDynamicL1, DYNAMICL1CACHE);
+    FEX_CONFIG_OPT(CfgTSO, TSOENABLED);
+    FEX_CONFIG_OPT(CfgHalfBarrier, HALFBARRIERTSOENABLED);
+    FEX_CONFIG_OPT(CfgVectorTSO, VECTORTSOENABLED);
+    FEX_CONFIG_OPT(CfgMemcpyTSO, MEMCPYSETTSOENABLED);
+
+    static constexpr struct {
+      FEXCore::Config::ConfigOption Option;
+      const char* Name;
+    } Tracked[] = {
+      {FEXCore::Config::ConfigOption::CONFIG_MULTIBLOCK, "Multiblock"},
+      {FEXCore::Config::ConfigOption::CONFIG_MAXINST, "MaxInst"},
+      {FEXCore::Config::ConfigOption::CONFIG_SMCCHECKS, "SMCChecks"},
+      {FEXCore::Config::ConfigOption::CONFIG_X87REDUCEDPRECISION, "X87ReducedPrecision"},
+      {FEXCore::Config::ConfigOption::CONFIG_DISABLEL2CACHE, "DisableL2Cache"},
+      {FEXCore::Config::ConfigOption::CONFIG_DYNAMICL1CACHE, "DynamicL1Cache"},
+      {FEXCore::Config::ConfigOption::CONFIG_TSOENABLED, "TSOEnabled"},
+      {FEXCore::Config::ConfigOption::CONFIG_HALFBARRIERTSOENABLED, "HalfBarrierTSOEnabled"},
+      {FEXCore::Config::ConfigOption::CONFIG_VECTORTSOENABLED, "VectorTSOEnabled"},
+      {FEXCore::Config::ConfigOption::CONFIG_MEMCPYSETTSOENABLED, "MemcpySetTSOEnabled"},
+    };
+    fextl::string Overridden;
+    for (const auto& Entry : Tracked) {
+      if (FEXCore::Config::Exists(Entry.Option)) {
+        if (!Overridden.empty()) {
+          Overridden += ",";
+        }
+        Overridden += Entry.Name;
+      }
+    }
+
+    LogMan::Msg::EFmt("[fex-cfg] rev=ml900 bitness=32 Multiblock={} MaxInst={} SMCChecks={} X87ReducedPrecision={} "
+                      "DisableL2Cache={} DynamicL1Cache={} TSOEnabled={} HalfBarrierTSOEnabled={} VectorTSOEnabled={} "
+                      "MemcpySetTSOEnabled={} | overridden=[{}] (everything else is the compiled default -- Madeira "
+                      "ships no Config.json)",
+                      CfgMultiblock() ? 1 : 0, CfgMaxInst(), CfgSMCChecks(), CfgX87Reduced() ? 1 : 0, CfgDisableL2() ? 1 : 0,
+                      CfgDynamicL1() ? 1 : 0, CfgTSO() ? 1 : 0, CfgHalfBarrier() ? 1 : 0, CfgVectorTSO() ? 1 : 0,
+                      CfgMemcpyTSO() ? 1 : 0, Overridden.empty() ? "none" : Overridden.c_str());
+  }
+
   FEX_CONFIG_OPT(ProfileStats, PROFILESTATS);
   FEX_CONFIG_OPT(StartupSleep, STARTUPSLEEP);
   FEX_CONFIG_OPT(StartupSleepProcName, STARTUPSLEEPPROCNAME);

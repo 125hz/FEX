@@ -70,7 +70,10 @@ Decoder::Decoder(FEXCore::Core::InternalThreadState* Thread)
   : Thread {Thread}
   , CTX {static_cast<FEXCore::Context::ContextImpl*>(Thread->CTX)}
   , OSABI {CTX->SyscallHandler ? CTX->SyscallHandler->GetOSABI() : FEXCore::HLE::SyscallOSABI::OS_UNKNOWN}
-  , PoolObject {CTX->FrontendAllocator, sizeof(FEXCore::X86Tables::DecodedInst) * DefaultDecodedBufferSize} {
+  /* ml900: size the per-thread decoded-instruction arena from the instruction ceiling the decode
+   * loop actually enforces, not from the compile-time maximum. See Frontend.h. */
+  , DecodedBufferSize {std::clamp<size_t>(static_cast<size_t>(CTX->Config.MaxInstPerBlock()), MinDecodedBufferSize, DefaultDecodedBufferSize)}
+  , PoolObject {CTX->FrontendAllocator, sizeof(FEXCore::X86Tables::DecodedInst) * DecodedBufferSize} {
 
   FEX_CONFIG_OPT(ReducedPrecision, X87REDUCEDPRECISION);
   if (ReducedPrecision) {
@@ -1553,7 +1556,8 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
       }
 
       // Check if we need to end the entire multiblock
-      FinalInstruction = DecodedSize >= MaxInst || DecodedSize >= DefaultDecodedBufferSize || TotalInstructions >= MaxInst;
+      // ml900: bound by the buffer that was actually allocated, not by the compile-time ceiling.
+      FinalInstruction = DecodedSize >= MaxInst || DecodedSize >= DecodedBufferSize || TotalInstructions >= MaxInst;
       if (FinalInstruction) {
         break;
       }

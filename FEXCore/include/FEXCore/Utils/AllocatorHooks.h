@@ -271,7 +271,27 @@ inline void VirtualTHPControl(const void* Ptr, size_t Size, THPControl Control) 
 
 #endif
 
-/* iOS-Madeira ml362: zero a region without dirtying pages that are already
+/* ⛔ ml900: DO NOT USE THIS ON A DARWIN/iOS HOST. The premise below -- "reading an untouched
+ * anonymous page maps the shared zero page instead -- no footprint" -- is true on Linux and
+ * FALSE on Darwin. XNU has no shared zero page for anonymous memory: a read fault on an absent
+ * page of an internal VM object allocates a real zero-filled page into that object, and internal
+ * pages are charged to phys_footprint whether or not they are ever written. So on iOS this scan
+ * costs exactly as much as the memset it was written to replace, and it costs it even when every
+ * page is already zero (the common case -- every call site reported stale=0 for a whole run).
+ *
+ * Measured in madeira-log 26: a 16MB FEXMem_CallRetStacks arena read `mincore_res 16384KB`
+ * (fully resident) with only 10448KB dirty, while the emitted callret guard bounds real use to a
+ * 4MB window; and [lookup-cache] carried fleet_live=50MB of L1 arrays that nothing had used yet.
+ *
+ * Use FEXCore::Allocator::VirtualDontNeed(Ptr, Size) instead: on Windows/wine it is
+ * MEM_DECOMMIT + MEM_COMMIT, which wine answers with a fresh MAP_ANON|MAP_FIXED. That drops the
+ * physical pages and reinstalls zero-fill-on-demand, so the whole range is guaranteed zero at
+ * zero footprint -- a stronger guarantee than this scan, for less.
+ *
+ * Kept for the Linux hosts where the premise holds, and so the reasoning above stays attached to
+ * the function rather than to whichever call site removed it.
+ *
+ * iOS-Madeira ml362: zero a region without dirtying pages that are already
  * zero. The defensive full memsets added for stale-content bugs (LookupCache
  * L2/L1, CallRetStack) each commit their whole range as private-dirty pages;
  * at ~40 guest threads that is ~1.9GB of phys_footprint against the 4096MB

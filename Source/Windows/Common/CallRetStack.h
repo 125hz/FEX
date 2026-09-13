@@ -85,11 +85,40 @@ void InitializeThread(FEXCore::Core::InternalThreadState* Thread) {
    * per thread (~670MB at 40 threads, ml361 [phys-map] showed these regions
    * fully dirty). ZeroScrub keeps the zero guarantee but only dirties pages
    * that actually hold stale bytes; the stale count is the probe for whether
-   * wine's commit really hands back nonzero pages. */
+   * wine's commit really hands back nonzero pages.
+   *
+   * ml900: ZeroScrub WAS THE COST IT WAS WRITTEN TO AVOID. Its premise -- "reading an
+   * untouched anonymous page maps the shared zero page, no footprint" -- is a LINUX fact.
+   * Darwin has no shared zero page for anonymous memory: a READ fault on an absent page of
+   * an internal VM object allocates a real zero-filled page into that object, and internal
+   * pages are charged to phys_footprint whether or not they are ever written. So the scan
+   * materialised all 16MB per thread exactly as the memset did.
+   *
+   * Measured, madeira-log 26 (391s, 32-bit D3D9 title, 36 guest threads):
+   *   - [dc-census] on a callret arena: `mincore_res 16384KB -> 32KB` -- the FULL 16MB was
+   *     resident before the reset, while `dirty` was only 10448KB. Every page resident but
+   *     only some written is the signature of a read-fault sweep, not of use.
+   *   - [phys-map] top-12 regions: 10 of them are 0x1004000-sized FEXMem_CallRetStacks at
+   *     14-16MB charged each, most of it `swap=` (compressed), i.e. zero pages the
+   *     compressor is paying to hold.
+   *   - EmitCallRetStackGuard bounds callret_sp to a 4MB window and [callret-gen] reported
+   *     ONE reset in the whole run, so use cannot explain a 16MB working set.
+   *   - Every [callret] line in the run reported stale=0x0, on every thread: wine's commit
+   *     always hands back zeroed pages here, so the memset the scan protects never ran.
+   *
+   * The right primitive for "make this range zero" on a host with a compressor is to hand
+   * the pages back, not to touch them. VirtualDontNeed() is MEM_DECOMMIT + MEM_COMMIT, and
+   * wine's decommit_pages() does anon_mmap_fixed() on this (non-pool-aliased) range -- a
+   * fresh MAP_ANON|MAP_FIXED that drops the physical pages and installs zero-fill-on-demand.
+   * That is a STRONGER guarantee than the scan (all pages are definitely zero, not just the
+   * ones a probe looked at) for ZERO footprint, and [dc-census] measures it at 38-251us.
+   * It is the same call ResetCallRetStack() already uses on this exact range. */
 #ifdef FEX_IOS_HOST
   {
-    size_t Stale = FEXCore::Allocator::ZeroScrub(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
-    LogMan::Msg::EFmt("[callret] zero-scrub rev=ml362 stale=0x{:x}", Stale);
+    FEXCore::Allocator::VirtualDontNeed(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
+    LogMan::Msg::EFmt("[callret] zero-by-decommit rev=ml900 base={:#x} size={:#x} (was a full-range read scan, "
+                      "which materialised every page on Darwin)",
+                      reinterpret_cast<uint64_t>(Thread->CallRetStackBase), FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
   }
 #endif
 

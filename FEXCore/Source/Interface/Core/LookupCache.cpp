@@ -144,10 +144,32 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
    * guest thread — ~1.3GB at 40 threads (ml361 [phys-map]), against a 4096MB
    * jetsam limit. ZeroScrub verifies by read (untouched anon pages map the
    * shared zero page, no footprint) and memsets only stale pages. The stale
-   * counts double as the probe for whether the hazard still exists at all. */
-  size_t StaleL2 = L2Enabled ? FEXCore::Allocator::ZeroScrub(reinterpret_cast<void*>(PageMemory), L2TableSize) : 0;
-  size_t StaleL1 = FEXCore::Allocator::ZeroScrub(reinterpret_cast<void*>(L1Pointer), MAX_L1_SIZE);
-  LogMan::Msg::EFmt("[TI-IC] zero-scrub rev=ml606 l2-stale=0x{:x} l1-stale=0x{:x}", StaleL2, StaleL1);
+   * counts double as the probe for whether the hazard still exists at all.
+   *
+   * ml900: THE READ SCAN COSTS EXACTLY WHAT THE MEMSET COST. "Untouched anon pages map the
+   * shared zero page" is a Linux fact; on Darwin a read fault on an absent page of an
+   * internal VM object allocates a real zero-filled page into the object, and internal pages
+   * are charged to phys_footprint written or not. So scanning 2MB of L1 per cache
+   * materialised 2MB per cache -- [lookup-cache] reported fleet_live=50MB at 25 live caches
+   * in madeira-log 26, all of it created by this scan rather than by use.
+   *
+   * Hand the pages back instead of touching them: VirtualDontNeed() is MEM_DECOMMIT +
+   * MEM_COMMIT and wine's decommit_pages() answers it with anon_mmap_fixed(), which drops
+   * the physical pages and reinstalls zero-fill-on-demand ([decommit-zero] branch=
+   * "mmap-over (zero)"). That guarantees the WHOLE range reads zero -- strictly more than
+   * the scan proved -- at zero footprint. ClearThreadLocalCaches() below already zeroes this
+   * exact allocation exactly this way, so this is the same mechanism at construction time.
+   *
+   * Recommit=true, unlike ClearThreadLocalCaches() below, which passes false. That call runs on
+   * a cache that is already live and stays live, so the pages demonstrably remain usable after a
+   * bare decommit on this host. This one runs at construction, where the two lines above went out
+   * of their way to MEM_COMMIT the range because "the auto-commit-on-access-violation path
+   * doesn't take effect cleanly on iOS". Re-committing costs one syscall once per cache and
+   * leaves the allocation in exactly the state the constructor promised. */
+  FEXCore::Allocator::VirtualDontNeed(reinterpret_cast<void*>(AllocationBase), AllocationSize);
+  LogMan::Msg::EFmt("[TI-IC] zero-by-decommit rev=ml900 base=0x{:x} size=0x{:x} l2={} "
+                    "(was a full-range read scan, which materialised every page on Darwin)",
+                    AllocationBase, AllocationSize, L2Enabled ? 1 : 0);
 #endif
 }
 
