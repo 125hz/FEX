@@ -20,6 +20,7 @@ $end_info$
 #include "Interface/Core/OpcodeDispatcher.h"
 #include "Interface/Core/JIT/JITClass.h"
 #include "Interface/Core/Dispatcher/Dispatcher.h"
+#include "Interface/Core/IosProfMap.h"
 #include "Interface/Core/X86Tables/X86Tables.h"
 #include <Interface/GDBJIT/GDBJIT.h>
 #include "Interface/IR/IR.h"
@@ -61,7 +62,9 @@ $end_info$
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <string_view>
 
 #if defined(FEX_IOS_HOST) && defined(_WIN32)
 /* MADEIRA ml708: the dual-mapped JIT pool's RX range, defined in rpmalloc.c and published by the
@@ -832,6 +835,162 @@ std::atomic<uint64_t> GuestInstsCompiled {};
 std::atomic<uint64_t> HostCodeBytes {};
 } // namespace MadeiraStats
 
+} // namespace FEXCore::Context (ml930: reopened below — IosProfMap is its own
+  // top-level namespace and must not nest inside Context)
+
+#ifdef FEX_IOS_HOST
+/* ml930: the published host-PC -> guest-RIP map. Rationale and invariants live in
+ * IosProfMap.h; this is only the storage and the two hot-ish entry points.
+ *
+ * The ring is allocated LAZILY, on the first compile after the [prof] sampler has
+ * set Enable through the published header. A run with the profiler off therefore
+ * costs one relaxed load per COMPILE (not per execution) and zero bytes. */
+namespace FEXCore::IosProfMap {
+Header Hdr {
+  .Magic = FEX_IOSPROFMAP_MAGIC,
+  .Version = FEX_IOSPROFMAP_VERSION,
+  .EntrySize = sizeof(Block),
+  .Capacity = 0,
+};
+
+/* 64 K x 24 B = 1.5 MB, and only while the sampler is attached. Sized against the
+ * device log's steady state (~40 k live blocks): a wrap costs attribution of the
+ * OLDEST compiles only, and the sampler reports the wrap so the loss is never
+ * silent. Must stay a power of two — the slot index is a mask, not a modulo. */
+static constexpr uint32_t kCapacity = 64 * 1024;
+
+static std::atomic<uint32_t> AllocState {0}; // 0 = untried, 1 = in progress, 2 = done
+
+bool Enabled() {
+  if (Hdr.Entries) [[likely]] {
+    return true;
+  }
+  if (!Hdr.Enable.load(std::memory_order_relaxed)) {
+    return false;
+  }
+  uint32_t Expected = 0;
+  if (!AllocState.compare_exchange_strong(Expected, 1, std::memory_order_acq_rel)) {
+    return Hdr.Entries != 0;
+  }
+  void* Ring = std::calloc(kCapacity, sizeof(Block));
+  if (!Ring) {
+    Hdr.AllocFailed.fetch_add(1, std::memory_order_relaxed);
+    AllocState.store(2, std::memory_order_release);
+    return false;
+  }
+  Hdr.Capacity = kCapacity;
+  /* Capacity before Entries, and a barrier between: the sampler validates
+   * Entries last, so it can never see a ring address with a zero capacity. */
+  std::atomic_thread_fence(std::memory_order_release);
+  Hdr.Entries = reinterpret_cast<uint64_t>(Ring);
+  AllocState.store(2, std::memory_order_release);
+  LogMan::Msg::EFmt("[prof-map] ml930 ring armed at {} ({} entries x {} B) — [prof] can now name JIT samples", Ring, kCapacity,
+                    (unsigned)sizeof(Block));
+  return true;
+}
+
+static inline uint16_t Sat16(uint32_t v) {
+  return v > 0xffff ? 0xffff : static_cast<uint16_t>(v);
+}
+
+void Record(uint64_t HostStart, uint64_t HostSize, uint64_t GuestRIP, uint32_t NumInst, uint32_t NumX87, uint32_t NumVec, uint32_t NumAtomic,
+            uint32_t NumTSO) {
+  Hdr.X87Ops.fetch_add(NumX87, std::memory_order_relaxed);
+  Hdr.VecOps.fetch_add(NumVec, std::memory_order_relaxed);
+  Hdr.AtomicOps.fetch_add(NumAtomic, std::memory_order_relaxed);
+  Hdr.TSOOps.fetch_add(NumTSO, std::memory_order_relaxed);
+  Hdr.GuestInsts.fetch_add(NumInst, std::memory_order_relaxed);
+  Hdr.HostBytes.fetch_add(HostSize, std::memory_order_relaxed);
+  Hdr.Blocks.fetch_add(1, std::memory_order_relaxed);
+
+  auto* Ring = reinterpret_cast<Block*>(Hdr.Entries);
+  if (!Ring || !HostStart || !HostSize) {
+    return;
+  }
+  const uint64_t Index = Hdr.Head.fetch_add(1, std::memory_order_relaxed);
+  Block& E = Ring[Index & (Hdr.Capacity - 1)];
+  /* HostStart is written LAST. The sampler rejects a zero HostStart, so a reader
+   * racing this write sees either the previous tenant or nothing — never a live
+   * host range paired with another block's RIP. */
+  E.HostSize = static_cast<uint32_t>(HostSize);
+  E.GuestRIP = static_cast<uint32_t>(GuestRIP);
+  E.NumInst = Sat16(NumInst);
+  E.NumX87 = Sat16(NumX87);
+  E.NumVec = Sat16(NumVec);
+  E.NumTSO = Sat16(NumTSO);
+  std::atomic_thread_fence(std::memory_order_release);
+  E.HostStart = HostStart;
+}
+
+void ClearDispRegions() {
+  Hdr.DispatcherBegin = 0;
+  Hdr.DispatcherEnd = 0;
+  Hdr.NumDispRegions = 0;
+}
+
+void AddDispRegion(const char* Name, uint64_t Begin) {
+  if (!Begin || Hdr.NumDispRegions >= MaxDispRegions) {
+    return;
+  }
+  auto& R = Hdr.DispRegions[Hdr.NumDispRegions];
+  R.Begin = Begin;
+  size_t i = 0;
+  for (; Name[i] && i < sizeof(R.Name) - 1; ++i) {
+    R.Name[i] = Name[i];
+  }
+  R.Name[i] = 0;
+  ++Hdr.NumDispRegions;
+}
+
+void SetDispatcherRange(uint64_t Begin, uint64_t End) {
+  Hdr.DispatcherBegin = Begin;
+  Hdr.DispatcherEnd = End;
+}
+
+/* Built once from FEXCore::IR::GetName(), never from a hand-written opcode list:
+ * an out-of-date list would quietly under-count exactly the ops a codegen change
+ * just added, which is the one situation these counters exist for. */
+uint8_t ClassifyOp(FEXCore::IR::IROps Op) {
+  static uint8_t Table[FEXCore::IR::IROps::OP_LAST + 1];
+  static std::atomic<bool> Built {false};
+  if (!Built.load(std::memory_order_acquire)) {
+    for (unsigned i = 0; i <= FEXCore::IR::IROps::OP_LAST; ++i) {
+      const auto O = static_cast<FEXCore::IR::IROps>(i);
+      const std::string_view N = FEXCore::IR::GetName(O);
+      uint8_t C = 0;
+      /* LoweredX87 is IR.json's own "X87": true flag, so this set cannot drift
+       * from the emitter. The name test only adds the F64 reduced-precision
+       * lowering, which is not flagged but is still x87 work. */
+      if (FEXCore::IR::LoweredX87(O) || N.starts_with("F80") || N.starts_with("F64") || N.find("Stack") != std::string_view::npos) {
+        C = 1;
+      } else if (N.ends_with("TSO")) {
+        C = 4; // LoadMemTSO / StoreMemTSO — what TSOEnabled costs
+      } else if (N.find("Atomic") != std::string_view::npos || N.starts_with("CAS")) {
+        C = 3;
+      } else if (N.size() > 1 && N[0] == 'V') {
+        C = 2; // every vector op FEX names V*
+      }
+      Table[i] = C;
+    }
+    Built.store(true, std::memory_order_release);
+  }
+  return Op <= FEXCore::IR::IROps::OP_LAST ? Table[Op] : 0;
+}
+} // namespace FEXCore::IosProfMap
+
+/* C-linkage handles for Source/Windows/WOW64/Module.cpp, which builds against the
+ * mingw SDK and has no FEXCore/Source include path. */
+extern "C" uint64_t ios_prof_map_header(void) {
+  return reinterpret_cast<uint64_t>(&FEXCore::IosProfMap::Hdr);
+}
+extern "C" void ios_prof_map_set_guest(uint64_t GuestBase, uint32_t Bitness) {
+  FEXCore::IosProfMap::Hdr.GuestBase = GuestBase;
+  FEXCore::IosProfMap::Hdr.Bitness = Bitness;
+}
+#endif
+
+namespace FEXCore::Context { // ml930: reopened
+
 /* iOS-Madeira ml623: targeted IR capture (PassManager.cpp). FEX_MadeiraIRCapTarget is the
  * absolute guest address of the ONE instruction under investigation, published by the
  * Windows-side InvalidationTracker at module load. The decode loop below marks the
@@ -1248,6 +1407,34 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
   MadeiraStats::BlocksCompiled.fetch_add(1, std::memory_order_relaxed);
   MadeiraStats::GuestInstsCompiled.fetch_add(TotalInstructions, std::memory_order_relaxed);
   MadeiraStats::HostCodeBytes.fetch_add(DebugData->HostCodeSize, std::memory_order_relaxed);
+
+#ifdef FEX_IOS_HOST
+  /* ml930: publish this block's host range, its guest RIP and its op mix for the
+   * [prof] sampler (IosProfMap.h). Gated on the sampler having attached, so a
+   * profiler-less run pays ONE relaxed load here and nothing else. The IR walk is
+   * on the compile path — which already costs microseconds — never on the
+   * execution path, and each op is a single table lookup.
+   *
+   * CompiledCode.BlockBegin is the FINAL RX address: JIT.cpp:1351-1356 rebases it
+   * by Delta after the block is migrated into the CodeBuffer, so this is the same
+   * namespace the sampler's host PC is in. */
+  if (FEXCore::IosProfMap::Enabled() && CompiledCode.BlockBegin && CompiledCode.Size) {
+    uint32_t NX87 = 0, NVec = 0, NAtomic = 0, NTSO = 0;
+    for (auto [BlockNode, BlockHeader] : IRView->GetBlocks()) {
+      for (auto [CodeNode, IROp] : IRView->GetCode(BlockNode)) {
+        switch (FEXCore::IosProfMap::ClassifyOp(IROp->Op)) {
+        case 1: ++NX87; break;
+        case 2: ++NVec; break;
+        case 3: ++NAtomic; break;
+        case 4: ++NTSO; break;
+        default: break;
+        }
+      }
+    }
+    FEXCore::IosProfMap::Record(reinterpret_cast<uint64_t>(CompiledCode.BlockBegin), CompiledCode.Size, GuestRIP, TotalInstructions, NX87,
+                                NVec, NAtomic, NTSO);
+  }
+#endif
 
   /* ml623: the final arm of the capture -- the host bytes actually emitted for the
    * target instruction, bounded to [its HostEntryOffset, the next one). This is the

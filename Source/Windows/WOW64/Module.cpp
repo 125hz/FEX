@@ -314,6 +314,27 @@ inline uint64_t ToGuestIfInWindow(uint64_t Host) {
 }
 } // namespace GuestWindow
 
+#ifdef FEX_IOS_HOST
+/* ml930: the ONE handle the ntdll-unix [prof] sampler needs.
+ *
+ * A DATA export, deliberately. ml613/ml614 established that a native Mach-O `blr`
+ * into a PE export of the emulator crashes every launch, and even for this plain
+ * aarch64 PE a call would run emulator code on the sampler's thread at an
+ * arbitrary point. So nothing is ever called: the sampler resolves this symbol's
+ * ADDRESS out of the module's export table, reads the uint64 stored here, and
+ * then reads the header and the ring with mach_vm_read_overwrite only.
+ *
+ * Not listed in libwow64fex.def for the same reason BTCpuIosSetMonoBridge is not:
+ * a .def entry for a symbol that only exists in an iOS-host build is a link
+ * error everywhere else. dllexport under the same #ifdef as the definition. */
+extern "C" __declspec(dllexport) uint64_t BTCpuIosProfMap = 0;
+
+/* Defined in FEXCore's Core.cpp (same link). Declared rather than included:
+ * this TU builds against the mingw SDK and has no FEXCore/Source include path. */
+extern "C" uint64_t ios_prof_map_header(void);
+extern "C" void ios_prof_map_set_guest(uint64_t GuestBase, uint32_t Bitness);
+#endif
+
 namespace {
 namespace BridgeInstrs {
   // These directly jumped to by the guest to make system calls
@@ -893,6 +914,14 @@ void BTCpuProcessInit() {
     IosRawReport("E [wow-base] class {} -> status={:#x} B={:#x} (guest window [{:#x}, {:#x}))",
                  GuestWindow::ProcessWineIosWowGuestBase, static_cast<uint32_t>(Err), GuestWindow::Base, GuestWindow::Base,
                  GuestWindow::Base + GuestWindow::Size);
+    /* ml930: publish the [prof] block map's header address through the one DATA
+     * export (below). B and the bitness go in here because the sampler needs both
+     * to turn a 32-bit guest RIP into a module name, and this is the only moment
+     * at which B is known and stable. */
+    ios_prof_map_set_guest(GuestWindow::Base, 32);
+    BTCpuIosProfMap = ios_prof_map_header();
+    IosRawReport("E [prof-map] ml930 header published at {:#x} (export BTCpuIosProfMap) — data only, never called",
+                 BTCpuIosProfMap);
 #endif
   }
 
@@ -1436,9 +1465,17 @@ NTSTATUS BTCpuSuspendLocalThread(HANDLE Thread, ULONG* Count) {
     NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, PAGE_READONLY, &TmpProt);
   }
 
-  // Spin until the JIT is interrupted
-  while (TLS.ControlWord().load() & ControlBits::IN_JIT)
-    ;
+  /* Spin until the JIT is interrupted.
+   *
+   * ml930: `yield` added. This was a NAKED relaxed-load spin: on iOS the waiter
+   * and the JIT thread it is waiting for are frequently on the same cluster and a
+   * bare load loop both burns a full core and starves the very thread that has to
+   * reach the interrupt check. `yield` is an instruction hint, not a syscall — it
+   * costs nothing and never enters the kernel, so it cannot become another
+   * swtch_pri source (see the NtYieldExecution finding in WOW64_DESIGN.md §6). */
+  while (TLS.ControlWord().load() & ControlBits::IN_JIT) {
+    __asm__ volatile("yield" ::: "memory");
+  }
 
   // The JIT has now been interrupted and the context stored in the thread's CPU area is up-to-date
   if (Err = NtSuspendThread(*ThreadDup, Count); Err) {

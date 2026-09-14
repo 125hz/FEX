@@ -14,6 +14,7 @@
 #include "Interface/Context/Context.h"
 #include "Interface/Core/CPUBackend.h"
 #include "Interface/Core/Dispatcher/Dispatcher.h"
+#include "Interface/Core/IosProfMap.h"
 #include "Interface/Core/LookupCache.h"
 #include "Utils/MemberFunctionToPointer.h"
 
@@ -450,6 +451,9 @@ void Dispatcher::EmitDispatcher() {
   }
 
   // Need to create the block
+#ifdef FEX_IOS_HOST
+  const uint64_t IosNoBlockAddress = GetCursorAddress<uint64_t>(); // ml930 [prof] region map
+#endif
   {
     (void)Bind(&NoBlock);
 
@@ -484,6 +488,9 @@ void Dispatcher::EmitDispatcher() {
     br(TMP1);
   }
 
+#ifdef FEX_IOS_HOST
+  const uint64_t IosCompileSingleStepAddress = GetCursorAddress<uint64_t>(); // ml930
+#endif
   {
     (void)Bind(&CompileSingleStep);
 
@@ -850,6 +857,84 @@ void Dispatcher::EmitDispatcher() {
                     Start, End, AbsoluteLoopTopAddress, AbsoluteLoopTopAddressFillSRA, AbsoluteLoopTopAddressEnterEC,
                     AbsoluteLoopTopAddressEnterECFillSRA, reinterpret_cast<uint64_t>(CallbackPtr),
                     reinterpret_cast<uint64_t>(DispatchPtr));
+
+  /* ml930: PUBLISH THE WHOLE REGION MAP, not just six landmarks.
+   *
+   * The l35 device log put 10-27 % of all CPU at four host PCs inside this
+   * 16 KB buffer (+0x1858, +0x1904, +0x200c, +0x20b8) and there was no way to
+   * say which helper that was — the only published addresses ended at
+   * CallbackPtr (+0x3c0). "Somewhere after the dispatcher core" is not an
+   * answer when the candidates (the F64 transcendental helpers, the 18
+   * interpreter-fallback ABI thunks, LUDIV/LDIV) imply completely different
+   * fixes. Publishing every named address makes it a lookup instead of an
+   * inference, for this run and every future one.
+   *
+   * Emission-time only: 38 stores into a static array, once per process. */
+  {
+    using FEXCore::IosProfMap::AddDispRegion;
+    FEXCore::IosProfMap::ClearDispRegions();
+    AddDispRegion("Dispatch", reinterpret_cast<uint64_t>(DispatchPtr));
+    AddDispRegion("LoopTopFillSRA", AbsoluteLoopTopAddressFillSRA);
+    if (AbsoluteLoopTopAddressEnterECFillSRA) {
+      AddDispRegion("EnterECFillSRA", AbsoluteLoopTopAddressEnterECFillSRA);
+    }
+    if (AbsoluteLoopTopAddressEnterEC) {
+      AddDispRegion("EnterEC", AbsoluteLoopTopAddressEnterEC);
+    }
+    AddDispRegion("LoopTop+L1probe", AbsoluteLoopTopAddress);
+    AddDispRegion("ThreadStopSpillSRA", ThreadStopHandlerAddressSpillSRA);
+    AddDispRegion("ThreadStop", ThreadStopHandlerAddress);
+    AddDispRegion("ExitFunctionLinker", ExitFunctionLinkerAddress);
+    AddDispRegion("NoBlock+CompileBlock", IosNoBlockAddress);
+    AddDispRegion("CompileSingleStep", IosCompileSingleStepAddress);
+    AddDispRegion("SignalHandlerReturn", SignalHandlerReturnAddress);
+    AddDispRegion("SignalHandlerReturnRT", SignalHandlerReturnAddressRT);
+    AddDispRegion("ThreadPauseSpillSRA", ThreadPauseHandlerAddressSpillSRA);
+    AddDispRegion("ThreadPause", ThreadPauseHandlerAddress);
+    AddDispRegion("CallbackPtr", reinterpret_cast<uint64_t>(CallbackPtr));
+    AddDispRegion("LUDIV", LUDIVHandlerAddress);
+    AddDispRegion("LDIV", LDIVHandlerAddress);
+    AddDispRegion("x87:F64Sin", F64SinHandlerAddress);
+    AddDispRegion("x87:F64Cos", F64CosHandlerAddress);
+    AddDispRegion("x87:F64Tan", F64TanHandlerAddress);
+    AddDispRegion("x87:F64F2XM1", F64F2XM1HandlerAddress);
+    AddDispRegion("x87:F64Scale", F64ScaleHandlerAddress);
+    AddDispRegion("x87:F64Atan", F64AtanHandlerAddress);
+    AddDispRegion("x87:F64FYL2X", F64FYL2XHandlerAddress);
+    AddDispRegion("x87:F64FYL2XP1", F64FYL2XP1HandlerAddress);
+    AddDispRegion("x87:F64FPREM", F64FPREMHandlerAddress);
+    AddDispRegion("x87:F64FPREM1", F64FPREM1HandlerAddress);
+    /* The interpreter-fallback thunks. Names are the ABI shape, which is what
+     * identifies the softfloat routine being called: FABI_F80_* is the
+     * FULL-PRECISION x87 path that X87ReducedPrecision=1 removes entirely. */
+    static constexpr struct {
+      FallbackABI ABI;
+      const char* Name;
+    } IosABINames[] = {
+      {FABI_F80_I16_F32_PTR, "fabi:F80_I16_F32"},
+      {FABI_F80_I16_F64_PTR, "fabi:F80_I16_F64"},
+      {FABI_F80_I16_I16_PTR, "fabi:F80_I16_I16"},
+      {FABI_F80_I16_I32_PTR, "fabi:F80_I16_I32"},
+      {FABI_F32_I16_F80_PTR, "fabi:F32_I16_F80"},
+      {FABI_F64_I16_F80_PTR, "fabi:F64_I16_F80"},
+      {FABI_F64_F64_PTR, "fabi:F64_F64"},
+      {FABI_F64_F64_F64_PTR, "fabi:F64_F64_F64"},
+      {FABI_I16_I16_F80_PTR, "fabi:I16_I16_F80"},
+      {FABI_I32_I16_F80_PTR, "fabi:I32_I16_F80"},
+      {FABI_I64_I16_F80_PTR, "fabi:I64_I16_F80"},
+      {FABI_I64_I16_F80_F80_PTR, "fabi:I64_I16_F80_F80"},
+      {FABI_F80_I16_F80_PTR, "fabi:F80_I16_F80"},
+      {FABI_F80_I16_F80_F80_PTR, "fabi:F80_I16_F80_F80"},
+      {FABI_F80x2_I16_F80_PTR, "fabi:F80x2_I16_F80"},
+      {FABI_F64x2_F64_PTR, "fabi:F64x2_F64"},
+      {FABI_I32_I64_I64_V128_V128_I16, "fabi:I32_I64_I64_V128"},
+      {FABI_I32_V128_V128_I16, "fabi:I32_V128_V128_I16"},
+    };
+    for (const auto& E : IosABINames) {
+      AddDispRegion(E.Name, ABIPointers[E.ABI]);
+    }
+    FEXCore::IosProfMap::SetDispatcherRange(reinterpret_cast<uint64_t>(DispatchPtr), End);
+  }
 #endif
   // sys_icache_invalidate is from libkern (Apple-native only). When cross-
   // compiling to Windows ARM64EC PE, libkern isn't available — use the
