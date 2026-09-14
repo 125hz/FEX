@@ -887,6 +887,33 @@ void BTCpuProcessInit() {
   FEXCore::Config::Set(FEXCore::Config::CONFIG_INTERPRETER_INSTALLED, "0");
   FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, "0");
 
+  /* MADEIRA ml950: 64-bit x87 is the DEFAULT for 32-bit guests on this host.
+   *
+   * Why: with the compiled-in default (80-bit, X87ReducedPrecision=0) every x87 op that FEXCore
+   * cannot keep in a double goes out through the softfloat ABI thunks, and a device A/B on a
+   * 32-bit D3D9 title measured those thunks at 20-50 % of ALL CPU, with frame rate roughly
+   * doubling when the option was flipped. 32-bit code is where x87 still lives -- a 64-bit guest
+   * uses SSE for scalar float -- so the trade is worth taking exactly here and the 64-bit/ARM64EC
+   * module is untouched.
+   *
+   * The trade is real and is not a rounding detail: x87 intermediates become 53-bit instead of
+   * 64-bit, so anything that genuinely depends on the extra mantissa bits (some geometry,
+   * collision and physics kernels, a few reduction loops) can produce different results, and a
+   * guest that compares its own float output against a recorded value can disagree. That is the
+   * price of the frame rate, and it is why this is a DEFAULT rather than a hard-coded value.
+   *
+   * Exists() is the layered "did anyone actually ask for this" test: FEX::Config::LoadConfig and
+   * ReloadMetaLayer have already run above, so the meta layer holds whatever the environment layer
+   * picked up from FEX_X87REDUCEDPRECISION -- which is exactly what Documents/madeira-fex.txt
+   * writes (ContentView.swift setenv("FEX_" + NAME)). So a user line X87REDUCEDPRECISION=0 still
+   * wins, and so does the env var directly; only the absence of any override lands here. The same
+   * Exists() call drives the `overridden=[...]` list in [fex-cfg] below, so a log still says
+   * whether a run used this default or a user value. */
+  const bool MadeiraX87DefaultApplied = !FEXCore::Config::Exists(FEXCore::Config::CONFIG_X87REDUCEDPRECISION);
+  if (MadeiraX87DefaultApplied) {
+    FEXCore::Config::Set(FEXCore::Config::CONFIG_X87REDUCEDPRECISION, "1");
+  }
+
   // MADEIRA: pick up the guest window before anything else touches a guest address, and in
   // particular before CreateNewContext - FEXCore resolves Config.GuestBase in its constructor and
   // the dispatcher bakes the base into emitted code, so a later value would be ignored.
@@ -1186,12 +1213,22 @@ void BTCpuProcessInit() {
     };
     fextl::string Overridden;
     for (const auto& Entry : Tracked) {
+      /* ml950: the X87ReducedPrecision default set at the top of this function goes through
+       * Config::Set, so Exists() would report our own default as a user override and the log
+       * would stop distinguishing the two. Report it as what it is instead. */
+      if (Entry.Option == FEXCore::Config::ConfigOption::CONFIG_X87REDUCEDPRECISION && MadeiraX87DefaultApplied) {
+        continue;
+      }
       if (FEXCore::Config::Exists(Entry.Option)) {
         if (!Overridden.empty()) {
           Overridden += ",";
         }
         Overridden += Entry.Name;
       }
+    }
+    if (MadeiraX87DefaultApplied) {
+      Overridden += Overridden.empty() ? "" : ",";
+      Overridden += "X87ReducedPrecision(madeira-32bit-default)";
     }
 
     LogMan::Msg::EFmt("[fex-cfg] rev=ml900 bitness=32 Multiblock={} MaxInst={} SMCChecks={} X87ReducedPrecision={} "
