@@ -604,7 +604,7 @@ ARMEmitter::Register Arm64JITCore::GetGuestMemReg(IR::OrderedNodeWrapper Addr, A
 
 Arm64JITCore::GuestMemAddr Arm64JITCore::GetGuestMemAddr(IR::OpSize AccessSize, IR::OrderedNodeWrapper Addr, IR::OrderedNodeWrapper Offset,
                                                          IR::MemOffsetType OffsetType, uint8_t OffsetScale, ARMEmitter::Register Tmp,
-                                                         bool HostAddr) {
+                                                         bool HostAddr, bool AllowRegOffsetFold) {
   const auto AddrReg = GetReg(Addr);
   if (!GuestBase) {
     // Identity mapped: nothing to do, and nothing is emitted.
@@ -623,6 +623,14 @@ Arm64JITCore::GuestMemAddr Arm64JITCore::GetGuestMemAddr(IR::OpSize AccessSize, 
   const auto NoOffset = IR::OrderedNodeWrapper::WrapOffset(0);
 
   if (Offset.IsInvalid()) {
+    if (AllowRegOffsetFold) {
+      /* MADEIRA ml920: `[REG_GUEST_BASE, wEA, uxtw #0]`. The UXTW in the addressing mode does
+       * exactly the job the `add ..., UXTW` did - zero-extend the guest EA from 32 bits, so nothing
+       * depends on the upper half of the guest register - and the whole conversion becomes free.
+       * The single-conversion and 4GiB-wrap rules in the class comment still hold: there is no
+       * displacement here, so there is nothing that could be added on the far side of the window. */
+      return {REG_GUEST_BASE.R(), NoOffset, IR::MemOffsetType::SXTX, 1, true, AddrReg};
+    }
     return {ApplyGuestBase(AddrReg, Tmp), NoOffset, IR::MemOffsetType::SXTX, 1};
   }
 
@@ -671,6 +679,13 @@ Arm64JITCore::GuestMemAddr Arm64JITCore::GetGuestMemAddr(IR::OpSize AccessSize, 
 
   // UXTW here does double duty: it wraps the effective address at 4GiB the way x86 does, and it
   // makes the zero extension explicit so nothing depends on the upper half of the fold above.
+  //
+  // MADEIRA ml920: when the consumer takes a register-offset operand, that UXTW add is the
+  // addressing mode, so it does not need to be an instruction. Tmp still holds the *completed*
+  // guest effective address, which is what keeps the fold-then-convert ordering intact.
+  if (AllowRegOffsetFold) {
+    return {REG_GUEST_BASE.R(), NoOffset, IR::MemOffsetType::SXTX, 1, true, Tmp};
+  }
   add(ARMEmitter::Size::i64Bit, Tmp, REG_GUEST_BASE.R(), Tmp, ARMEmitter::ExtendedType::UXTW, 0);
   return {Tmp, NoOffset, IR::MemOffsetType::SXTX, 1};
 }
@@ -701,6 +716,14 @@ ARMEmitter::ExtendedMemOperand Arm64JITCore::GenerateMemOperand(
   }
 
   FEX_UNREACHABLE;
+}
+
+// MADEIRA ml920: see GuestMemAddr::RegOffsetFold.
+ARMEmitter::ExtendedMemOperand Arm64JITCore::GenerateMemOperand(IR::OpSize AccessSize, const GuestMemAddr& Guest) {
+  if (Guest.RegOffsetFold) {
+    return ARMEmitter::ExtendedMemOperand(Guest.Base.X(), Guest.IndexReg.X(), ARMEmitter::ExtendedType::UXTW, 0);
+  }
+  return GenerateMemOperand(AccessSize, Guest.Base, Guest.Offset, Guest.OffsetType, Guest.OffsetScale);
 }
 
 ARMEmitter::Register Arm64JITCore::ApplyMemOperand(IR::OpSize AccessSize, ARMEmitter::Register Base, ARMEmitter::Register Tmp,
@@ -796,9 +819,12 @@ DEF_OP(LoadMem) {
   const auto Op = IROp->C<IR::IROp_LoadMem>();
   const auto OpSize = IROp->Size;
 
-  const auto Guest = GetGuestMemAddr(OpSize, Op->Addr, Op->Offset, Op->OffsetType, Op->OffsetScale, REG_GUEST_ADDR_TMP.R(), Op->HostAddr);
+  // MADEIRA ml920: every lowering below is a plain ldr except the 256-bit SVE one, whose operand has
+  // no extend field - so the window add folds into the addressing mode for all the rest.
+  const auto Guest = GetGuestMemAddr(OpSize, Op->Addr, Op->Offset, Op->OffsetType, Op->OffsetScale, REG_GUEST_ADDR_TMP.R(),
+                                     Op->HostAddr, OpSize != IR::OpSize::i256Bit);
   const auto MemReg = Guest.Base;
-  const auto MemSrc = GenerateMemOperand(OpSize, MemReg, Guest.Offset, Guest.OffsetType, Guest.OffsetScale);
+  const auto MemSrc = GenerateMemOperand(OpSize, Guest);
 
   if (Op->Class == IR::RegClass::GPR) {
     const auto Dst = GetReg(Node);
@@ -875,7 +901,12 @@ DEF_OP(LoadMemTSO) {
   // address. Keeping every atomic and acquire form in the `[Xn]` shape is deliberate: the unaligned
   // backpatcher in Utils/ArchHelpers/Arm64.cpp decodes these encodings, and it must never have to
   // learn about an extended-register addressing mode.
-  const auto Guest = GetGuestMemAddr(OpSize, Op->Addr, Op->Offset, Op->OffsetType, Op->OffsetScale);
+  //
+  // MADEIRA ml920: the vector class is the exception - it lowers to a plain ldr (plus a DMB when
+  // vector TSO is on), which the backpatcher never sees and which does have a register-offset form,
+  // so it takes the fold. That is the whole x87/SSE load path on a VectorTSOEnabled=0 build.
+  const auto Guest = GetGuestMemAddr(OpSize, Op->Addr, Op->Offset, Op->OffsetType, Op->OffsetScale, REG_GUEST_ADDR_TMP.R(), false,
+                                     Op->Class != IR::RegClass::GPR && OpSize != IR::OpSize::i256Bit);
   const auto MemReg = Guest.Base;
 
   if (CTX->HostFeatures.SupportsTSOImm9 && Op->Class == IR::RegClass::GPR) {
@@ -897,8 +928,12 @@ DEF_OP(LoadMemTSO) {
       case IR::OpSize::i64Bit: ldapur(Dst.X(), MemReg, Offset); break;
       default: LOGMAN_MSG_A_FMT("Unhandled LoadMemTSO size: {}", OpSize); break;
       }
-      // Half-barrier once back-patched.
-      nop();
+      // Half-barrier once back-patched -- MADEIRA ml920: only reserve the slot when the unaligned
+      // handler will actually patch it (ContextImpl::IsHalfBarrierTSOEnabled). Unchanged at the
+      // default; 4 bytes off every 16/32/64-bit TSO GPR access when the option is turned off.
+      if (CTX->IsHalfBarrierTSOEnabled()) {
+        nop();
+      }
     }
   } else if (CTX->HostFeatures.SupportsRCPC && Op->Class == IR::RegClass::GPR) {
     const auto Dst = GetReg(Node);
@@ -912,8 +947,12 @@ DEF_OP(LoadMemTSO) {
       case IR::OpSize::i64Bit: ldapr(Dst.X(), MemReg); break;
       default: LOGMAN_MSG_A_FMT("Unhandled LoadMemTSO size: {}", OpSize); break;
       }
-      // Half-barrier once back-patched.
-      nop();
+      // Half-barrier once back-patched -- MADEIRA ml920: only reserve the slot when the unaligned
+      // handler will actually patch it (ContextImpl::IsHalfBarrierTSOEnabled). Unchanged at the
+      // default; 4 bytes off every 16/32/64-bit TSO GPR access when the option is turned off.
+      if (CTX->IsHalfBarrierTSOEnabled()) {
+        nop();
+      }
     }
   } else if (Op->Class == IR::RegClass::GPR) {
     const auto Dst = GetReg(Node);
@@ -927,12 +966,16 @@ DEF_OP(LoadMemTSO) {
       case IR::OpSize::i64Bit: ldar(Dst.X(), MemReg); break;
       default: LOGMAN_MSG_A_FMT("Unhandled LoadMemTSO size: {}", OpSize); break;
       }
-      // Half-barrier once back-patched.
-      nop();
+      // Half-barrier once back-patched -- MADEIRA ml920: only reserve the slot when the unaligned
+      // handler will actually patch it (ContextImpl::IsHalfBarrierTSOEnabled). Unchanged at the
+      // default; 4 bytes off every 16/32/64-bit TSO GPR access when the option is turned off.
+      if (CTX->IsHalfBarrierTSOEnabled()) {
+        nop();
+      }
     }
   } else {
     const auto Dst = GetVReg(Node);
-    const auto MemSrc = GenerateMemOperand(OpSize, MemReg, Guest.Offset, Guest.OffsetType, Guest.OffsetScale);
+    const auto MemSrc = GenerateMemOperand(OpSize, Guest);
     switch (OpSize) {
     case IR::OpSize::i8Bit: ldrb(Dst, MemSrc); break;
     case IR::OpSize::i16Bit: ldrh(Dst, MemSrc); break;
@@ -1608,14 +1651,17 @@ DEF_OP(Push) {
       Src = TMP1;
     }
 
+    // MADEIRA ml920: the conversion is the store's own addressing mode -- `[REG_GUEST_BASE, wESP,
+    // uxtw #0]` -- so a guest `push` is `sub` + `str`, one instruction instead of two on top of the
+    // architectural decrement. The UXTW does what the explicit `add ..., UXTW` did.
     sub(ARMEmitter::Size::i32Bit, Dst, AddrSrc, ValueSize);
-    const auto HostAddr = ApplyGuestBase(Dst);
+    const auto HostAddr = ARMEmitter::ExtendedMemOperand(REG_GUEST_BASE, Dst.X(), ARMEmitter::ExtendedType::UXTW, 0);
 
     switch (ValueSize) {
-    case 1: sturb(Src.W(), HostAddr, 0); break;
-    case 2: sturh(Src.W(), HostAddr, 0); break;
-    case 4: stur(Src.W(), HostAddr, 0); break;
-    case 8: stur(Src.X(), HostAddr, 0); break;
+    case 1: strb(Src, HostAddr); break;
+    case 2: strh(Src, HostAddr); break;
+    case 4: str(Src.W(), HostAddr); break;
+    case 8: str(Src.X(), HostAddr); break;
     default: LOGMAN_MSG_A_FMT("Unhandled {} size: {}", __func__, ValueSize); break;
     }
     return;
@@ -1760,13 +1806,15 @@ DEF_OP(Pop) {
     // MADEIRA: post-indexed writeback would put a host address in the guest's ESP, so load through
     // the converted *original* pointer with no writeback and advance the architectural pointer
     // afterwards, in the guest namespace and at i32Bit width.
-    const auto HostAddr = ApplyGuestBase(Addr);
+    // MADEIRA ml920: as Push -- fold the window add into the load's addressing mode, so a guest
+    // `pop` is `ldr` + `add` rather than `add` + `ldur` + `add`.
+    const auto HostAddr = ARMEmitter::ExtendedMemOperand(REG_GUEST_BASE, Addr.X(), ARMEmitter::ExtendedType::UXTW, 0);
 
     switch (Size) {
-    case 1: ldurb(Dst.W(), HostAddr, 0); break;
-    case 2: ldurh(Dst.W(), HostAddr, 0); break;
-    case 4: ldur(Dst.W(), HostAddr, 0); break;
-    case 8: ldur(Dst.X(), HostAddr, 0); break;
+    case 1: ldrb(Dst, HostAddr); break;
+    case 2: ldrh(Dst, HostAddr); break;
+    case 4: ldr(Dst.W(), HostAddr); break;
+    case 8: ldr(Dst.X(), HostAddr); break;
     default: LOGMAN_MSG_A_FMT("Unhandled {} size: {}", __func__, Op->Size); return;
     }
 
@@ -1847,9 +1895,11 @@ DEF_OP(StoreMem) {
   const auto Op = IROp->C<IR::IROp_StoreMem>();
   const auto OpSize = IROp->Size;
 
-  const auto Guest = GetGuestMemAddr(OpSize, Op->Addr, Op->Offset, Op->OffsetType, Op->OffsetScale, REG_GUEST_ADDR_TMP.R(), Op->HostAddr);
+  // MADEIRA ml920: as LoadMem - plain str everywhere except the 256-bit SVE lowering.
+  const auto Guest = GetGuestMemAddr(OpSize, Op->Addr, Op->Offset, Op->OffsetType, Op->OffsetScale, REG_GUEST_ADDR_TMP.R(),
+                                     Op->HostAddr, OpSize != IR::OpSize::i256Bit);
   const auto MemReg = Guest.Base;
-  const auto MemSrc = GenerateMemOperand(OpSize, MemReg, Guest.Offset, Guest.OffsetType, Guest.OffsetScale);
+  const auto MemSrc = GenerateMemOperand(OpSize, Guest);
 
   if (Op->Class == IR::RegClass::GPR) {
     const auto Src = GetZeroableReg(Op->Value);
@@ -1996,8 +2046,10 @@ DEF_OP(StoreMemTSO) {
   }
 
   // MADEIRA: see LoadMemTSO - with a guest window every release/atomic form below reduces to `[Xn]`
-  // on a host address, which is what the unaligned backpatcher expects to decode.
-  const auto Guest = GetGuestMemAddr(OpSize, Op->Addr, Op->Offset, Op->OffsetType, Op->OffsetScale);
+  // on a host address, which is what the unaligned backpatcher expects to decode. ml920: and, as
+  // there, the vector class lowers to a plain str and takes the register-offset fold instead.
+  const auto Guest = GetGuestMemAddr(OpSize, Op->Addr, Op->Offset, Op->OffsetType, Op->OffsetScale, REG_GUEST_ADDR_TMP.R(), false,
+                                     Op->Class != IR::RegClass::GPR && OpSize != IR::OpSize::i256Bit);
   const auto MemReg = Guest.Base;
 
   if (CTX->HostFeatures.SupportsTSOImm9 && Op->Class == IR::RegClass::GPR) {
@@ -2012,8 +2064,12 @@ DEF_OP(StoreMemTSO) {
       // 8bit load is always aligned to natural alignment
       stlurb(Src, MemReg, Offset);
     } else {
-      // Half-barrier once back-patched.
-      nop();
+      // Half-barrier once back-patched -- MADEIRA ml920: only reserve the slot when the unaligned
+      // handler will actually patch it (ContextImpl::IsHalfBarrierTSOEnabled). Unchanged at the
+      // default; 4 bytes off every 16/32/64-bit TSO GPR access when the option is turned off.
+      if (CTX->IsHalfBarrierTSOEnabled()) {
+        nop();
+      }
       switch (OpSize) {
       case IR::OpSize::i16Bit: stlurh(Src, MemReg, Offset); break;
       case IR::OpSize::i32Bit: stlur(Src.W(), MemReg, Offset); break;
@@ -2028,8 +2084,12 @@ DEF_OP(StoreMemTSO) {
       // 8bit load is always aligned to natural alignment
       stlrb(Src, MemReg);
     } else {
-      // Half-barrier once back-patched.
-      nop();
+      // Half-barrier once back-patched -- MADEIRA ml920: only reserve the slot when the unaligned
+      // handler will actually patch it (ContextImpl::IsHalfBarrierTSOEnabled). Unchanged at the
+      // default; 4 bytes off every 16/32/64-bit TSO GPR access when the option is turned off.
+      if (CTX->IsHalfBarrierTSOEnabled()) {
+        nop();
+      }
       switch (OpSize) {
       case IR::OpSize::i16Bit: stlrh(Src, MemReg); break;
       case IR::OpSize::i32Bit: stlr(Src.W(), MemReg); break;
@@ -2043,7 +2103,7 @@ DEF_OP(StoreMemTSO) {
       dmb(ARMEmitter::BarrierScope::ISH);
     }
     const auto Src = GetVReg(Op->Value);
-    const auto MemSrc = GenerateMemOperand(OpSize, MemReg, Guest.Offset, Guest.OffsetType, Guest.OffsetScale);
+    const auto MemSrc = GenerateMemOperand(OpSize, Guest);
     switch (OpSize) {
     case IR::OpSize::i8Bit: strb(Src, MemSrc); break;
     case IR::OpSize::i16Bit: strh(Src, MemSrc); break;

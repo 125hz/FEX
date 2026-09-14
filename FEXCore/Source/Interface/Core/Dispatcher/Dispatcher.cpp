@@ -277,14 +277,25 @@ void Dispatcher::EmitDispatcher() {
   {
     ARMEmitter::ForwardLabel L1Miss;
     ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
-    // Entry address = L1Pointer + ((RIP << ilog2(entry size)) & pre-scaled mask)
-    and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+    // Set address = L1Pointer + ((RIP << ilog2(set size)) & pre-scaled mask)
+    // MADEIRA ml920: the mask selects a SET now (LookupCache::L1_WAYS entries), so the shift is
+    // log2(ways * entry). With L1_WAYS == 1 this is upstream's sequence, instruction for
+    // instruction; TMP1 survives each way's ldp so the extra ways cost no re-derivation.
+    and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(LookupCache::L1_SET_BYTES));
     add(TMP1, TMP1, TMP2);
-    ldp<ARMEmitter::IndexType::OFFSET>(TMP4, TMP2, TMP1, 0);
-    sub(TMP2, TMP2, RipReg);
-    (void)cbnz(ARMEmitter::Size::i64Bit, TMP2, &L1Miss);
-    (void)cbz(ARMEmitter::Size::i64Bit, TMP4, &L1Miss);
-    br(TMP4);
+    for (size_t Way = 0; Way < LookupCache::L1_WAYS; ++Way) {
+      ARMEmitter::ForwardLabel NextWay;
+      const bool LastWay = (Way + 1) == LookupCache::L1_WAYS;
+      auto* Fail = LastWay ? &L1Miss : &NextWay;
+      ldp<ARMEmitter::IndexType::OFFSET>(TMP4, TMP2, TMP1, Way * sizeof(LookupCache::LookupCacheEntry));
+      sub(TMP2, TMP2, RipReg);
+      (void)cbnz(ARMEmitter::Size::i64Bit, TMP2, Fail);
+      (void)cbz(ARMEmitter::Size::i64Bit, TMP4, Fail);
+      br(TMP4);
+      if (!LastWay) {
+        (void)Bind(&NextWay);
+      }
+    }
     (void)Bind(&L1Miss);
   }
 
@@ -337,9 +348,12 @@ void Dispatcher::EmitDispatcher() {
         // update L1 cache
         ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
 
-        // Calculate (tmp1 + ((ripreg & L1_ENTRIES_MASK) << 4)) for the address
-        // L1Mask is pre-shifted.
-        and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg.R(), ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+        // Calculate (tmp1 + ((ripreg & L1_SET_MASK) << ilog2(set size))) for the address
+        // L1Mask is pre-shifted. MADEIRA ml920: selects a set; way 0 is written without demoting
+        // way 1, which costs a little hit rate versus the C++ InsertL1 and keeps this inline path
+        // the same three instructions. (It is unreachable on the shipping config anyway:
+        // DisableL2Cache is on, so the branch above never gets here.)
+        and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg.R(), ARMEmitter::ShiftType::LSL, FEXCore::ilog2(LookupCache::L1_SET_BYTES));
         add(TMP1, TMP1, TMP2);
 
         stp<ARMEmitter::IndexType::OFFSET>(TMP4, RipReg, TMP1);
@@ -702,6 +716,7 @@ void Dispatcher::EmitDispatcher() {
 
     // load static regs
     FillStaticRegs();
+#ifndef FEX_CALLRET_STACK_UNUSED
 #ifdef FEX_IOS_HOST
     /* MADEIRA ml708: inline bounds-guard before the JITCallback sentinel push. FillStaticRegs
      * has just reloaded REG_CALLRET_SP from State.callret_sp; if State has drifted OOB (e.g. an
@@ -714,7 +729,11 @@ void Dispatcher::EmitDispatcher() {
      * which called out this site by name as the one not bounded by the window). */
     EmitCallRetStackGuard(TMP1);
 #endif
+    /* MADEIRA ml920: the sentinel exists so a RET taken inside the callback pops {0,0} and
+     * mispredicts instead of branching to a stale host label. With the shadow stack gone there is
+     * neither a push nor a pop, so there is nothing to seed. */
     stp<ARMEmitter::IndexType::PRE>(ARMEmitter::XReg::zr, ARMEmitter::XReg::zr, REG_CALLRET_SP, -0x10);
+#endif
 
     // Now go back to the regular dispatcher loop
     (void)b(&LoopTop);

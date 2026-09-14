@@ -138,6 +138,33 @@ constexpr uint64_t EC_CODE_BITMAP_MAX_ADDRESS = 1ULL << 47;
 constexpr auto REG_GUEST_BASE = ARMEmitter::XReg::x19;
 constexpr auto REG_GUEST_ADDR_TMP = ARMEmitter::XReg::x24;
 
+// MADEIRA ml920: on the iOS WoW64 CPU module the call-ret shadow stack is WRITE-ONLY.
+//
+// The stack is a pure return-address PREDICTOR: a CALL pushes {guest_ret_rip, host_label} and a RET
+// pops it and takes a direct `br` to the host label when the guest half matches. Both readers of
+// that pair are already compiled out on this host:
+//   - JIT/BranchOps.cpp, the `cbz` shortcut after the pop  (ml305: stale entries could branch into
+//     the middle of an unrelated block, because the guard-page SEGV that upstream relies on to bound
+//     an unbalanced stack never fires under Wine-on-iOS),
+//   - Dispatcher/Dispatcher.cpp, the EnterEC opportunistic return (ARM64EC only, and also disabled).
+// Nothing else ever reads the data. What remains is 11 host instructions per guest CALL (a
+// 9-instruction EmitCallRetStackGuard, an `adr` and an `stp`) and 11 per guest RET (guard, `ldp`,
+// and a `sub` feeding the removed `cbz`) spent maintaining a structure with no consumer.
+//
+// The gate is deliberately `FEX_IOS_HOST && !ARCHITECTURE_arm64ec`: the ARM64EC module keeps every
+// byte of its current sequence (it threads State.callret_sp through EnterEC/ExitFunctionEC, so the
+// removal there is a separate question), and every non-iOS build is untouched, shadow stack and all.
+//
+// One thing survives the removal: the lone `adr TMP1, <after the bl>` at a linked CALL. It is not
+// the push any more, it is the KNOWN-CALL MARKER that Arm64JITCore::ExitFunctionLink sniffs to
+// decide whether to backpatch the callsite as `bl` or `b` (JIT.cpp). Keeping it keeps calls linked
+// as `bl`, which is what pairs with the `ret Xn` at the guest RET and keeps the hardware
+// return-address stack balanced. Its immediate and the offset the linker reads it from both shrink
+// by one instruction; JIT.cpp derives them from this macro so the two can never drift.
+#if defined(FEX_IOS_HOST) && !defined(ARCHITECTURE_arm64ec)
+#define FEX_CALLRET_STACK_UNUSED 1
+#endif
+
 // Will force one single instruction block to be generated first if set when entering the JIT filling SRA.
 // FillStaticRegs must preserve this
 constexpr auto ENTRY_FILL_SRA_SINGLE_INST_REG = TMP2;

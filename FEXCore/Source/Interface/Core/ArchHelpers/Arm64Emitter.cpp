@@ -860,7 +860,13 @@ void Arm64Emitter::SpillStaticRegs(ARMEmitter::Register TmpReg, SpillStaticRegOp
   unsigned PFAFSpillMask = Options.GPRSpillMask & PFAFMask;
   Options.GPRSpillMask &= ~PFAFSpillMask;
 
+  /* MADEIRA ml920: REG_CALLRET_SP is not a live register any more under FEX_CALLRET_STACK_UNUSED --
+   * nothing pushes, pops or reads the shadow stack -- so there is nothing to spill. One store off
+   * every spill (and the matching load off every fill in FillStaticRegs), on the dispatcher
+   * round-trip path this round is trying to make cheaper. */
+#ifndef FEX_CALLRET_STACK_UNUSED
   str(REG_CALLRET_SP, STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
+#endif
 
   for (size_t i = 0; i < StaticRegisters.size(); i += 2) {
     auto Reg1 = StaticRegisters[i];
@@ -965,7 +971,10 @@ void Arm64Emitter::FillStaticRegs(FillStaticRegOptions Options) {
   ldr(STATE, TmpReg, CPU_AREA_EMULATOR_DATA_OFFSET);
 #endif
 
+  // MADEIRA ml920: see SpillStaticRegs -- REG_CALLRET_SP is dead under FEX_CALLRET_STACK_UNUSED.
+#ifndef FEX_CALLRET_STACK_UNUSED
   ldr(REG_CALLRET_SP, STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
+#endif
 
   // MADEIRA: no-op unless a guest window is configured.
   LoadGuestBaseReg();

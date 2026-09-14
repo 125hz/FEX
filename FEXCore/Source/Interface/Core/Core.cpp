@@ -1978,13 +1978,36 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     static volatile uint64_t g_cb_last_summary_total = 0;
     static volatile uint64_t g_cb_hot_rip = 0;
     static volatile uint64_t g_cb_hot_rip_count = 0;
+    /* MADEIRA ml920: this estimator was reporting a fossil.
+     *
+     * Two bugs, one line apart. (1) The `== 0` test and the `__sync_sub_and_fetch` below it were
+     * separate operations on a counter every guest thread writes, so two threads that both observed
+     * 1 both decremented and the *unsigned* counter wrapped to ~1.8e19. After that the candidate
+     * could never be displaced (the weight never returns to 0 again) and `hottest_rip` stayed
+     * whatever RIP happened to be current at the moment of the wrap, forever. (2) The field was
+     * printed as `repeats~`, which it never was: Boyer-Moore's counter is the candidate's WEIGHT
+     * (hits minus misses), a lower bound on nothing unless the candidate is an actual majority. It
+     * was read as a visit count at least once. Decrement with a saturating CAS, and name it.
+     *
+     * The estimator stays deliberately lock-free and approximate: a lost race just picks a
+     * different candidate, which is fine for a hint. `[prof]` is what decides anything. */
     if (GuestRIP == g_cb_hot_rip) {
       __sync_add_and_fetch(&g_cb_hot_rip_count, 1);
-    } else if (g_cb_hot_rip_count == 0) {
-      g_cb_hot_rip = GuestRIP;
-      __sync_add_and_fetch(&g_cb_hot_rip_count, 1);
     } else {
-      __sync_sub_and_fetch(&g_cb_hot_rip_count, 1);
+      uint64_t Weight = g_cb_hot_rip_count;
+      while (true) {
+        if (Weight == 0) {
+          // Claim the empty slot. A racing claimant simply wins instead.
+          g_cb_hot_rip = GuestRIP;
+          __sync_add_and_fetch(&g_cb_hot_rip_count, 1);
+          break;
+        }
+        const uint64_t Prev = __sync_val_compare_and_swap(&g_cb_hot_rip_count, Weight, Weight - 1);
+        if (Prev == Weight) {
+          break;
+        }
+        Weight = Prev;
+      }
     }
     uint64_t total = __sync_add_and_fetch(&g_cb_total, 1);
     if ((total - g_cb_last_summary_total) >= 16384) {
@@ -2000,7 +2023,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
        * silently misses every time — no crash, pure 60us tax per lookup. */
       auto* T = Frame ? Frame->Thread : nullptr;
       LogMan::Msg::EFmt("[CB_SUMMARY] total={} real_compiles={} cache_hits={} "
-                        "hit_rate={}%  hottest_rip≈0x{:x} repeats~{} "
+                        "hit_rate={}%  hottest_rip≈0x{:x} hot_weight={} "
                         "L1ptr=0x{:x} L1mask=0x{:x} cacheL1=0x{:x}",
                         total, reals,
                         total - reals,

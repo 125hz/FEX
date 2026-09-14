@@ -185,6 +185,35 @@ public:
     uintptr_t GuestCode;
   };
 
+  /* MADEIRA ml920: L1 associativity.
+   *
+   * The L1 is the only lookup tier this configuration has -- DisableL2Cache is on, so
+   * Dispatcher.cpp emits `b(&NoBlock)` where the inline L2 walk would be and every L1 miss becomes
+   * a full C++ round trip (Spill/FillStaticRegs, a contended global counter, a shared read lock).
+   * Upstream's L1 is DIRECT-MAPPED on the low bits of the guest RIP, so once the live entry-point
+   * set is comparable to the entry count, misses stop being capacity misses and become conflict
+   * misses: two hot RIPs 0x20000 apart evict each other forever, however much cache is free.
+   * ml363 capped the array at 128K entries (2MB/thread) for footprint reasons across ~40 guest
+   * threads, so growing it is not available; associativity is, and it costs nothing extra:
+   * `L1_WAYS` ways of the SAME array, with a set index one bit shorter per doubling.
+   *
+   * The inline probe stays exactly as cheap on the way-0 hit (the common case: same instruction
+   * count, same registers); a way-0 miss pays one extra ldp/sub/cbnz/cbz before falling to the C++
+   * path it would have taken anyway. Insertion is a one-step demote, i.e. a FIFO of `L1_WAYS`.
+   *
+   * L1_WAYS == 1 reproduces upstream's direct-mapped cache byte-for-byte, in the emitted probe and
+   * in the C++ paths, and is what every non-iOS build gets.
+   */
+  // Gated to the 32-bit WoW64 CPU module: the ARM64EC module and every non-iOS build keep the
+  // direct-mapped cache and byte-identical emitted probes.
+#if defined(FEX_IOS_HOST) && !defined(ARCHITECTURE_arm64ec)
+  constexpr static size_t L1_WAYS = 2;
+#else
+  constexpr static size_t L1_WAYS = 1;
+#endif
+  static_assert((L1_WAYS & (L1_WAYS - 1)) == 0, "L1_WAYS must be a power of two");
+  constexpr static size_t L1_SET_BYTES = L1_WAYS * sizeof(LookupCacheEntry);
+
   LookupCache(FEXCore::Context::ContextImpl* CTX);
   ~LookupCache();
 
@@ -197,9 +226,11 @@ public:
 
   uintptr_t FindBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) {
     // Try L1, no lock needed
-    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
-    if (L1Entry.GuestCode == Address) {
-      return L1Entry.HostCode;
+    auto* L1Set = GetL1Set(Address);
+    for (size_t Way = 0; Way < L1_WAYS; ++Way) {
+      if (L1Set[Way].GuestCode == Address) {
+        return L1Set[Way].HostCode;
+      }
     }
 
     // L2 and L3 need to be locked
@@ -224,9 +255,8 @@ public:
           auto BlockPointers = reinterpret_cast<LookupCacheEntry*>(LocalPagePointer);
 
           if (BlockPointers[PageOffset].GuestCode == Address) {
-            L1Entry.GuestCode = Address;
-            L1Entry.HostCode = BlockPointers[PageOffset].HostCode;
-            HostPtr = L1Entry.HostCode;
+            HostPtr = BlockPointers[PageOffset].HostCode;
+            InsertL1(Address, HostPtr);
           }
         }
       }
@@ -322,13 +352,16 @@ public:
 
   // Invalidates L1/L2 for a given guest block
   void InvalidateCache(uint64_t Address, const LookupCacheWriteLockToken& lk) {
-    // Do L1
-    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
-    if (L1Entry.GuestCode == Address) {
-      L1Entry.GuestCode = 0;
-      // Leave L1Entry.HostCode as is, so that concurrent lookups won't read a null pointer
-      // This is a soft guarantee for cross thread invalidation, as atomics are not used
-      // and it hasn't been thoroughly tested
+    // Do L1. MADEIRA ml920: every way of the set, not just one -- a stale copy left in a way this
+    // loop skipped is a live branch target for invalidated host code.
+    auto* L1Set = GetL1Set(Address);
+    for (size_t Way = 0; Way < L1_WAYS; ++Way) {
+      if (L1Set[Way].GuestCode == Address) {
+        L1Set[Way].GuestCode = 0;
+        // Leave HostCode as is, so that concurrent lookups won't read a null pointer
+        // This is a soft guarantee for cross thread invalidation, as atomics are not used
+        // and it hasn't been thoroughly tested
+      }
     }
 
     if (!DisableL2Cache()) {
@@ -380,8 +413,12 @@ public:
   uintptr_t GetL1Pointer() const {
     return L1Pointer;
   }
+  /* MADEIRA ml920: the value the JIT's inline probe ANDs the shifted RIP with. It selects a SET,
+   * pre-scaled to a byte offset, so with L1_WAYS == 1 it is exactly upstream's
+   * `(Entries - 1) << ilog2(entry)` and the emitted probe is unchanged. L1PointerMask is always
+   * `Entries - 1` with Entries a power of two, so shifting it right by log2(ways) is `Sets - 1`. */
   uintptr_t GetScaledL1PointerMask() const {
-    return L1PointerMask << FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry));
+    return L1SetMask() << FEXCore::ilog2(LookupCache::L1_SET_BYTES);
   }
   uintptr_t GetPagePointer() const {
     // ml606: publish NULL when there is no L2 region. The JIT never loads
@@ -406,15 +443,46 @@ public:
   }
 
 private:
+  // MADEIRA ml920: set index, in entries-1 form.
+  uint64_t L1SetMask() const {
+    return L1PointerMask >> FEXCore::ilog2(LookupCache::L1_WAYS);
+  }
+
+  // Way 0 of the set `Address` maps to. Ways of a set are contiguous, so one ldp per way.
+  LookupCacheEntry* GetL1Set(uint64_t Address) const {
+    return reinterpret_cast<LookupCacheEntry*>(L1Pointer + ((Address & L1SetMask()) * L1_SET_BYTES));
+  }
+
+  /* MADEIRA ml920: publish a block into the set's way 0, demoting what was there by one way. That
+   * makes a set a FIFO of L1_WAYS rather than a direct-mapped slot with dead neighbours, which is
+   * the entire point of the associativity. With L1_WAYS == 1 the loop is empty and this is
+   * upstream's two stores, in upstream's order.
+   *
+   * Locking: demoting an entry to another way is the one L1 write that could RESURRECT a mapping a
+   * concurrent InvalidateCache had just cleared (it could copy a pre-invalidation way 0 into a way
+   * the invalidator has already scanned). Both callers hold a LookupCache lock -- AddBlockMapping
+   * the write lock, FindBlock the read lock -- and InvalidateCache requires the write lock, so the
+   * two can never overlap. Do not call this without one.
+   *
+   * Reads are unlocked but owner-thread-only (the JIT's inline probe and FindBlock both run on the
+   * thread that owns this cache), so the non-atomic 16-byte copy below cannot be observed torn; the
+   * only cross-thread writer is InvalidateCache, which just zeroes GuestCode. */
+  void InsertL1(uint64_t Address, uintptr_t HostCode) {
+    auto* Set = GetL1Set(Address);
+    for (size_t Way = L1_WAYS - 1; Way > 0; --Way) {
+      Set[Way] = Set[Way - 1];
+    }
+    Set[0].GuestCode = Address;
+    Set[0].HostCode = HostCode;
+  }
+
   void CacheBlockMapping(uint64_t Address, const GuestToHostMap::BlockEntry& Entry, bool L1Only, const LookupCacheBaseLockToken& lk) {
     for (const auto& CodePage : Entry.CodePages) {
       CachedCodePages[CodePage >> 12].insert(Address);
     }
 
     // Do L1
-    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
-    L1Entry.GuestCode = Address;
-    L1Entry.HostCode = Entry.HostCode;
+    InsertL1(Address, Entry.HostCode);
 
     if (!DisableL2Cache() && !L1Only) {
       // Do ful map

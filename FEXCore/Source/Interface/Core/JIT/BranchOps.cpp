@@ -170,6 +170,17 @@ DEF_OP(ExitFunction) {
         // spilled/filled by Spill/FillStaticRegs, so the register is authoritative.
         ldr(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
 #endif
+#ifdef FEX_CALLRET_STACK_UNUSED
+        /* MADEIRA ml920: nothing reads this shadow stack on this host -- see FEX_CALLRET_STACK_UNUSED
+         * in Arm64Emitter.h. The guard and the `stp` push are gone; the `adr` stays as the
+         * known-call marker ExitFunctionLink sniffs at KnownCallMarkerDisp before the callsite,
+         * so a linked call is still backpatched to `bl` and stays paired with the `ret Xn` that the
+         * guest RET emits. TMP1 is dead immediately afterwards. 11 instructions -> 1. */
+        if (!Op->CallReturnBlock.IsInvalid()) {
+          PendingCallReturnTargetLabel = &CallReturnTargets.try_emplace(Op->CallReturnBlock.ID()).first->second;
+          (void)adr(TMP1, &l_CallReturn);
+        }
+#else
 #ifdef FEX_IOS_HOST
         /* MADEIRA ml708: inline bounds-guard before the `stp` push. Gated on the HOST, not on
          * ARCHITECTURE_arm64ec -- the WoW64 module runs on the same iOS host with the same
@@ -185,6 +196,7 @@ DEF_OP(ExitFunction) {
         } else {
           stp<ARMEmitter::IndexType::PRE>(ARMEmitter::XReg::zr, ARMEmitter::XReg::zr, REG_CALLRET_SP, -0x10);
         }
+#endif
 #ifdef ARCHITECTURE_arm64ec
         /* Write back post-push x17 so dispatcher LoopTop's reload picks
          * up the new top. Without this, in-register PUSH changes get
@@ -211,6 +223,12 @@ DEF_OP(ExitFunction) {
     ARMEmitter::ForwardLabel SkipFullLookup;
     auto RipReg = GetReg(Op->NewRIP);
 
+    /* MADEIRA ml920: the pop side of the dead shadow stack is compiled out under
+     * FEX_CALLRET_STACK_UNUSED. The CALL side no longer pushes, so the `ldp` would pop entries that
+     * were never written; the `sub` under it only ever fed the `cbz` that ml305 disabled. Both go,
+     * together with the guard, and a guest RET falls straight into the L1 probe -- which is exactly
+     * what it already did, minus 11 instructions. */
+#ifndef FEX_CALLRET_STACK_UNUSED
     if (Op->Hint == IR::BranchHint::Return) {
       // First try to pop from the call-ret stack, otherwise follow the normal path (but ending in a ret)
 #ifdef ARCHITECTURE_arm64ec
@@ -268,20 +286,41 @@ DEF_OP(ExitFunction) {
       (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &SkipFullLookup);
 #endif
     }
+#endif // !FEX_CALLRET_STACK_UNUSED
 
     // L1 Cache
-    ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
+    if constexpr (LookupCache::L1_WAYS == 1) {
+      ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
 
-    // Calculate (tmp1 + ((ripreg & L1_ENTRIES_MASK) << 4)) for the address
-    // L1Mask is pre-shifted.
-    and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
-    add(TMP1, TMP1, TMP2);
+      // Calculate (tmp1 + ((ripreg & L1_ENTRIES_MASK) << 4)) for the address
+      // L1Mask is pre-shifted.
+      and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+      add(TMP1, TMP1, TMP2);
 
-    ldp<ARMEmitter::IndexType::OFFSET>(TMP2, TMP1, TMP1, 0);
+      ldp<ARMEmitter::IndexType::OFFSET>(TMP2, TMP1, TMP1, 0);
 
-    // Note: sub+cbnz used over cmp+br to preserve flags.
-    sub(TMP1, TMP1, RipReg.X());
-    (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &SkipFullLookup);
+      // Note: sub+cbnz used over cmp+br to preserve flags.
+      sub(TMP1, TMP1, RipReg.X());
+      (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &SkipFullLookup);
+    } else {
+      /* MADEIRA ml920: set-associative probe. The direct-mapped form above consumes the set pointer
+       * with its own ldp (TMP1 is both the address and the loaded GuestCode), so a second way needs
+       * the pointer kept somewhere: TMP3, which is emitter scratch and dead at a block exit.
+       *
+       * Cost model: a way-0 hit is the same six instructions as the direct-mapped probe; each
+       * further way adds ldp/sub/cbz and is only reached on a miss that would otherwise have gone
+       * straight to the C++ CompileBlock round trip. Flags are preserved throughout (sub without S,
+       * cbz), which this site requires. */
+      ldp<ARMEmitter::IndexType::OFFSET>(TMP3, TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
+      and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(LookupCache::L1_SET_BYTES));
+      add(TMP3, TMP3, TMP2);
+
+      for (size_t Way = 0; Way < LookupCache::L1_WAYS; ++Way) {
+        ldp<ARMEmitter::IndexType::OFFSET>(TMP2, TMP1, TMP3, Way * sizeof(LookupCache::LookupCacheEntry));
+        sub(TMP1, TMP1, RipReg.X());
+        (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &SkipFullLookup);
+      }
+    }
     ldr(TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.DispatcherLoopTop));
     str(RipReg.X(), STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
 
@@ -294,6 +333,16 @@ DEF_OP(ExitFunction) {
       // native ARM64EC returns leave x17 pointing at an arbitrary RX page.
       ldr(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
 #endif
+#ifdef FEX_CALLRET_STACK_UNUSED
+      /* MADEIRA ml920: dead shadow stack, and unlike the linked CALL above there is no marker to
+       * keep here -- this callsite is a register `blr`, never backpatched, so ExitFunctionLink never
+       * looks at it. The whole push disappears: 11 instructions -> 0. `l_CallReturn` is left bound
+       * but unreferenced, which Emitter::Bind handles as a no-op, and PendingCallReturnTargetLabel
+       * still drives JIT.cpp's block layout exactly as before. */
+      if (!Op->CallReturnBlock.IsInvalid()) {
+        PendingCallReturnTargetLabel = &CallReturnTargets.try_emplace(Op->CallReturnBlock.ID()).first->second;
+      }
+#else
 #ifdef FEX_IOS_HOST
       /* MADEIRA ml708: inline bounds-guard before the `stp` push -- see the linked CALL push site.
        * Host-gated. TMP1 is dead here (the lookup compare finished at SkipFullLookup) and TMP2,
@@ -312,6 +361,7 @@ DEF_OP(ExitFunction) {
       /* Write back post-push x17 so dispatcher LoopTop reload sees it. */
       str(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
 #endif
+#endif // FEX_CALLRET_STACK_UNUSED
       blr(TMP2);
       (void)Bind(&l_CallReturn);
     } else if (Op->Hint == IR::BranchHint::Return) {

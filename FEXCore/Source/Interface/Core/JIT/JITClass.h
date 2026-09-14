@@ -333,6 +333,15 @@ private:
     IR::OrderedNodeWrapper Offset;
     IR::MemOffsetType OffsetType;
     uint8_t OffsetScale;
+
+    // MADEIRA ml920: set when the window add was folded into the addressing mode itself, i.e. the
+    // access is `[REG_GUEST_BASE, IndexReg, UXTW #0]` with IndexReg holding the completed *guest*
+    // effective address. Base is REG_GUEST_BASE in that case and Offset is invalid. Only ever set
+    // for ops that asked for it (AllowRegOffsetFold) and that lower to a plain ldr/str, which is
+    // the only family with a register-offset form: the acquire/release and atomic encodings have
+    // none, and the unaligned back-patcher must keep seeing them in the `[Xn]` shape.
+    bool RegOffsetFold {false};
+    ARMEmitter::Register IndexReg {ARMEmitter::Reg::zr};
   };
 
   // Converts a guest address operand (plus its offset) into a host addressing description.
@@ -343,10 +352,17 @@ private:
   //
   // `HostAddr` says the operand is already a host pointer (IROp_LoadMem/IROp_StoreMem::HostAddr,
   // set only for FEXCore's own context-relative storage) and must be dereferenced as-is.
+  //
+  // MADEIRA ml920: `AllowRegOffsetFold` says the caller will consume the result through the
+  // GuestMemAddr overload of GenerateMemOperand and lowers to a plain ldr/str, so the `add Tmp,
+  // REG_GUEST_BASE, wEA, uxtw` may be folded into the addressing mode instead of emitted. Pass it
+  // only from such sites: it is wrong for ldar/stlr/ldapr/ldapur/stlur (no register-offset
+  // encoding, and the unaligned back-patcher decodes them), for anything that re-derives working
+  // pointers from GuestMemAddr::Base, and for the SVE forms, whose operand has no extend field.
   [[nodiscard]]
   GuestMemAddr GetGuestMemAddr(IR::OpSize AccessSize, IR::OrderedNodeWrapper Addr, IR::OrderedNodeWrapper Offset,
                                IR::MemOffsetType OffsetType, uint8_t OffsetScale, ARMEmitter::Register Tmp = REG_GUEST_ADDR_TMP.R(),
-                               bool HostAddr = false);
+                               bool HostAddr = false, bool AllowRegOffsetFold = false);
 
   // Shorthand for the (common) case of an address with no separate offset operand.
   [[nodiscard]]
@@ -361,6 +377,10 @@ private:
   [[nodiscard]]
   ARMEmitter::ExtendedMemOperand GenerateMemOperand(IR::OpSize AccessSize, ARMEmitter::Register Base, IR::OrderedNodeWrapper Offset,
                                                     IR::MemOffsetType OffsetType, uint8_t OffsetScale);
+
+  // MADEIRA ml920: the GuestMemAddr form, which is the only one that can honour RegOffsetFold.
+  [[nodiscard]]
+  ARMEmitter::ExtendedMemOperand GenerateMemOperand(IR::OpSize AccessSize, const GuestMemAddr& Guest);
 
   [[nodiscard]]
   ARMEmitter::Register ApplyMemOperand(IR::OpSize AccessSize, ARMEmitter::Register Base, ARMEmitter::Register Tmp,

@@ -627,9 +627,22 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
   uintptr_t CallerAddress = JumpThunkStartAddress + Record->CallerOffset;
   auto BranchOffset = HostCode / 4 - CallerAddress / 4;
 
+  /* MADEIRA ml920: the known-call marker is the `adr TMP1, <l_CallReturn>` that a linked CALL emits
+   * just before its `bl`. Under FEX_CALLRET_STACK_UNUSED the `stp` push between them is gone, so the
+   * marker sits one instruction closer to the callsite and its immediate is 4 bytes smaller. Both
+   * numbers are derived from the same macro as the emission site in BranchOps.cpp so they cannot
+   * drift; get either wrong and every direct call silently relinks as `b` instead of `bl`, which
+   * unbalances the hardware return-address stack against the `ret Xn` at each guest RET. */
+#ifdef FEX_CALLRET_STACK_UNUSED
+  constexpr uint32_t KnownCallMarkerImm = 0x8;
+  constexpr uintptr_t KnownCallMarkerDisp = 0x4;
+#else
+  constexpr uint32_t KnownCallMarkerImm = 0xC;
+  constexpr uintptr_t KnownCallMarkerDisp = 0x8;
+#endif
   uint32_t ExpectedKnownCallMarkerInst = 0;
   ARMEmitter::Emitter ExpectedKnownCallMarkerEmit(reinterpret_cast<uint8_t*>(&ExpectedKnownCallMarkerInst), 4);
-  ExpectedKnownCallMarkerEmit.adr(TMP1, 0xC);
+  ExpectedKnownCallMarkerEmit.adr(TMP1, KnownCallMarkerImm);
 
   // Guard the LookupCache lock with the code invalidation mutex, to avoid issues with forking
   auto lk_inval = GuardSignalDeferringSection<std::shared_lock>(static_cast<Context::ContextImpl*>(Thread->CTX)->CodeInvalidationMutex, Thread);
@@ -639,7 +652,7 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
 
   // For non-calls, this would extend into the block's code, however that's fine as an out-of-range adr would never
   // be generated avoiding any false positives.
-  uintptr_t KnownCallMarkerAddr = CallerAddress - 0x8;
+  uintptr_t KnownCallMarkerAddr = CallerAddress - KnownCallMarkerDisp;
   uint32_t KnownCallMarkerInst = *reinterpret_cast<uint32_t*>(KnownCallMarkerAddr);
   if (ARMEmitter::Emitter::IsInt26(BranchOffset)) {
     // Directly patch the callsite with the appropriate branch instruction.

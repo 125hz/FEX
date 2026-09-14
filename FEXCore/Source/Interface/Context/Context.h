@@ -347,6 +347,9 @@ public:
     FEX_CONFIG_OPT(Is64BitMode, IS64BIT_MODE);
     FEX_CONFIG_OPT(Guest32BaseOption, GUEST32BASE);
     FEX_CONFIG_OPT(TSOEnabled, TSOENABLED);
+    // MADEIRA ml920: read by the JIT so the placeholder `nop` next to every TSO GPR access is only
+    // emitted when something can back-patch it into a half-barrier. See IsHalfBarrierTSOEnabled().
+    FEX_CONFIG_OPT(HalfBarrierTSOEnabled, HALFBARRIERTSOENABLED);
     FEX_CONFIG_OPT(VectorTSOEnabled, VECTORTSOENABLED);
     FEX_CONFIG_OPT(MemcpySetTSOEnabled, MEMCPYSETTSOENABLED);
     FEX_CONFIG_OPT(SMCChecks, SMCCHECKS);
@@ -433,6 +436,22 @@ public:
   // If atomic-based TSO emulation is enabled for memcpy operations.
   bool IsMemcpyAtomicTSOEnabled() const {
     return MemcpyAtomicTSOEmulationEnabled;
+  }
+
+  /* MADEIRA ml920: whether the unaligned back-patcher will turn the placeholder `nop` beside a
+   * ldar/ldapr/ldapur/stlr/stlur into a half-barrier.
+   *
+   * The JIT emits that nop unconditionally today, but its only consumer --
+   * ArchHelpers::Arm64::HandleUnalignedAccess -- writes over it only when the installed
+   * UnalignedHandlerType is not NonAtomic, and both frontends pick the type from this one option
+   * (Windows/Common/TSOHandlerConfig.h, LinuxSyscalls/SignalDelegator.h). With the option off the
+   * nop is dead weight: 4 bytes on every 16/32/64-bit TSO GPR load and store.
+   *
+   * The two readings must agree or the back-patcher writes a DMB over a real instruction, so both
+   * sides read this same process-wide option and nothing may consult it per-block. Default is true,
+   * so every build's emitted code is unchanged unless the option is explicitly turned off. */
+  bool IsHalfBarrierTSOEnabled() const {
+    return Config.HalfBarrierTSOEnabled;
   }
 
   void SetHardwareTSOSupport(bool HardwareTSOSupported) override {
