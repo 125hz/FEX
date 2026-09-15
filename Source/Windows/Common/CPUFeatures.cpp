@@ -8,6 +8,9 @@
 
 #include <windows.h>
 
+#include <cstdlib>
+#include <cstring>
+
 #include "CPUFeatures.h"
 
 namespace {
@@ -75,6 +78,42 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostF
   HostFeatures.SupportsFlagM = true;
   HostFeatures.SupportsFlagM2 = true;
   HostFeatures.SupportsAFP = true;
+
+  /* MADEIRA ml970: FEAT_LRCPC2 (SupportsTSOImm9) is OPT-IN here, and off by
+   * default, because this branch cannot probe for it.
+   *
+   * What it buys, measured on the [prof] hot-block dumps of a 32-bit D3D9
+   * title: with SupportsTSOImm9 false every TSO access is emitted as
+   * `<addr arithmetic>; add x24, x19, wN, uxtw; ldapr/stlr wR, [x24]',
+   * because LDAPR/STLR have no offset form at all and IREmitter.h's
+   * `IsSIMM9 &= (SupportsTSOImm9 || !TSO)' therefore refuses to fold ANY
+   * displacement into a TSO op.  One guest `add [ebp-516], reg' costs nine
+   * host instructions, four of which are address arithmetic that
+   * `ldapur/stlur wR, [x24, #-516]' would absorb outright.  The unaligned
+   * back-patcher already decodes and rewrites both forms
+   * (FEXCore/Source/Utils/ArchHelpers/Arm64.cpp: LDAPUR_INST/STLUR_INST at
+   * :2202, :2352, :2412), so nothing downstream needs to change.
+   *
+   * WHY IT IS NOT ON BY DEFAULT.  FEAT_LRCPC2 is ARMv8.4; the app's iOS 18
+   * floor admits A12/A13, which are ARMv8.3 and implement LRCPC but NOT
+   * LRCPC2, so an unconditional `true' here would emit an undefined
+   * instruction in every JIT block on those devices.  Detecting it properly
+   * needs `hw.optional.arm.FEAT_LRCPC2' from sysctl, which is a unix-side
+   * call this PE module cannot make (FEXUnixLib's func table is not
+   * registered on the iOS host -- see TryEnableHardwareTSO), so until that
+   * table exists the honest form of this knob is a user opt-in that the
+   * device owner sets after checking their own silicon.
+   *
+   * Spelling matches upstream's own FEX_HOSTFEATURES token so nothing new
+   * has to be learned: `HOSTFEATURES=ENABLELRCPC2' in
+   * Documents/madeira-fex.txt.  FEX::FetchHostFeatures/OverrideFeatures --
+   * which is what parses that variable on a Linux host -- is never reached
+   * on this branch, which is why it is read directly here. */
+  if (const char* HostFeaturesEnv = getenv("FEX_HOSTFEATURES");
+      HostFeaturesEnv && strstr(HostFeaturesEnv, "ENABLELRCPC2")) {
+    HostFeatures.SupportsTSOImm9 = true;
+  }
+
   HostFeatures.CPUMIDRs.push_back(0u);
   HostFeatures.HostType = HostType;
   return HostFeatures;

@@ -365,6 +365,16 @@ decltype(__wine_unix_call_dispatcher) WineUnixCall;
 // the wow64_NtQueryInformationThread(ThreadBasicInformation) path hands to 32-bit callers.
 // ClientId is a TID pair, never offset.
 std::pair<NTSTATUS, TLS> GetThreadTLS(HANDLE Thread) {
+  // MADEIRA ml970: the current-thread pseudo-handle needs no round trip at all.
+  // On this target NtQueryInformationThread(ThreadBasicInformation) is a
+  // wineserver request (get_thread_info), and BTCpuGetContext/BTCpuSetContext
+  // are called with GetCurrentThread() by every internal wow64 path -- see the
+  // comment on BTCpuGetContext below. CurrentTEB() is the same answer, read
+  // from the register.
+  if (Thread == GetCurrentThread()) {
+    return {STATUS_SUCCESS, TLS {CurrentTEB()}};
+  }
+
   THREAD_BASIC_INFORMATION Info;
   const NTSTATUS Err = NtQueryInformationThread(Thread, ThreadBasicInformation, &Info, sizeof(Info), nullptr);
   return {Err, TLS {reinterpret_cast<_TEB*>(Info.TebBaseAddress)}};
@@ -1366,32 +1376,86 @@ void* __wine_get_unix_opcode() {
   return BridgeInstrs::UnixCall;
 }
 
+/*
+ * MADEIRA ml970: SELF IS NOT A HANDLE OPERATION.
+ *
+ * [srv-stats] on a 32-bit D3D9 title showed five wineserver request kinds
+ * locked together at ~177/s each -- get_object_info=1770 dup_handle=1770
+ * close_handle=1772 get_thread_context=1770 per 10 s, plus
+ * set_thread_context=2950 -- which is 3 to 5 requests per rendered frame for
+ * something no D3D9 game does. They are all ours: with G calls of
+ * BTCpuGetContext and S of BTCpuSetContext the bodies below issue exactly
+ * G+S object-info, G+S dup, G+S close, G+S get_thread_context and G+2S
+ * set_thread_context requests, and G=590 S=1180 reproduces all five measured
+ * numbers exactly.
+ *
+ * And the handle is always the same one. Every internal caller in
+ * wine/dlls/wow64/syscall.c -- 32-bit exception dispatch, NtContinue,
+ * NtSetContextThread, the APC and callback paths -- passes
+ * GetCurrentThread(), i.e. the pseudo-handle, never a real thread handle:
+ *
+ *     pBTCpuGetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
+ *
+ * so the NtQueryObject / NtDuplicateObject / NtClose triple validates,
+ * duplicates and closes a handle to the calling thread itself, three server
+ * round trips to learn something the thread already knows. Worse, the
+ * duplicate is what made the rest expensive: Wine's get_thread_wow64_context()
+ * and set_thread_wow64_context() (dlls/ntdll/unix/signal_arm64.c) both open
+ * with `BOOL self = (handle == GetCurrentThread());' and read or write the
+ * caller's own CPU area with NO server call when that holds -- a duplicated
+ * handle to the same thread does not compare equal, so every context transfer
+ * took the cross-thread path through the server for nothing.
+ *
+ * So: when the target IS the current thread, skip the validation (a thread
+ * always has full access to itself), skip the duplicate, and hand the
+ * pseudo-handle straight down. Nothing else changes: a real handle -- which is
+ * what a guest-issued GetThreadContext on another thread arrives as -- still
+ * takes the original path, access check included.
+ *
+ * Expected: get_object_info, dup_handle and close_handle drop to ~0,
+ * get_thread_info loses ~1770 per 10 s, and get_thread_context /
+ * set_thread_context drop to ~0 as well because the self fast path above then
+ * engages -- together ~1180 requests/s of the measured ~3700/s.
+ */
 NTSTATUS BTCpuGetContext(HANDLE Thread, HANDLE Process, void* Unknown, WOW64_CONTEXT* Context) {
-  if (!FEX::Windows::ValidateHandleAccess(Thread, THREAD_GET_CONTEXT)) {
+  const bool Self = Thread == GetCurrentThread();
+
+  if (!Self && !FEX::Windows::ValidateHandleAccess(Thread, THREAD_GET_CONTEXT)) {
     return STATUS_ACCESS_DENIED;
   }
 
-  auto ThreadDup = FEX::Windows::DupHandle(Thread, THREAD_QUERY_INFORMATION | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT);
-  auto [Err, TLS] = GetThreadTLS(*ThreadDup);
+  auto ThreadDup = Self ? FEX::Windows::ScopedHandle {} :
+                          FEX::Windows::DupHandle(Thread, THREAD_QUERY_INFORMATION | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT);
+  const HANDLE Target = Self ? Thread : *ThreadDup;
+
+  auto [Err, TLS] = GetThreadTLS(Target);
   if (Err) {
     return Err;
   }
 
   Context::ScopedJITContextLock Lk {TLS};
-  if (Err = Context::FlushThreadStateContext(*ThreadDup); Err) {
+  if (Err = Context::FlushThreadStateContext(Target); Err) {
     return Err;
   }
 
-  return RtlWow64GetThreadContext(*ThreadDup, Context);
+  return RtlWow64GetThreadContext(Target, Context);
 }
 
+// MADEIRA ml970: same self short-circuit as BTCpuGetContext above; see the
+// comment there for the measurement and for why the duplicate was the thing
+// that forced Wine's cross-thread context path.
 NTSTATUS BTCpuSetContext(HANDLE Thread, HANDLE Process, void* Unknown, WOW64_CONTEXT* Context) {
-  if (!FEX::Windows::ValidateHandleAccess(Thread, THREAD_SET_CONTEXT)) {
+  const bool Self = Thread == GetCurrentThread();
+
+  if (!Self && !FEX::Windows::ValidateHandleAccess(Thread, THREAD_SET_CONTEXT)) {
     return STATUS_ACCESS_DENIED;
   }
 
-  auto ThreadDup = FEX::Windows::DupHandle(Thread, THREAD_QUERY_INFORMATION | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT);
-  auto [Err, TLS] = GetThreadTLS(*ThreadDup);
+  auto ThreadDup = Self ? FEX::Windows::ScopedHandle {} :
+                          FEX::Windows::DupHandle(Thread, THREAD_QUERY_INFORMATION | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT);
+  const HANDLE Target = Self ? Thread : *ThreadDup;
+
+  auto [Err, TLS] = GetThreadTLS(Target);
   if (Err) {
     return Err;
   }
@@ -1400,18 +1464,18 @@ NTSTATUS BTCpuSetContext(HANDLE Thread, HANDLE Process, void* Unknown, WOW64_CON
   WOW64_CONTEXT TmpContext = *Context;
 
   Context::ScopedJITContextLock Lk {TLS};
-  if (Err = Context::FlushThreadStateContext(*ThreadDup); Err) {
+  if (Err = Context::FlushThreadStateContext(Target); Err) {
     return Err;
   }
 
   // Merge the input context into the CPU area then pass the full context into the JIT
-  if (Err = RtlWow64SetThreadContext(*ThreadDup, &TmpContext); Err) {
+  if (Err = RtlWow64SetThreadContext(Target, &TmpContext); Err) {
     return Err;
   }
 
   TmpContext.ContextFlags = WOW64_CONTEXT_FULL | WOW64_CONTEXT_EXTENDED_REGISTERS;
 
-  if (Err = RtlWow64GetThreadContext(*ThreadDup, &TmpContext); Err) {
+  if (Err = RtlWow64GetThreadContext(Target, &TmpContext); Err) {
     return Err;
   }
 
