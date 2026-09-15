@@ -49,10 +49,19 @@ enum IROps : uint16_t;
 namespace FEXCore::IosProfMap {
 
 #define FEX_IOSPROFMAP_MAGIC   0x314d5049u /* "IPM1" */
-#define FEX_IOSPROFMAP_VERSION 1u
+/* v2 (ml960): Block grew NumMem/NumAtomic and the header grew MemOps. The
+ * sampler rejects a header whose Version or EntrySize does not match its own
+ * mirror, so a half-updated pair of binaries reports itself in one line instead
+ * of silently printing counts from the wrong offsets. */
+#define FEX_IOSPROFMAP_VERSION 2u
 
-// 24 bytes. Mirrored byte-for-byte by struct ios_profblk in
+// 32 bytes. Mirrored byte-for-byte by struct ios_profblk in
 // build/ntdll-unix/signal_arm64_ios.c — change both or neither.
+//
+// NumMem is EVERY memory op in the block and NumTSO is the subset that carries
+// ordering, so the sampler can weight "what fraction of the accesses this block
+// performs are half-barrier accesses" by SAMPLES rather than by compile count —
+// which is the only form of the question that ranks HalfBarrierTSOEnabled.
 struct Block {
   uint64_t HostStart;
   uint32_t HostSize;
@@ -61,8 +70,11 @@ struct Block {
   uint16_t NumX87;
   uint16_t NumVec;
   uint16_t NumTSO;
+  uint16_t NumMem;
+  uint16_t NumAtomic;
+  uint32_t Reserved0;
 };
-static_assert(sizeof(Block) == 24, "ABI shared with signal_arm64_ios.c");
+static_assert(sizeof(Block) == 32, "ABI shared with signal_arm64_ios.c");
 
 // One named region of the dispatcher's 16 KB buffer. The device log showed
 // 10–27 % of all CPU inside the dispatcher with no way to say WHICH helper, so
@@ -97,6 +109,7 @@ struct Header {
   std::atomic<uint64_t> HostBytes;
   std::atomic<uint64_t> Blocks;
   std::atomic<uint64_t> AllocFailed;
+  std::atomic<uint64_t> MemOps; // v2
   DispRegion DispRegions[MaxDispRegions];
 };
 
@@ -108,7 +121,7 @@ bool Enabled();
 
 // Append one compiled block. Safe to call from any compiling thread.
 void Record(uint64_t HostStart, uint64_t HostSize, uint64_t GuestRIP, uint32_t NumInst, uint32_t NumX87, uint32_t NumVec, uint32_t NumAtomic,
-            uint32_t NumTSO);
+            uint32_t NumTSO, uint32_t NumMem);
 
 // Called from Dispatcher::EmitDispatcher as each named region is emitted.
 // Several pseudo-processes share this Mach task and each builds its own
@@ -120,8 +133,21 @@ void ClearDispRegions();
 void AddDispRegion(const char* Name, uint64_t Begin);
 void SetDispatcherRange(uint64_t Begin, uint64_t End);
 
-// 0 none / 1 x87 / 2 vector / 3 atomic / 4 TSO memory op. Built once from
-// FEXCore::IR::GetName so no hand-maintained opcode list can drift.
+/* ml960: a BITMASK, not an enumeration.
+ *
+ * The v1 classifier returned one code per op with x87 winning, which meant a
+ * TSO access was never also counted as a memory access and the only question
+ * the TSO counter can actually answer -- "what fraction of this block's memory
+ * traffic pays for ordering" -- had no denominator. The classes genuinely
+ * overlap (LoadMemTSO is a memory op AND a TSO op; a vector TSO load is all
+ * three), so the classifier reports every property it finds and the caller
+ * counts each independently. Built once from FEXCore::IR::GetName so no
+ * hand-maintained opcode list can drift. */
+static constexpr uint8_t OpIsX87 = 1u << 0;
+static constexpr uint8_t OpIsVec = 1u << 1;
+static constexpr uint8_t OpIsAtomic = 1u << 2;
+static constexpr uint8_t OpIsTSO = 1u << 3;
+static constexpr uint8_t OpIsMem = 1u << 4;
 uint8_t ClassifyOp(FEXCore::IR::IROps Op);
 
 } // namespace FEXCore::IosProfMap

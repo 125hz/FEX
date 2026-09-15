@@ -333,6 +333,8 @@ extern "C" __declspec(dllexport) uint64_t BTCpuIosProfMap = 0;
  * this TU builds against the mingw SDK and has no FEXCore/Source include path. */
 extern "C" uint64_t ios_prof_map_header(void);
 extern "C" void ios_prof_map_set_guest(uint64_t GuestBase, uint32_t Bitness);
+extern "C" uint32_t ios_prof_map_abi_version(void);
+extern "C" uint32_t ios_prof_map_entry_size(void);
 #endif
 
 namespace {
@@ -947,8 +949,8 @@ void BTCpuProcessInit() {
      * at which B is known and stable. */
     ios_prof_map_set_guest(GuestWindow::Base, 32);
     BTCpuIosProfMap = ios_prof_map_header();
-    IosRawReport("E [prof-map] ml930 header published at {:#x} (export BTCpuIosProfMap) — data only, never called",
-                 BTCpuIosProfMap);
+    IosRawReport("E [prof-map] ml960 header published at {:#x} (export BTCpuIosProfMap, abi v{} entry {} B) — data only, never called",
+                 BTCpuIosProfMap, ios_prof_map_abi_version(), ios_prof_map_entry_size());
 #endif
   }
 

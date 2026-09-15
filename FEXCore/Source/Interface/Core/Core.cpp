@@ -894,11 +894,12 @@ static inline uint16_t Sat16(uint32_t v) {
 }
 
 void Record(uint64_t HostStart, uint64_t HostSize, uint64_t GuestRIP, uint32_t NumInst, uint32_t NumX87, uint32_t NumVec, uint32_t NumAtomic,
-            uint32_t NumTSO) {
+            uint32_t NumTSO, uint32_t NumMem) {
   Hdr.X87Ops.fetch_add(NumX87, std::memory_order_relaxed);
   Hdr.VecOps.fetch_add(NumVec, std::memory_order_relaxed);
   Hdr.AtomicOps.fetch_add(NumAtomic, std::memory_order_relaxed);
   Hdr.TSOOps.fetch_add(NumTSO, std::memory_order_relaxed);
+  Hdr.MemOps.fetch_add(NumMem, std::memory_order_relaxed);
   Hdr.GuestInsts.fetch_add(NumInst, std::memory_order_relaxed);
   Hdr.HostBytes.fetch_add(HostSize, std::memory_order_relaxed);
   Hdr.Blocks.fetch_add(1, std::memory_order_relaxed);
@@ -918,6 +919,9 @@ void Record(uint64_t HostStart, uint64_t HostSize, uint64_t GuestRIP, uint32_t N
   E.NumX87 = Sat16(NumX87);
   E.NumVec = Sat16(NumVec);
   E.NumTSO = Sat16(NumTSO);
+  E.NumMem = Sat16(NumMem);
+  E.NumAtomic = Sat16(NumAtomic);
+  E.Reserved0 = 0;
   std::atomic_thread_fence(std::memory_order_release);
   E.HostStart = HostStart;
 }
@@ -962,13 +966,23 @@ uint8_t ClassifyOp(FEXCore::IR::IROps Op) {
        * from the emitter. The name test only adds the F64 reduced-precision
        * lowering, which is not flagged but is still x87 work. */
       if (FEXCore::IR::LoweredX87(O) || N.starts_with("F80") || N.starts_with("F64") || N.find("Stack") != std::string_view::npos) {
-        C = 1;
-      } else if (N.ends_with("TSO")) {
-        C = 4; // LoadMemTSO / StoreMemTSO — what TSOEnabled costs
-      } else if (N.find("Atomic") != std::string_view::npos || N.starts_with("CAS")) {
-        C = 3;
-      } else if (N.size() > 1 && N[0] == 'V') {
-        C = 2; // every vector op FEX names V*
+        C |= OpIsX87;
+      }
+      if (N.size() > 1 && N[0] == 'V') {
+        C |= OpIsVec; // every vector op FEX names V*
+      }
+      if (N.find("Atomic") != std::string_view::npos || N.starts_with("CAS")) {
+        C |= OpIsAtomic;
+      }
+      if (N.ends_with("TSO")) {
+        C |= OpIsTSO; // LoadMemTSO / StoreMemTSO — what TSOEnabled costs
+      }
+      /* ml960: the DENOMINATOR for the TSO share. Every op that touches guest
+       * memory, named the way MemoryOps.cpp names them, so the TSO ops above are
+       * a strict subset ("LoadMemTSO" contains "LoadMem"). */
+      if (N.find("LoadMem") != std::string_view::npos || N.find("StoreMem") != std::string_view::npos || N.starts_with("MemSet") ||
+          N.starts_with("MemCpy")) {
+        C |= OpIsMem;
       }
       Table[i] = C;
     }
@@ -982,6 +996,17 @@ uint8_t ClassifyOp(FEXCore::IR::IROps Op) {
  * mingw SDK and has no FEXCore/Source include path. */
 extern "C" uint64_t ios_prof_map_header(void) {
   return reinterpret_cast<uint64_t>(&FEXCore::IosProfMap::Hdr);
+}
+/* ml960: the ABI the published header speaks, so the one line the CPU module
+ * prints at publish time is enough to convict a half-updated pair of binaries —
+ * the sampler refuses a header whose version/entry size it does not share, and
+ * a refusal that only shows up as "all counters zero" is what this round is
+ * for. */
+extern "C" uint32_t ios_prof_map_abi_version(void) {
+  return FEX_IOSPROFMAP_VERSION;
+}
+extern "C" uint32_t ios_prof_map_entry_size(void) {
+  return static_cast<uint32_t>(sizeof(FEXCore::IosProfMap::Block));
 }
 extern "C" void ios_prof_map_set_guest(uint64_t GuestBase, uint32_t Bitness) {
   FEXCore::IosProfMap::Hdr.GuestBase = GuestBase;
@@ -1419,20 +1444,31 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
    * by Delta after the block is migrated into the CodeBuffer, so this is the same
    * namespace the sampler's host PC is in. */
   if (FEXCore::IosProfMap::Enabled() && CompiledCode.BlockBegin && CompiledCode.Size) {
-    uint32_t NX87 = 0, NVec = 0, NAtomic = 0, NTSO = 0;
+    uint32_t NX87 = 0, NVec = 0, NAtomic = 0, NTSO = 0, NMem = 0;
     for (auto [BlockNode, BlockHeader] : IRView->GetBlocks()) {
       for (auto [CodeNode, IROp] : IRView->GetCode(BlockNode)) {
-        switch (FEXCore::IosProfMap::ClassifyOp(IROp->Op)) {
-        case 1: ++NX87; break;
-        case 2: ++NVec; break;
-        case 3: ++NAtomic; break;
-        case 4: ++NTSO; break;
-        default: break;
+        /* ml960: a bitmask — the classes overlap (a TSO access is also a memory
+         * access), so each property is counted on its own. */
+        const uint8_t C = FEXCore::IosProfMap::ClassifyOp(IROp->Op);
+        if (C & FEXCore::IosProfMap::OpIsX87) {
+          ++NX87;
+        }
+        if (C & FEXCore::IosProfMap::OpIsVec) {
+          ++NVec;
+        }
+        if (C & FEXCore::IosProfMap::OpIsAtomic) {
+          ++NAtomic;
+        }
+        if (C & FEXCore::IosProfMap::OpIsTSO) {
+          ++NTSO;
+        }
+        if (C & FEXCore::IosProfMap::OpIsMem) {
+          ++NMem;
         }
       }
     }
     FEXCore::IosProfMap::Record(reinterpret_cast<uint64_t>(CompiledCode.BlockBegin), CompiledCode.Size, GuestRIP, TotalInstructions, NX87,
-                                NVec, NAtomic, NTSO);
+                                NVec, NAtomic, NTSO, NMem);
   }
 #endif
 
