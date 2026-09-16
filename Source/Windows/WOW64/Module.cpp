@@ -868,6 +868,10 @@ public:
    * SMC trap); a run where `declined` climbs is taking wild branches that DEP-off cannot excuse,
    * which is a different bug entirely.
    *
+   * `regions=0` is the EXPECTED reading for most non-NX-compat programs and is the whole point
+   * of promoting lazily: DEP is off, and the program simply never executes from its own data, so
+   * not one write-trap was armed.
+   *
    * Emitted from PreCompile rather than from InvalidationTracker so the tracker keeps no timer
    * of its own, and from here rather than FEXCore's [fex-stats] block because DEP is a
    * Windows-module concept that FEXCore has no view of. Silent until DEP is actually off. */
@@ -890,9 +894,10 @@ public:
       return;
     }
 
-    LogMan::Msg::EFmt("[dep-off] summary: DEP off, {} regions / {} KiB promoted to executable "
-                      "({} lazily on a decode miss), {} decode misses declined (not committed+readable)",
-                      Stats.Regions, Stats.Bytes >> 10, Stats.LazyRegions, Stats.LazyDeclined);
+    LogMan::Msg::EFmt("[dep-off] summary: DEP off, {} regions / {} KiB promoted to executable on an "
+                      "actual execute attempt (0 is normal — nothing is promoted eagerly), "
+                      "{} attempts declined (not committed+readable)",
+                      Stats.Regions, Stats.Bytes >> 10, Stats.Declined);
   }
 };
 

@@ -220,21 +220,42 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
 
     FEXCore::IntervalList<uint64_t>::Interval ProtInterval {AlignedBase, AlignedBase + AlignedSize};
 
+    /* MADEIRA: DEP-off does NOT promote here.
+     *
+     * An earlier revision treated "DEP off + readable" as executable on this path, so every
+     * guest NtAllocateVirtualMemory / NtProtectVirtualMemory of ordinary PAGE_READWRITE memory
+     * inserted an X *and* an RWX interval. In a non-NX-compat game that allocates or reprotects
+     * per frame that is a write-trap armed on plain data, at render-thread rate: one device run
+     * produced ~100 "Add SMC interval" lines a second, a 77 MB / 1.6 M-line log, and
+     * unixcall_wine_dbg_write at 3.2% of all CPU — while the title never executed from data at
+     * all, so every one of those traps was pure cost.
+     *
+     * The only correct trigger for DEP-off promotion is an ACTUAL EXECUTE ATTEMPT, and the
+     * decoder asks about one before it emits anything: see the lazy path in
+     * QueryExecutableRange. So this notification means exactly what it meant before DEP existed
+     * — the protection the guest asked for — and a program that never runs code out of its own
+     * data pays nothing.
+     *
+     * Removal is deliberately still DEP-aware (the branch below): a region promoted lazily and
+     * later reprotected or freed must leave DEPPromotedIntervals with the rest. */
     const bool HasExec = ProtHasExec(Prot);
-    // MADEIRA: with DEP off every committed readable page is executable - except a guard page,
-    // whose PAGE_GUARD bit is OR'd into an otherwise readable protection and which must keep its
-    // fault-once-then-rearm behaviour rather than acquiring an SMC write-trap.
-    const bool EffectiveExec = HasExec || (DEPDisabled && ProtIsReadable(Prot) && !(Prot & (PAGE_GUARD | PAGE_NOACCESS)));
-    const bool EffectiveRWX = EffectiveExec && ProtIsWritable(Prot);
+    const bool EffectiveRWX = HasExec && ProtIsWritable(Prot);
 
-    if (EffectiveExec) {
+    if (HasExec) {
       XIntervals.Insert(ProtInterval);
       if (EffectiveRWX) {
-        LogMan::Msg::DFmt("Add SMC interval: {:X} - {:X}", AlignedBase, AlignedBase + AlignedSize);
+        /* Capped. This fires once per genuinely RWX range, which is rare and interesting - but
+         * "rare" is a property of the guest, not a guarantee, and an uncapped log on a path a
+         * guest can drive is how the storm above happened. 64 is enough to characterise a
+         * process; the running totals live in the periodic [dep-off] summary. */
+        static std::atomic<uint32_t> SMCLogCount {0};
+        const auto N = SMCLogCount.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (N <= 64) {
+          LogMan::Msg::DFmt("Add SMC interval: {:X} - {:X}", AlignedBase, AlignedBase + AlignedSize);
+        } else if (N == 65) {
+          LogMan::Msg::DFmt("Add SMC interval: 64 reported — further ones suppressed for this session");
+        }
         RWXIntervals.Insert(ProtInterval);
-      }
-      if (DEPDisabled && !HasExec) {
-        DEPPromotedIntervals.Insert(ProtInterval);
       }
       return true;
     } else if (XIntervals.Intersect(ProtInterval)) {
@@ -308,7 +329,7 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
  * that the 32-bit loader issues for a non-NX-compat image (and that SetProcessDEPPolicy issues at
  * runtime), which sweeps what is already mapped; and PromoteDEPRegionLocked below, called lazily
  * from QueryExecutableRange for anything that appears afterwards. */
-FEXCore::IntervalList<uint64_t>::Interval InvalidationTracker::PromoteDEPRegionLocked(uint64_t Address, bool Lazy) {
+FEXCore::IntervalList<uint64_t>::Interval InvalidationTracker::PromoteDEPRegionLocked(uint64_t Address) {
   // A host address outside the guest window is FEX's own heap, the JIT pool or a host module.
   // DEP is a property of the GUEST process's memory; promoting host memory would both be
   // meaningless and arm SMC write-traps on FEX's own allocations.
@@ -325,17 +346,13 @@ FEXCore::IntervalList<uint64_t>::Interval InvalidationTracker::PromoteDEPRegionL
   // fault once and be re-armed by the kernel; PAGE_NOACCESS is excluded for the same reason
   // ProtIsReadable already excludes it, stated here so the guard case is visibly deliberate.
   if (Info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) {
-    if (Lazy) {
-      DEPLazyDeclined.fetch_add(1, std::memory_order_relaxed);
-    }
+    DEPDeclined.fetch_add(1, std::memory_order_relaxed);
     return {};
   }
   if (Info.State != MEM_COMMIT || !ProtIsReadable(Info.Protect) || ProtHasExec(Info.Protect)) {
     // Not a committed readable page: a wild branch into free/reserved/no-access memory, which is
     // an access violation even with DEP off. Leave it to fault.
-    if (Lazy) {
-      DEPLazyDeclined.fetch_add(1, std::memory_order_relaxed);
-    }
+    DEPDeclined.fetch_add(1, std::memory_order_relaxed);
     return {};
   }
 
@@ -359,24 +376,21 @@ FEXCore::IntervalList<uint64_t>::Interval InvalidationTracker::PromoteDEPRegionL
 
   DEPPromotedRegions.fetch_add(1, std::memory_order_relaxed);
   DEPPromotedBytes.fetch_add(AlignedSize, std::memory_order_relaxed);
-  if (Lazy) {
-    DEPLazyRegions.fetch_add(1, std::memory_order_relaxed);
-  }
 
   // Once per region, by construction: the DEPPromotedIntervals check above is the gate. Capped
-  // all the same - a process that churns scratch buffers promotes a region per buffer, and a log
-  // that scrolls the interesting first ones off the top is worse than one that says it stopped.
+  // all the same - a program that churns scratch buffers and jumps into each one promotes a
+  // region per buffer, and no log line a guest can drive may be uncapped.
   // The running totals are in the periodic [dep-off] summary either way.
   {
     static std::atomic<uint32_t> PromoteLogCount {0};
     const auto N = PromoteLogCount.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (N <= 512) {
+    if (N <= 64) {
       LogMan::Msg::EFmt("[dep-off] promoting {:#x}+{:#x} to executable for a non-NX-compat image (guest rip {:#x}) "
-                        "via={} prot={:#x} rwx={}",
+                        "prot={:#x} rwx={}",
                         GuestBase ? AlignedBase - GuestBase : AlignedBase, AlignedSize, GuestBase ? Address - GuestBase : Address,
-                        Lazy ? "decode-miss" : "sweep", Info.Protect, ProtIsWritable(Info.Protect) ? "yes" : "no");
-    } else if (N == 513) {
-      LogMan::Msg::EFmt("[dep-off] 512 regions promoted — per-region lines suppressed from here on; "
+                        Info.Protect, ProtIsWritable(Info.Protect) ? "yes" : "no");
+    } else if (N == 65) {
+      LogMan::Msg::EFmt("[dep-off] 64 regions promoted — per-region lines suppressed from here on; "
                         "see the periodic [dep-off] summary for the running totals");
     }
   }
@@ -388,8 +402,7 @@ InvalidationTracker::DEPStats InvalidationTracker::GetDEPStats() const {
     DEPDisabled,
     DEPPromotedRegions.load(std::memory_order_relaxed),
     DEPPromotedBytes.load(std::memory_order_relaxed),
-    DEPLazyRegions.load(std::memory_order_relaxed),
-    DEPLazyDeclined.load(std::memory_order_relaxed),
+    DEPDeclined.load(std::memory_order_relaxed),
   };
 }
 
@@ -414,35 +427,29 @@ void InvalidationTracker::HandleProcessExecuteFlagsChange(ULONG Flags) {
   if (DisableDEP) {
     DEPPromotedIntervals.Clear();
 
-    /* MADEIRA: the sweep is BOUNDED TO THE GUEST WINDOW.
+    /* MADEIRA: NOTHING IS PROMOTED HERE. DEP-off promotion is entirely lazy.
      *
-     * Upstream walks the whole address space from 0, which is right when guest and host share
-     * one 32-bit space. Here the host space is 64-bit and holds FEX's heap, the JIT pool's RW
-     * alias, every host module and the wineserver mappings - hundreds of gigabytes of committed
-     * readable non-executable regions that have nothing to do with the guest's DEP policy.
-     * Inserting them would (a) mark FEX's own allocations as guest code, and (b) put them in
-     * RWXIntervals, so the first block compiled anywhere near them would have
-     * ProtectRWXIntervalsInternal strip write access from FEX's own heap. DEP is a property of
-     * the guest process's memory; [Base, Base+4GiB) is exactly that memory.
+     * Upstream sweeps the whole address space and marks every committed readable region
+     * executable up front. That is cheap where "executable" is only a bit in an interval list
+     * consulted on decode - but here a writable promoted region ALSO enters RWXIntervals, and
+     * RWXIntervals arm a real host write-trap (NtProtectVirtualMemory to PAGE_READONLY) on any
+     * page a block is compiled in. Sweeping therefore taxed every data page of a non-NX-compat
+     * image whether or not the program ever executed from one. Measured on device: 38 regions /
+     * 25 MB promoted at startup for a title that never ran a byte out of its data, and the
+     * resulting SMC bookkeeping produced ~100 log lines a second for the whole session.
      *
-     * GuestBase == 0 means an identity-mapped configuration (ARM64EC), where the full walk is
-     * both correct and what upstream does. */
-    MEMORY_BASIC_INFORMATION Info;
-    uint64_t Address = GuestBase;
-    const uint64_t ScanEnd = GuestBase ? (GuestBase + (1ULL << 32)) : ~0ULL;
-
-    while (Address < ScanEnd && VirtualQuery(reinterpret_cast<LPCVOID>(Address), &Info, sizeof(Info))) {
-      uint64_t BaseAddress = reinterpret_cast<uint64_t>(Info.BaseAddress);
-      if (Info.State == MEM_COMMIT && ProtIsReadable(Info.Protect) && !ProtHasExec(Info.Protect)) {
-        PromoteDEPRegionLocked(BaseAddress, false);
-      }
-
-      Address = BaseAddress + Info.RegionSize;
-    }
+     * An execute attempt is both the correct trigger and a cheap one to detect: the frontend
+     * asks QueryExecutableRange before emitting anything, and the lazy branch there promotes on
+     * the miss. A program that never executes from writable memory pays nothing at all; one
+     * that does pays a VirtualQuery and one interval insert, once, per region it jumps into.
+     *
+     * (The scan that used to be here also had to be bounded to [GuestBase, GuestBase+4GiB):
+     * this host address space is 64-bit and full of FEX's own heap and the JIT pool's RW alias,
+     * and sweeping those would have marked FEX's allocations as guest code and armed write
+     * traps on them. Deleting the sweep removes that hazard as well.) */
     LogMan::Msg::EFmt("[dep-off] DEP DISABLED for this process (non-NX-compat image or SetProcessDEPPolicy): "
-                      "swept [{:#x},{:#x}) host, promoted {} regions / {:#x} bytes",
-                      GuestBase, ScanEnd, DEPPromotedRegions.load(std::memory_order_relaxed),
-                      DEPPromotedBytes.load(std::memory_order_relaxed));
+                      "no eager promotion — a committed readable page becomes executable only when "
+                      "the guest actually branches into it");
   } else {
     // ml760: this loop logs and removes (both allocate) with IntervalsLock held exclusively.
     // It cannot self-deadlock any more -- TrackerLockScope above makes every nested
@@ -873,7 +880,7 @@ FEXCore::HLE::ExecutableRangeInfo InvalidationTracker::QueryExecutableRange(uint
   }
   TrackerLockScope Reentry;
   std::unique_lock Lock(IntervalsLock);
-  if (!XIntervals.Query(Address).Enclosed && !PromoteDEPRegionLocked(Address, true).End) {
+  if (!XIntervals.Query(Address).Enclosed && !PromoteDEPRegionLocked(Address).End) {
     return {};
   }
   return QueryExecutableRangeLocked(Address);
