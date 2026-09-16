@@ -3,6 +3,7 @@
 
 #include <FEXCore/Utils/IntervalList.h>
 #include <FEXCore/HLE/SyscallHandler.h>
+#include <atomic>
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
@@ -66,7 +67,26 @@ public:
 
   FEXCore::HLE::ExecutableRangeInfo QueryExecutableRange(uint64_t Address);
 
+  // MADEIRA: what the periodic [dep-off] summary reports. Plain scalars, read without a lock -
+  // this is a progress counter, not a decision input.
+  struct DEPStats {
+    bool Disabled;         // DEP is off for this process (image without NX_COMPAT, or an explicit opt-out)
+    uint64_t Regions;      // regions promoted to executable so far, both sweep and lazy
+    uint64_t Bytes;        // their total size
+    uint64_t LazyRegions;  // of those, the ones promoted by QueryExecutableRange on a decode miss
+    uint64_t LazyDeclined; // decode misses where the page was NOT committed+readable, i.e. a real bad branch
+  };
+  DEPStats GetDEPStats() const;
+
 private:
+  // Registers [Address's committed region] as executable because DEP is off for this process.
+  // Returns the promoted interval, or a zero-size one when the address is not a committed,
+  // readable, non-executable page (i.e. a genuine wild branch, which must still fault).
+  // NOTE: Must be called with IntervalsLock held exclusively.
+  FEXCore::IntervalList<uint64_t>::Interval PromoteDEPRegionLocked(uint64_t Address, bool Lazy);
+  // The interval-list half of QueryExecutableRange. NOTE: IntervalsLock must be held.
+  FEXCore::HLE::ExecutableRangeInfo QueryExecutableRangeLocked(uint64_t Address);
+
   void DetectMonoBackpatcherBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC);
   void DisableSMCDetection();
   void InvalidateIntervalInternal(uint64_t Address, uint64_t Size);
@@ -92,6 +112,11 @@ private:
   bool SMCDetectionDisabled {false};                    // Protected by IntervalsLock
   bool DEPDisabled {false};                             // Protected by IntervalsLock
   FEXCore::IntervalList<uint64_t> DEPPromotedIntervals; // Protected by IntervalsLock
+  // Progress counters for the periodic [dep-off] line. Written under IntervalsLock, read without.
+  std::atomic<uint64_t> DEPPromotedRegions {0};
+  std::atomic<uint64_t> DEPPromotedBytes {0};
+  std::atomic<uint64_t> DEPLazyRegions {0};
+  std::atomic<uint64_t> DEPLazyDeclined {0};
 
   bool MonoBackpatcherDetectionPending {false};
   uint64_t MonoBase {0};

@@ -52,6 +52,7 @@ $end_info$
 #include <cstdint>
 #include <type_traits>
 #include <atomic>
+#include <chrono> // MADEIRA: the ~10 s wall clock behind the periodic [dep-off] summary
 #include <mutex>
 #include <utility>
 #include <unordered_map>
@@ -855,6 +856,43 @@ public:
 
   void PreCompile() override {
     Wow64ProcessPendingCrossProcessItems();
+    ReportDEPStats();
+  }
+
+  /* MADEIRA: the periodic [dep-off] summary.
+   *
+   * Companion to [fex-stats], on the same ~10 s wall clock and for the same reason: the
+   * per-region [dep-off] lines say what was promoted, this says how much of the guest's memory
+   * the process is executing out of and whether the number is still growing. A run whose
+   * regions/bytes climb without bound is an unpacker churning scratch buffers (each one arming an
+   * SMC trap); a run where `declined` climbs is taking wild branches that DEP-off cannot excuse,
+   * which is a different bug entirely.
+   *
+   * Emitted from PreCompile rather than from InvalidationTracker so the tracker keeps no timer
+   * of its own, and from here rather than FEXCore's [fex-stats] block because DEP is a
+   * Windows-module concept that FEXCore has no view of. Silent until DEP is actually off. */
+  void ReportDEPStats() {
+    const auto Stats = InvalidationTracker->GetDEPStats();
+    if (!Stats.Disabled) {
+      return;
+    }
+
+    static std::atomic<uint64_t> LastNs {0};
+    const uint64_t NowNs =
+      static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    uint64_t Last = LastNs.load(std::memory_order_relaxed);
+    if (Last == 0) {
+      // First arrival seeds the window instead of printing a line measured against the epoch.
+      LastNs.compare_exchange_strong(Last, NowNs, std::memory_order_relaxed);
+      return;
+    }
+    if ((NowNs - Last) < 10'000'000'000ULL || !LastNs.compare_exchange_strong(Last, NowNs, std::memory_order_relaxed)) {
+      return;
+    }
+
+    LogMan::Msg::EFmt("[dep-off] summary: DEP off, {} regions / {} KiB promoted to executable "
+                      "({} lazily on a decode miss), {} decode misses declined (not committed+readable)",
+                      Stats.Regions, Stats.Bytes >> 10, Stats.LazyRegions, Stats.LazyDeclined);
   }
 };
 

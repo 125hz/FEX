@@ -221,7 +221,10 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
     FEXCore::IntervalList<uint64_t>::Interval ProtInterval {AlignedBase, AlignedBase + AlignedSize};
 
     const bool HasExec = ProtHasExec(Prot);
-    const bool EffectiveExec = HasExec || (DEPDisabled && ProtIsReadable(Prot));
+    // MADEIRA: with DEP off every committed readable page is executable - except a guard page,
+    // whose PAGE_GUARD bit is OR'd into an otherwise readable protection and which must keep its
+    // fault-once-then-rearm behaviour rather than acquiring an SMC write-trap.
+    const bool EffectiveExec = HasExec || (DEPDisabled && ProtIsReadable(Prot) && !(Prot & (PAGE_GUARD | PAGE_NOACCESS)));
     const bool EffectiveRWX = EffectiveExec && ProtIsWritable(Prot);
 
     if (EffectiveExec) {
@@ -276,6 +279,120 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
   }
 }
 
+/* MADEIRA: DEP-OFF PROMOTION, in this port's terms.
+ *
+ * On Windows a 32-bit image WITHOUT IMAGE_DLLCHARACTERISTICS_NX_COMPAT runs with DEP disabled:
+ * executing from any committed readable page is legal, which is what every 2000s-era
+ * copy-protection wrapper, unpacker and runtime thunk relies on. Upstream Wine models that with
+ * force_exec_prot (wine/dlls/ntdll/unix/virtual.c:virtual_set_force_exec): every PROT_READ mmap
+ * also gets PROT_EXEC.
+ *
+ * That mechanism cannot work here and does not need to. iOS TXM refuses PROT_EXEC on every VA
+ * outside the JIT pool, so virtual_ios.c's mprotect_exec deliberately ignores the force (its
+ * [force-exec] note says why); and nothing host-executes a guest page anyway - guest code is
+ * decoded by the frontend and RUN FROM THE POOL. The only thing that decides whether a guest
+ * address may be executed is THIS class's XIntervals, consulted through QueryExecutableRange ->
+ * WowSyscallHandler::QueryGuestExecutableRange -> Decoder::CheckRangeExecutable. A range that is
+ * not in XIntervals decodes as NOEXEC, Core.cpp raises NoExecOp, and the JIT branches to the
+ * GuestSignal_SIGSEGV trampoline (`mov w1,#0 ; ldr x1,[x1]`) - the "no pool copy for this
+ * address" death seen on a retail 32-bit title at guest RIP 0x01B4380F, a VirtualAlloc'd page the
+ * program had written code into.
+ *
+ * So "promote the page to executable" means exactly one thing here: put it in XIntervals, and -
+ * because unpackers write, execute, rewrite and execute again - in RWXIntervals too, so the SMC
+ * write-trap is armed on it. DEPPromotedIntervals then makes GetTrapProt/GetUntrapProt trap with
+ * PAGE_READONLY/PAGE_READWRITE instead of the PAGE_EXECUTE_* pair, since the host page is (and
+ * must stay) non-executable.
+ *
+ * Two entry points feed it: this function, on the NtSetInformationProcess(ProcessExecuteFlags)
+ * that the 32-bit loader issues for a non-NX-compat image (and that SetProcessDEPPolicy issues at
+ * runtime), which sweeps what is already mapped; and PromoteDEPRegionLocked below, called lazily
+ * from QueryExecutableRange for anything that appears afterwards. */
+FEXCore::IntervalList<uint64_t>::Interval InvalidationTracker::PromoteDEPRegionLocked(uint64_t Address, bool Lazy) {
+  // A host address outside the guest window is FEX's own heap, the JIT pool or a host module.
+  // DEP is a property of the GUEST process's memory; promoting host memory would both be
+  // meaningless and arm SMC write-traps on FEX's own allocations.
+  if (GuestBase && (Address < GuestBase || (Address - GuestBase) >= (1ULL << 32))) {
+    return {};
+  }
+
+  MEMORY_BASIC_INFORMATION Info;
+  if (!VirtualQuery(reinterpret_cast<LPCVOID>(Address), &Info, sizeof(Info))) {
+    return {};
+  }
+  // PAGE_GUARD is OR'd into the protection, so a stack guard page reads as "readable" to
+  // ProtIsReadable. Promoting one would arm an SMC write-trap on a page whose entire job is to
+  // fault once and be re-armed by the kernel; PAGE_NOACCESS is excluded for the same reason
+  // ProtIsReadable already excludes it, stated here so the guard case is visibly deliberate.
+  if (Info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) {
+    if (Lazy) {
+      DEPLazyDeclined.fetch_add(1, std::memory_order_relaxed);
+    }
+    return {};
+  }
+  if (Info.State != MEM_COMMIT || !ProtIsReadable(Info.Protect) || ProtHasExec(Info.Protect)) {
+    // Not a committed readable page: a wild branch into free/reserved/no-access memory, which is
+    // an access violation even with DEP off. Leave it to fault.
+    if (Lazy) {
+      DEPLazyDeclined.fetch_add(1, std::memory_order_relaxed);
+    }
+    return {};
+  }
+
+  const auto BaseAddress = reinterpret_cast<uint64_t>(Info.BaseAddress);
+  const auto AlignedBase = BaseAddress & FEXCore::Utils::FEX_PAGE_MASK;
+  const auto AlignedSize = (BaseAddress - AlignedBase + Info.RegionSize + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK;
+  FEXCore::IntervalList<uint64_t>::Interval ProtInterval {AlignedBase, AlignedBase + AlignedSize};
+
+  if (DEPPromotedIntervals.Query(Address).Enclosed) {
+    // Already promoted (a second thread raced us here); report the interval without re-logging.
+    return ProtInterval;
+  }
+
+  XIntervals.Insert(ProtInterval);
+  if (ProtIsWritable(Info.Protect)) {
+    // Writable AND executable now, so the SMC write-trap must cover it: a self-decrypting
+    // unpacker writes the next stage into the same page it is about to jump into.
+    RWXIntervals.Insert(ProtInterval);
+  }
+  DEPPromotedIntervals.Insert(ProtInterval);
+
+  DEPPromotedRegions.fetch_add(1, std::memory_order_relaxed);
+  DEPPromotedBytes.fetch_add(AlignedSize, std::memory_order_relaxed);
+  if (Lazy) {
+    DEPLazyRegions.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  // Once per region, by construction: the DEPPromotedIntervals check above is the gate. Capped
+  // all the same - a process that churns scratch buffers promotes a region per buffer, and a log
+  // that scrolls the interesting first ones off the top is worse than one that says it stopped.
+  // The running totals are in the periodic [dep-off] summary either way.
+  {
+    static std::atomic<uint32_t> PromoteLogCount {0};
+    const auto N = PromoteLogCount.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (N <= 512) {
+      LogMan::Msg::EFmt("[dep-off] promoting {:#x}+{:#x} to executable for a non-NX-compat image (guest rip {:#x}) "
+                        "via={} prot={:#x} rwx={}",
+                        GuestBase ? AlignedBase - GuestBase : AlignedBase, AlignedSize, GuestBase ? Address - GuestBase : Address,
+                        Lazy ? "decode-miss" : "sweep", Info.Protect, ProtIsWritable(Info.Protect) ? "yes" : "no");
+    } else if (N == 513) {
+      LogMan::Msg::EFmt("[dep-off] 512 regions promoted — per-region lines suppressed from here on; "
+                        "see the periodic [dep-off] summary for the running totals");
+    }
+  }
+  return ProtInterval;
+}
+
+InvalidationTracker::DEPStats InvalidationTracker::GetDEPStats() const {
+  return {
+    DEPDisabled,
+    DEPPromotedRegions.load(std::memory_order_relaxed),
+    DEPPromotedBytes.load(std::memory_order_relaxed),
+    DEPLazyRegions.load(std::memory_order_relaxed),
+    DEPLazyDeclined.load(std::memory_order_relaxed),
+  };
+}
+
 void InvalidationTracker::HandleProcessExecuteFlagsChange(ULONG Flags) {
   const bool DisableDEP = (Flags & MEM_EXECUTE_OPTION_ENABLE) != 0;
 
@@ -297,25 +414,35 @@ void InvalidationTracker::HandleProcessExecuteFlagsChange(ULONG Flags) {
   if (DisableDEP) {
     DEPPromotedIntervals.Clear();
 
+    /* MADEIRA: the sweep is BOUNDED TO THE GUEST WINDOW.
+     *
+     * Upstream walks the whole address space from 0, which is right when guest and host share
+     * one 32-bit space. Here the host space is 64-bit and holds FEX's heap, the JIT pool's RW
+     * alias, every host module and the wineserver mappings - hundreds of gigabytes of committed
+     * readable non-executable regions that have nothing to do with the guest's DEP policy.
+     * Inserting them would (a) mark FEX's own allocations as guest code, and (b) put them in
+     * RWXIntervals, so the first block compiled anywhere near them would have
+     * ProtectRWXIntervalsInternal strip write access from FEX's own heap. DEP is a property of
+     * the guest process's memory; [Base, Base+4GiB) is exactly that memory.
+     *
+     * GuestBase == 0 means an identity-mapped configuration (ARM64EC), where the full walk is
+     * both correct and what upstream does. */
     MEMORY_BASIC_INFORMATION Info;
-    uint64_t Address = 0;
+    uint64_t Address = GuestBase;
+    const uint64_t ScanEnd = GuestBase ? (GuestBase + (1ULL << 32)) : ~0ULL;
 
-    while (VirtualQuery(reinterpret_cast<LPCVOID>(Address), &Info, sizeof(Info))) {
+    while (Address < ScanEnd && VirtualQuery(reinterpret_cast<LPCVOID>(Address), &Info, sizeof(Info))) {
       uint64_t BaseAddress = reinterpret_cast<uint64_t>(Info.BaseAddress);
       if (Info.State == MEM_COMMIT && ProtIsReadable(Info.Protect) && !ProtHasExec(Info.Protect)) {
-        const auto AlignedBase = BaseAddress & FEXCore::Utils::FEX_PAGE_MASK;
-        const auto AlignedSize = (BaseAddress - AlignedBase + Info.RegionSize + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK;
-        FEXCore::IntervalList<uint64_t>::Interval ProtInterval {AlignedBase, AlignedBase + AlignedSize};
-
-        XIntervals.Insert(ProtInterval);
-        if (ProtIsWritable(Info.Protect)) {
-          RWXIntervals.Insert(ProtInterval);
-        }
-        DEPPromotedIntervals.Insert(ProtInterval);
+        PromoteDEPRegionLocked(BaseAddress, false);
       }
 
       Address = BaseAddress + Info.RegionSize;
     }
+    LogMan::Msg::EFmt("[dep-off] DEP DISABLED for this process (non-NX-compat image or SetProcessDEPPolicy): "
+                      "swept [{:#x},{:#x}) host, promoted {} regions / {:#x} bytes",
+                      GuestBase, ScanEnd, DEPPromotedRegions.load(std::memory_order_relaxed),
+                      DEPPromotedBytes.load(std::memory_order_relaxed));
   } else {
     // ml760: this loop logs and removes (both allocate) with IntervalsLock held exclusively.
     // It cannot self-deadlock any more -- TrackerLockScope above makes every nested
@@ -327,10 +454,36 @@ void InvalidationTracker::HandleProcessExecuteFlagsChange(ULONG Flags) {
         LogMan::Msg::EFmt("[iOS-xrem] via=depflags #{} tracker={} {:#x}-{:#x}", DepRemoveCount, static_cast<void*>(this),
                           Interval.Offset, Interval.End);
       }
+      /* MADEIRA: UNTRAP BEFORE FORGETTING.
+       *
+       * A DEP-promoted region that carried compiled code has had write access stripped from
+       * those pages by ProtectRWXIntervalsInternal (GetTrapProt -> PAGE_READONLY for a
+       * DEP-promoted range). Removing the interval here without restoring write would leave the
+       * guest's own data pages permanently read-only: the next store faults,
+       * HandleRWXAccessViolation no longer recognises the address, and the guest receives a
+       * write access violation on memory it legitimately owns. The DEP-off half of
+       * build/x86-tests/execrw-x86.c walks straight into this in its runtime-opt-in phase - it
+       * enables DEP with SetProcessDEPPolicy and then writes to the buffer it had been
+       * executing from.
+       *
+       * PAGE_READWRITE, not GetUntrapProt: DEPDisabled is already false above, so GetUntrapProt
+       * would hand back PAGE_EXECUTE_READWRITE - a protection the host page cannot hold and
+       * never had. Only intervals that reached RWXIntervals were ever trapped, and a region
+       * only reaches RWXIntervals through the DEP path when the whole region was writable, so
+       * restoring the whole interval to PAGE_READWRITE restores exactly what was taken. */
+      if (RWXIntervals.Query(Interval.Offset).Enclosed) {
+        void* TmpAddress = reinterpret_cast<void*>(Interval.Offset);
+        SIZE_T TmpSize = static_cast<SIZE_T>(Interval.End - Interval.Offset);
+        ULONG TmpProt;
+        NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, PAGE_READWRITE, &TmpProt);
+      }
       XIntervals.Remove(Interval);
       RWXIntervals.Remove(Interval);
     }
     DEPPromotedIntervals.Clear();
+    LogMan::Msg::EFmt("[dep-off] DEP RE-ENABLED for this process: withdrew {} promoted regions, "
+                      "restoring write access to any that had been write-trapped for SMC",
+                      DepRemoveCount);
   }
 
   // Invalidate all cached code: previously-compiled blocks may contain NoExec stubs for addresses
@@ -680,7 +833,54 @@ bool InvalidationTracker::BeginUntrackedWriteLocked(uint64_t Address, uint64_t S
  * NotifyMemoryFree), neither of which was instrumented. Tag each site so the culprit
  * path names itself. */
 FEXCore::HLE::ExecutableRangeInfo InvalidationTracker::QueryExecutableRange(uint64_t Address) {
-  std::shared_lock Lock(IntervalsLock);
+  {
+    // The hot path: one interval query under a shared lock, exactly as before. A zero Size means
+    // "not executable", which only has a second chance to be answered when DEP is off.
+    std::shared_lock Lock(IntervalsLock);
+    const auto Info = QueryExecutableRangeLocked(Address);
+    if (Info.Size || !DEPDisabled) {
+      return Info;
+    }
+  }
+
+  /* MADEIRA: LAZY DEP PROMOTION - the decode-time half of DEP-off.
+   *
+   * The sweep in HandleProcessExecuteFlagsChange only sees what is mapped at the moment DEP is
+   * switched off. Everything a copy-protection layer does afterwards - VirtualAlloc a scratch
+   * buffer, decrypt the next stage into it, jump in - arrives later, and while
+   * BTCpuNotifyMemoryAlloc/Protect do cover the ordinary paths, they cannot cover a page that
+   * became executable without any guest syscall at all (a section view committed on demand, a
+   * page some other pseudo-process wrote, a range whose notification was dropped by the ml760
+   * re-entrancy guard).
+   *
+   * This is the port's equivalent of upstream's "execute fault on a committed page in a
+   * non-DEP process grants execute" (which upstream spells as force_exec_prot, applied at
+   * mprotect time). Doing it HERE rather than on the fault is what makes it usable: the
+   * decoder asks before it emits anything, so the block is compiled correctly the first time.
+   * Promoting after the NoExec trap has been emitted would mean unwinding an already-running
+   * block and re-entering the JIT at the same RIP from a signal handler.
+   *
+   * Only IntervalsLock is taken. In particular NO invalidation is performed - nothing can have
+   * been compiled for a range the decoder is only now asking about - which matters because this
+   * runs with CodeInvalidationMutex already held SHARED by the compiling thread, and that mutex
+   * has no shared->exclusive upgrade.
+   *
+   * A decode miss that is NOT a committed readable page falls through to a zero-size result, so
+   * a genuine wild branch still raises NoExecOp and still faults. DEP off does not mean "every
+   * address is code". */
+  if (TrackerReentered("QueryExecutableRange", Address, 0)) {
+    return {};
+  }
+  TrackerLockScope Reentry;
+  std::unique_lock Lock(IntervalsLock);
+  if (!XIntervals.Query(Address).Enclosed && !PromoteDEPRegionLocked(Address, true).End) {
+    return {};
+  }
+  return QueryExecutableRangeLocked(Address);
+}
+
+// NOTE: IntervalsLock must be held (shared or exclusive) by the caller.
+FEXCore::HLE::ExecutableRangeInfo InvalidationTracker::QueryExecutableRangeLocked(uint64_t Address) {
   const auto XResult = XIntervals.Query(Address);
   if (!XResult.Enclosed) {
     return {};
