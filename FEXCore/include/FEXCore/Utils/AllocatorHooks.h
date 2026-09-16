@@ -120,8 +120,19 @@ inline void* VirtualAlloc(void* Base, size_t Size, bool Execute = false, bool Co
     if (Ret) {
       return Ret;
     }
-    /* Band exists but is exhausted: a different failure from "no band", and
-     * the pre-existing ml321 hardening (#43) still applies below. */
+    /* ml799: an exhausted arena must FAIL, not fall through.
+     *
+     * The unconstrained VirtualAlloc2 below places the allocation wherever the
+     * kernel likes -- which, once the arena exists, means FEX memory landing
+     * outside the range Wine is holding for it, i.e. in guest address space.
+     * That is the collision the arena was built to end, and it would reappear
+     * only under exhaustion: the hardest case to reproduce and the easiest to
+     * misread as corruption.
+     *
+     * Callers already handle nullptr (see the thread-state and call/ret-stack
+     * paths, which report and refuse to start a thread), so failing here is
+     * both honest and survivable. */
+    return nullptr;
   }
 #endif
   MEM_EXTENDED_PARAMETER Parameter {};

@@ -6,6 +6,7 @@ desc: Implements the ARM64EC BT module API using FEXCore
 $end_info$
 */
 
+#include "../Common/ArenaManager.h"
 #include <FEXCore/fextl/fmt.h>
 #include <FEXCore/Core/X86Enums.h>
 #include <FEXCore/Core/SignalDelegator.h>
@@ -852,6 +853,21 @@ NTSTATUS ProcessInit() {
   FEX::Config::LoadConfig(fextl::string {ExecutableName}, _environ, FEX::ReadPortabilityInformation());
   FEXCore::Config::ReloadMetaLayer();
   FEX::Windows::Logging::Init();
+
+#if defined(FEX_IOS_HOST) && defined(MADEIRA_ARENA_SELFTEST)
+  /* Runs only when MADEIRA_ARENA_TEST is set, and only in builds that link the
+   * self-test (ArenaSelfTest.cpp is not in CMakeLists, so this is compiled out
+   * by default and the carver has NEVER executed on device).
+   *
+   * ml798 correction: an earlier version of this comment blamed the test's
+   * std::thread/std::vector CRT constructors for the _lock(17) recursion that
+   * killed every launch. The ml796 A/B REFUTED that -- unlinking the test
+   * changed nothing. The real cause was three getenv() calls added to
+   * rpmalloc's band selector, which runs before ucrtbase's DllMain; see the
+   * ml797 note in ios_fex_band_select(). Keeping the false attribution here
+   * would send the next reader to exonerated code. */
+  FEX::Windows::Arena::SelfTest();
+#endif
 #ifdef FEX_IOS_HOST
   /* iOS-Madeira ml278: announce the atomic-alias geometry UNCONDITIONALLY, AFTER
    * Logging::Init().
@@ -890,7 +906,7 @@ NTSTATUS ProcessInit() {
  * __DATE__/__TIME__ below is compiler-generated and therefore the
  * authoritative identity; if the two disagree, the tag is wrong, not the
  * build. */
-#define MADEIRA_REV "ml755"
+#define MADEIRA_REV "ml908"
   LogMan::Msg::EFmt("[build-id] xtajit64 rev=" MADEIRA_REV " compiled " __DATE__ " " __TIME__);
 #ifdef FEX_IOS_HOST
   /* ml751: flush the VA band selector's beacons.
@@ -1645,6 +1661,22 @@ NTSTATUS ThreadInit() {
 #endif
 
   auto* Thread = CTX->CreateThread(0, 0);
+  if (!Thread) {
+    /* The emulator could not allocate this thread's state. Unwind what this
+     * function has already built and hand the failure back; the loader releases
+     * loader_section and ends only this thread, so the process survives to
+     * report it rather than wedging on a lock owned by a dead thread. */
+    LogMan::Msg::EFmt("[FEX-iOS] ThreadInit: thread state unavailable -- unwinding thread {:#x} "
+                      "and returning STATUS_NO_MEMORY", (unsigned long long)GetCurrentThreadId());
+    CPUArea.StateFrame() = nullptr;
+    CPUArea.EmulatorStackLimit() = 0;
+    CPUArea.EmulatorStackBase() = 0;
+    if (EmulatorStack) {
+      ::VirtualFree(reinterpret_cast<void*>(EmulatorStack), 0, MEM_RELEASE);
+    }
+    FEX::Windows::DeinitCRTThread();
+    return STATUS_NO_MEMORY;
+  }
 #ifdef FEX_IOS_HOST
   IosTiLog("[FEX-iOS] TI:createthread\n");
 #endif
@@ -1700,7 +1732,37 @@ NTSTATUS ThreadInit() {
   }
 #endif
 
-  FEX::Windows::CallRetStack::InitializeThread(Thread);
+  if (!FEX::Windows::CallRetStack::InitializeThread(Thread)) {
+    /* Unwind everything this function built for this thread, in reverse.
+     *
+     * Returning early without unwinding leaves the CPU area pointing at a
+     * half-built thread, and the emulator stack and segment table leaked -- on
+     * a band that just proved it has nothing left to give. The caller releases
+     * the loader lock and terminates only this thread, so the process survives
+     * to report the failure instead of wedging. */
+    LogMan::Msg::EFmt("[FEX-iOS] ThreadInit: call-ret stack unavailable (band [{:#x},{:#x}]) "
+                      "-- unwinding thread {:#x} and returning STATUS_NO_MEMORY",
+                      (unsigned long long)ios_fex_band_base, (unsigned long long)ios_fex_band_end,
+                      (unsigned long long)GetCurrentThreadId());
+
+    Frame->State.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_GDT] = nullptr;
+    Frame->State.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_LDT] = nullptr;
+    delete[] NewSegments;
+
+    CTX->DestroyThread(Thread);
+
+    /* Clear the CPU-area fields before freeing what they point at, so nothing
+     * can observe a stale pointer while the thread winds down. */
+    CPUArea.StateFrame() = nullptr;
+    CPUArea.EmulatorStackLimit() = 0;
+    CPUArea.EmulatorStackBase() = 0;
+    if (EmulatorStack) {
+      ::VirtualFree(reinterpret_cast<void*>(EmulatorStack), 0, MEM_RELEASE);
+    }
+
+    FEX::Windows::DeinitCRTThread();
+    return STATUS_NO_MEMORY;
+  }
 #ifdef FEX_IOS_HOST
   IosTiLog("[FEX-iOS] TI:callret\n");
 #endif
