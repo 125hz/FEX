@@ -42,10 +42,12 @@ The Madeira-authored modifications and new files in this repository (the
 commits by Will Faust) are offered under GPL-3.0-or-later **with** the
 following additional permission, reproduced here in full so this grant is
 self-contained. Upstream code keeps its own licence and notices and needs
-no exception. This is a draft prepared 2026-09-16; it takes effect only
-when adopted in a tagged release, and is provisional until then.
+no exception. This is a draft prepared 2026-09-16; it takes effect when the
+copyright holder completes the adoption line in the top-level Madeira
+repository's LICENSE-EXCEPTION.md, which must happen before any public
+push, and is provisional until then.
 
-### Madeira Converter Exception, version 1 (DRAFT of 2026-09-16; not in effect until adopted)
+### Madeira Converter Exception, version 1 (DRAFT of 2026-09-16; in effect from the adoption recorded in the top-level LICENSE-EXCEPTION.md)
 
 Additional permission under GNU GPL version 3 section 7.
 
