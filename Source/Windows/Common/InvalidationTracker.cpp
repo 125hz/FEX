@@ -770,9 +770,18 @@ void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t S
     // churn, drowning the log and costing a dprintf syscall per free. The
     // signal (which path removes a tracked range) is preserved by the first 40
     // plus a 1-in-64 sample.
+    //
+    // ml998: 1-in-64 was measured against ml436's 4,234 events. A real play
+    // session runs 3.8 M of them (qp4.txt, 934 s: 4,000 guest frees a second),
+    // so the "sampled" line was still the second largest thing in the log —
+    // 58,854 lines. The sample is what carries the signal here, not the rate,
+    // so widen it to 1-in-1024 and keep a first-32 prefix for the boot-time
+    // sequence, where every removal is worth seeing. 3.8 M events then cost
+    // ~3.7 k lines instead of 59 k, and the decision the sample informs (which
+    // path removes a tracked range, and how big) is unchanged.
     static std::atomic<uint32_t> AlignedRemoveCount;
     const auto N = AlignedRemoveCount.fetch_add(1) + 1;
-    if (N <= 40 || !(N & 63)) {
+    if (N <= 32 || !(N & 1023)) {
       LogMan::Msg::EFmt("[iOS-xrem] via=aligned #{} tracker={} {:#x}-{:#x}", N, static_cast<void*>(this),
                         AlignedBase, AlignedBase + AlignedSize);
     }
