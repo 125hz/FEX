@@ -15,6 +15,13 @@
 #include <cstdint>
 #include <cstdlib>
 
+// MADEIRA 2026-09-19: [unaligned-atomic] totals, defined in Interface/Core/Core.cpp
+// alongside the other [fex-stats] accumulators (this file is arm64-host only).
+namespace FEXCore::Context::MadeiraStats {
+extern std::atomic<uint64_t> UnalignedAtomicEmulated;
+extern std::atomic<uint64_t> UnalignedAtomicPatched;
+} // namespace FEXCore::Context::MadeiraStats
+
 namespace FEXCore::ArchHelpers::Arm64 {
 constexpr uint32_t CASPAL_MASK = 0xBF'E0'FC'00;
 constexpr uint32_t CASPAL_INST = 0x08'60'FC'00;
@@ -2139,9 +2146,96 @@ static uint64_t HandleAtomicLoadstoreExclusive(uintptr_t ProgramCounter, uint64_
   return NumInstructionsToSkip * 4;
 }
 
+/* MADEIRA 2026-09-19 [unaligned-atomic] census.
+ *
+ * Every unaligned atomic that reaches this file is either EMULATED in place
+ * (the handler performs the access itself and reports how far to advance) or
+ * BACK-PATCHED (the atomic is rewritten to a plain access plus a barrier and
+ * re-executed). Which one happened is fully determined by the return value —
+ * a byte count to skip means emulation, an instruction-relative 0 or -4 means
+ * the site was rewritten and must run again — so one wrapper covers all nine
+ * class branches without touching any of them.
+ *
+ * Why this is worth logging at all: FEX deliberately does NOT back-patch the
+ * LSE atomic-memory class (SWP/LDADD/LDCLR/LDEOR/LDSET), because no single
+ * ARM64 instruction has the semantics to replace one. Those sites therefore
+ * fault on EVERY execution, and a guest spin-acquire re-faults once per loop
+ * iteration. That is correct but slow, and it is the shape that has to be
+ * recognisable in a log before anyone concludes a lock is deadlocked. Sites
+ * are deduplicated by host PC and capped at 32 lines; the running totals go
+ * out on the periodic [fex-stats] line, which is never capped. */
+namespace Madeira {
+// Storage lives in Core.cpp next to the other [fex-stats] accumulators, because
+// this translation unit is only compiled for arm64 hosts and the stats line is
+// not.
+using FEXCore::Context::MadeiraStats::UnalignedAtomicEmulated;
+using FEXCore::Context::MadeiraStats::UnalignedAtomicPatched;
+
+static bool ClaimUnalignedSite(uint64_t PC) {
+  constexpr uint32_t MaxSites = 32;
+  static std::atomic<uint64_t> Sites[MaxSites] {};
+
+  for (uint32_t i = 0; i < MaxSites;) {
+    uint64_t Seen = Sites[i].load(std::memory_order_acquire);
+    if (Seen == PC) {
+      // Already reported once.
+      return false;
+    }
+    if (Seen == 0) {
+      uint64_t Expected = 0;
+      if (Sites[i].compare_exchange_strong(Expected, PC, std::memory_order_acq_rel)) {
+        return true;
+      }
+      // Another thread took this slot while we looked at it; re-read the same
+      // slot rather than skipping it, so a site can never be reported twice.
+      continue;
+    }
+    ++i;
+  }
+  // Table full: the 32-line cap is reached, counters keep going.
+  return false;
+}
+} // namespace Madeira
+
+[[nodiscard]]
+static std::optional<int32_t> HandleUnalignedAccessImpl(FEXCore::Core::InternalThreadState* Thread, UnalignedHandlerType HandleType,
+                                                       uintptr_t ProgramCounter, uint64_t* GPRs, bool IsJIT);
+
 [[nodiscard]]
 std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState* Thread, UnalignedHandlerType HandleType,
                                              uintptr_t ProgramCounter, uint64_t* GPRs, bool IsJIT) {
+  // Read the faulting encoding BEFORE the handler runs: a back-patch rewrites
+  // it in place, and the log has to name the instruction that actually faulted.
+  const uint32_t Instr = reinterpret_cast<const uint32_t*>(ProgramCounter)[0];
+  const auto Result = HandleUnalignedAccessImpl(Thread, HandleType, ProgramCounter, GPRs, IsJIT);
+  if (!Result.has_value()) {
+    return Result;
+  }
+
+  // 0 / -4 mean "the site was rewritten, run it again"; anything else is a
+  // byte count past an access this handler performed itself.
+  const bool Patched = (*Result == 0 || *Result == -4);
+  if (Patched) {
+    Madeira::UnalignedAtomicPatched.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    Madeira::UnalignedAtomicEmulated.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  if (Madeira::ClaimUnalignedSite(ProgramCounter)) {
+    const uint32_t AddrReg = (Instr >> 5) & 0x1F;
+    LogMan::Msg::EFmt("[unaligned-atomic] pc=0x{:x} insn=0x{:08x} addr=0x{:x} handled by {} "
+                      "(jit={} emulated={} patched={}) rev=2026-09-19",
+                      ProgramCounter, Instr, AddrReg == 31 ? 0 : GPRs[AddrReg], Patched ? "patch" : "emulation", IsJIT ? 1 : 0,
+                      Madeira::UnalignedAtomicEmulated.load(std::memory_order_relaxed),
+                      Madeira::UnalignedAtomicPatched.load(std::memory_order_relaxed));
+  }
+
+  return Result;
+}
+
+[[nodiscard]]
+static std::optional<int32_t> HandleUnalignedAccessImpl(FEXCore::Core::InternalThreadState* Thread, UnalignedHandlerType HandleType,
+                                                        uintptr_t ProgramCounter, uint64_t* GPRs, bool IsJIT) {
 #ifdef ARCHITECTURE_arm64
   constexpr bool is_arm64 = true;
 #else

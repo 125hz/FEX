@@ -833,6 +833,15 @@ namespace MadeiraStats {
 std::atomic<uint64_t> BlocksCompiled {};
 std::atomic<uint64_t> GuestInstsCompiled {};
 std::atomic<uint64_t> HostCodeBytes {};
+/* 2026-09-19: unaligned-atomic fixups, bumped by ArchHelpers/Arm64.cpp (arm64
+ * hosts only — defined here so the [fex-stats] line can read them on every
+ * host). `ua_emu` counts accesses the handler performed itself, which includes
+ * the whole LSE atomic-memory class because no single instruction can replace
+ * one; `ua_patch` counts sites rewritten to plain access + barrier, which fault
+ * once and then cost nothing. A large, still-growing ua_emu is normal for a
+ * guest that spins on a misaligned lock word — it is not by itself a fault. */
+std::atomic<uint64_t> UnalignedAtomicEmulated {};
+std::atomic<uint64_t> UnalignedAtomicPatched {};
 } // namespace MadeiraStats
 
 } // namespace FEXCore::Context (ml930: reopened below — IosProfMap is its own
@@ -2296,10 +2305,12 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
           const uint64_t BlockDelta = Blocks - LastStatsBlocks.exchange(Blocks, std::memory_order_relaxed);
           const uint64_t DispatchDelta = total - LastStatsTotal.exchange(total, std::memory_order_relaxed);
           LogMan::Msg::EFmt("[fex-stats] rev=ml900 window_ms={} blocks={} (+{}, {}/s) insts/blk={} "
-                            "host_b/inst={} cpp_dispatch=+{} ({}/s) hit_rate={}%",
+                            "host_b/inst={} cpp_dispatch=+{} ({}/s) hit_rate={}% ua_emu={} ua_patch={}",
                             ElapsedMs, Blocks, BlockDelta, ElapsedMs ? (BlockDelta * 1000 / ElapsedMs) : 0, Blocks ? (Insts / Blocks) : 0,
                             Insts ? (HostBytes / Insts) : 0, DispatchDelta, ElapsedMs ? (DispatchDelta * 1000 / ElapsedMs) : 0,
-                            (total > 0) ? (100 * (total - reals) / total) : 0);
+                            (total > 0) ? (100 * (total - reals) / total) : 0,
+                            MadeiraStats::UnalignedAtomicEmulated.load(std::memory_order_relaxed),
+                            MadeiraStats::UnalignedAtomicPatched.load(std::memory_order_relaxed));
         }
       }
 
