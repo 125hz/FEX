@@ -82,17 +82,39 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostF
   /* MADEIRA ml970: FEAT_LRCPC2 (SupportsTSOImm9) is OPT-IN here, and off by
    * default, because this branch cannot probe for it.
    *
-   * What it buys, measured on the [prof] hot-block dumps of a 32-bit D3D9
-   * title: with SupportsTSOImm9 false every TSO access is emitted as
-   * `<addr arithmetic>; add x24, x19, wN, uxtw; ldapr/stlr wR, [x24]',
-   * because LDAPR/STLR have no offset form at all and IREmitter.h's
-   * `IsSIMM9 &= (SupportsTSOImm9 || !TSO)' therefore refuses to fold ANY
-   * displacement into a TSO op.  One guest `add [ebp-516], reg' costs nine
-   * host instructions, four of which are address arithmetic that
-   * `ldapur/stlur wR, [x24, #-516]' would absorb outright.  The unaligned
-   * back-patcher already decodes and rewrites both forms
-   * (FEXCore/Source/Utils/ArchHelpers/Arm64.cpp: LDAPUR_INST/STLUR_INST at
-   * :2202, :2352, :2412), so nothing downstream needs to change.
+   * ml998 CORRECTION -- IT BUYS NOTHING ON THIS PORT, AND COSTS A LITTLE.
+   * The paragraph that used to sit here described upstream's IDENTITY-MAPPED
+   * behaviour and was quietly wrong about ours.  It claimed a guest
+   * `add [ebp-516], reg' would have four address instructions absorbed by
+   * `ldapur/stlur wR, [x24, #-516]'.  That fold cannot happen behind a guest
+   * window: Arm64JITCore::GetGuestMemAddr (FEXCore JIT MemoryOps.cpp) returns
+   * NoOffset on every non-identity path, deliberately, because the base must
+   * be applied as `Base + zext32(EA + disp)' and an imm9 would add the
+   * displacement on the FAR side of the window (`Base + zext32(EA) + disp'),
+   * which leaves the window whenever an x86 effective address wraps at 4 GiB.
+   * Only the `if (!GuestBase)' early return preserves Offset, and that is the
+   * Linux-host path we never take.
+   *
+   * So with SupportsTSOImm9 true, LoadMemTSO/StoreMemTSO still see
+   * Guest.Offset invalid and emit `ldapur/stlur wR, [Xn, #0]' -- the same
+   * access as `ldapr/stlr wR, [Xn]', one encoding further up the architecture
+   * version.  The displacement is still materialised, just in a worse place:
+   *   OFF: one IR Add computes EA+disp and CSEs across the load and the store
+   *        of a load-modify-store, plus one ApplyGuestBase per access  = 3.
+   *   ON:  SelectAddressMode peels the displacement off, so there is no
+   *        shared IR Add left, and each access re-emits `sub Tmp, base, #516'
+   *        and `add Tmp, REG_GUEST_BASE, Tmp, UXTW'                    = 4.
+   * One extra instruction per load-modify-store, on a workload whose [prof]
+   * hot blocks are 95.1 % TSO-carrying.  The knob therefore stays OFF, and
+   * the app now probes `hw.optional.arm.FEAT_LRCPC2' and REPORTS it as
+   * [fex-cfg] without applying it (ContentView.swift, FEX knob block).
+   *
+   * Making it a win is a GetGuestMemAddr change, not a feature-bit change: it
+   * would have to carry a window-safe displacement through to the emitter.
+   * The back-patcher is already ready for that day -- it decodes and rewrites
+   * both forms (FEXCore/Source/Utils/ArchHelpers/Arm64.cpp: LDAPUR_INST /
+   * STLUR_INST at :2202, :2352, :2412) -- so the blocker is purely the 4 GiB
+   * wrap rule in the addressing path.
    *
    * WHY IT IS NOT ON BY DEFAULT.  FEAT_LRCPC2 is ARMv8.4; the app's iOS 18
    * floor admits A12/A13, which are ARMv8.3 and implement LRCPC but NOT
