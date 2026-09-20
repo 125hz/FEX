@@ -89,14 +89,21 @@ extern "C" uint64_t IosFfsBypassLog[4];
 extern "C" const uint64_t IosEcAsmIosBuilt;
 
 /* ExitFunctionEC's inline alias translation keeps score: [0] translated to the
- * JIT-pool copy, [1] left in PE space (each of those is a Mach exec fault). */
-extern "C" uint64_t IosAliasStats[2];
+ * JIT-pool copy, [1] left in PE space (each of those IS a Mach exec fault),
+ * [2] ml990: already a pool address, nothing to translate. See IosJitAlias.cpp
+ * for why [1] and [2] had to be separated. */
+extern "C" uint64_t IosAliasStats[4];
 
 /* Bisect switch for ExitToX64's fast-forward-sequence bypass; see IosJitAlias.cpp.
  * Namespace scope, because a linkage-specification is ill-formed at block scope —
  * clang then resolved the name against the nearest visible array and reported the
  * mistake as a pointer-to-bool warning three errors later. */
 extern "C" volatile int IosFfsBypassEnable;
+
+/* ml990: MADEIRA_EC_POOL_FASTOUT=0 disables the in-pool fast-out in
+ * ExitFunctionEC by keeping IosAliasJitSpan zero. Same namespace-scope reason
+ * as IosFfsBypassEnable above. */
+extern "C" volatile int IosEcPoolFastOut;
 
 /* Raw TSD byte offset (from TPIDRRO_EL0 & ~7) of the slot holding the TEB.
  * Discovered and published by wine's ntdll-unix; imported in ProcessInit.
@@ -922,9 +929,17 @@ NTSTATUS ProcessInit() {
     if (Bypass && Bypass[0] == '0') {
       IosFfsBypassEnable = 0;
     }
+    /* ml990: the in-pool fast-out in ExitFunctionEC. Read here so it is set
+     * before the first BTCpu64IosAddAliasMapping can publish a span; with it
+     * off the span stays 0 and Module.S takes the pre-ml990 path. */
+    const char* PoolOut = getenv("MADEIRA_EC_POOL_FASTOUT");
+    if (PoolOut && PoolOut[0] == '0') {
+      IosEcPoolFastOut = 0;
+    }
     LogMan::Msg::EFmt("[build-id] Module.S iOS paths present (stamp {}) -- alias xlate and sweep "
-                      "gate are compiled in; ExitToX64 FFS bypass {}",
-                      IosEcAsmIosBuilt, IosFfsBypassEnable ? "ENABLED" : "disabled by MADEIRA_EC_FFS_BYPASS=0");
+                      "gate are compiled in; ExitToX64 FFS bypass {}; EC in-pool fast-out {}",
+                      IosEcAsmIosBuilt, IosFfsBypassEnable ? "ENABLED" : "disabled by MADEIRA_EC_FFS_BYPASS=0",
+                      IosEcPoolFastOut ? "ENABLED" : "disabled by MADEIRA_EC_POOL_FASTOUT=0");
   }
 #endif
 #ifdef FEX_IOS_HOST

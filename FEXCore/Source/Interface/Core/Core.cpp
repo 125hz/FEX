@@ -2223,25 +2223,57 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
      *
      * The estimator stays deliberately lock-free and approximate: a lost race just picks a
      * different candidate, which is fine for a hint. `[prof]` is what decides anything. */
-    if (GuestRIP == g_cb_hot_rip) {
-      __sync_add_and_fetch(&g_cb_hot_rip_count, 1);
-    } else {
-      uint64_t Weight = g_cb_hot_rip_count;
-      while (true) {
-        if (Weight == 0) {
-          // Claim the empty slot. A racing claimant simply wins instead.
-          g_cb_hot_rip = GuestRIP;
-          __sync_add_and_fetch(&g_cb_hot_rip_count, 1);
-          break;
+    /* MADEIRA ml990: THIS ESTIMATOR IS DIAGNOSTIC AND IT WAS NOT FREE.
+     *
+     * It runs on EVERY C++ CompileBlock dispatch -- which is every inline-L1
+     * miss, measured at 42-65 k/s in [fex-stats] -- and every iteration does a
+     * bus-locked RMW on one of two process-wide words that every guest thread
+     * writes. That is a cache line ping-ponging between cores tens of thousands
+     * of times a second to maintain a HINT whose own comment says "`[prof]` is
+     * what decides anything".
+     *
+     * Behind MADEIRA_DIAG now. The two numbers that are actually load-bearing
+     * -- dispatches and real compiles -- survive below, and they are batched
+     * per thread so the shipping build pays one un-contended thread-local
+     * increment per dispatch instead of two contended global ones. */
+    static const bool CbCensus = [] {
+      const char* Env = getenv("MADEIRA_DIAG");
+      return Env && *Env && Env[0] != '0';
+    }();
+    if (CbCensus) {
+      if (GuestRIP == g_cb_hot_rip) {
+        __sync_add_and_fetch(&g_cb_hot_rip_count, 1);
+      } else {
+        uint64_t Weight = g_cb_hot_rip_count;
+        while (true) {
+          if (Weight == 0) {
+            // Claim the empty slot. A racing claimant simply wins instead.
+            g_cb_hot_rip = GuestRIP;
+            __sync_add_and_fetch(&g_cb_hot_rip_count, 1);
+            break;
+          }
+          const uint64_t Prev = __sync_val_compare_and_swap(&g_cb_hot_rip_count, Weight, Weight - 1);
+          if (Prev == Weight) {
+            break;
+          }
+          Weight = Prev;
         }
-        const uint64_t Prev = __sync_val_compare_and_swap(&g_cb_hot_rip_count, Weight, Weight - 1);
-        if (Prev == Weight) {
-          break;
-        }
-        Weight = Prev;
       }
     }
-    uint64_t total = __sync_add_and_fetch(&g_cb_total, 1);
+    /* ml990: BATCHED. The dispatch count is the L1-miss rate the tuning
+     * questions are asked in (see cpp_dispatch/s in [fex-stats]), so it stays
+     * on unconditionally -- but a shared counter incremented 65 k times a
+     * second across ~40 threads is a contention artefact in the very
+     * measurement it feeds. Count thread-locally and publish a batch; the
+     * global is then only touched once per kCbBatch dispatches per thread, and
+     * a rate averaged over 10 s cannot tell the difference. */
+    constexpr uint64_t kCbBatch = 512;
+    static thread_local uint64_t CbLocal = 0;
+    uint64_t total = g_cb_total;
+    if (++CbLocal >= kCbBatch) {
+      CbLocal = 0;
+      total = __sync_add_and_fetch(&g_cb_total, kCbBatch);
+    }
     if ((total - g_cb_last_summary_total) >= 16384) {
       g_cb_last_summary_total = total;
       uint64_t reals = g_cb_real_compiles;
@@ -2254,6 +2286,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
        * pointer), the emitted probe reads the iOS-emulated zero page and
        * silently misses every time — no crash, pure 60us tax per lookup. */
       auto* T = Frame ? Frame->Thread : nullptr;
+      if (CbCensus)
       LogMan::Msg::EFmt("[CB_SUMMARY] total={} real_compiles={} cache_hits={} "
                         "hit_rate={}%  hottest_rip≈0x{:x} hot_weight={} "
                         "L1ptr=0x{:x} L1mask=0x{:x} cacheL1=0x{:x}",
@@ -2286,6 +2319,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
         static std::atomic<uint64_t> LastStatsNs {0};
         static std::atomic<uint64_t> LastStatsBlocks {0};
         static std::atomic<uint64_t> LastStatsTotal {0};
+        static std::atomic<uint64_t> LastStatsReals {0};
         const uint64_t NowNs = static_cast<uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
         uint64_t Last = LastStatsNs.load(std::memory_order_relaxed);
@@ -2297,6 +2331,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
           LastStatsNs.compare_exchange_strong(Last, NowNs, std::memory_order_relaxed);
           LastStatsBlocks.store(MadeiraStats::BlocksCompiled.load(std::memory_order_relaxed), std::memory_order_relaxed);
           LastStatsTotal.store(total, std::memory_order_relaxed);
+          LastStatsReals.store(reals, std::memory_order_relaxed);
         } else if (DueAndWon) {
           const uint64_t ElapsedMs = (NowNs - Last) / 1'000'000ULL;
           const uint64_t Blocks = MadeiraStats::BlocksCompiled.load(std::memory_order_relaxed);
@@ -2304,11 +2339,47 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
           const uint64_t HostBytes = MadeiraStats::HostCodeBytes.load(std::memory_order_relaxed);
           const uint64_t BlockDelta = Blocks - LastStatsBlocks.exchange(Blocks, std::memory_order_relaxed);
           const uint64_t DispatchDelta = total - LastStatsTotal.exchange(total, std::memory_order_relaxed);
-          LogMan::Msg::EFmt("[fex-stats] rev=ml900 window_ms={} blocks={} (+{}, {}/s) insts/blk={} "
-                            "host_b/inst={} cpp_dispatch=+{} ({}/s) hit_rate={}% ua_emu={} ua_patch={}",
+          const uint64_t RealDelta = reals - LastStatsReals.exchange(reals, std::memory_order_relaxed);
+          /* ml990: THE NUMBER THAT DECIDES WHETHER A BOUNDED L2 IS WORTH BUILDING.
+           *
+           * Every C++ dispatch is an inline-L1 miss (DisableL2Cache is on, so
+           * Dispatcher.cpp emits `b(&NoBlock)` where the L2 walk would be, and
+           * there is no second tier to catch it). Of those dispatches, the ones
+           * that did NOT end in a real compile are blocks the process had
+           * already compiled and that only the locked C++ L3 map could find --
+           * i.e. exactly the traffic an L2 would absorb, and exactly the
+           * traffic that pays SpillStaticRegs + a shared read lock + a
+           * robin_map probe for nothing.
+           *
+           * l1_miss_l3hit/s is therefore the upper bound on what restoring an
+           * L2 could recover, in units anyone can act on, and it is free: both
+           * inputs were already being counted. */
+          const uint64_t L3Only = (DispatchDelta > RealDelta) ? (DispatchDelta - RealDelta) : 0;
+          /* ml990: WHAT DID DynamicL1Cache ACTUALLY GROW TO?
+           *
+           * The growth heuristic doubles CurrentL1Entries on L2/L3 hit rate
+           * and halves it when the rate falls, capped at MAX_L1_ENTRIES
+           * (128 K on iOS), but nothing ever reported where it settled -- so
+           * "is the L1 the right size" had no data behind it. State.L1Mask is
+           * the value the emitted probe ANDs with, i.e. (sets-1) pre-scaled to
+           * a byte offset, so entries = (mask/set_bytes + 1) * ways. This is
+           * the reporting thread's own cache, which is representative but not
+           * a fleet number; a thread that has just started shows the 8 K
+           * minimum. */
+          const uint64_t L1MaskNow = Frame ? Frame->State.L1Mask : 0;
+          const uint64_t L1SetBytes = LookupCache::L1_SET_BYTES;
+          const uint64_t L1Entries = L1MaskNow ? ((L1MaskNow / L1SetBytes) + 1) * LookupCache::L1_WAYS : 0;
+          LogMan::Msg::EFmt("[fex-stats] rev=ml990 window_ms={} blocks={} (+{}, {}/s) insts/blk={} "
+                            "host_b/inst={} cpp_dispatch=+{} ({}/s) hit_rate={}% "
+                            "l1_miss_l3hit=+{} ({}/s, {}% of dispatches) real_compile=+{} "
+                            "l1_entries={} ways={} "
+                            "ua_emu={} ua_patch={}",
                             ElapsedMs, Blocks, BlockDelta, ElapsedMs ? (BlockDelta * 1000 / ElapsedMs) : 0, Blocks ? (Insts / Blocks) : 0,
                             Insts ? (HostBytes / Insts) : 0, DispatchDelta, ElapsedMs ? (DispatchDelta * 1000 / ElapsedMs) : 0,
                             (total > 0) ? (100 * (total - reals) / total) : 0,
+                            L3Only, ElapsedMs ? (L3Only * 1000 / ElapsedMs) : 0,
+                            DispatchDelta ? (100 * L3Only / DispatchDelta) : 0, RealDelta,
+                            L1Entries, static_cast<uint64_t>(LookupCache::L1_WAYS),
                             MadeiraStats::UnalignedAtomicEmulated.load(std::memory_order_relaxed),
                             MadeiraStats::UnalignedAtomicPatched.load(std::memory_order_relaxed));
         }

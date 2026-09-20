@@ -311,12 +311,40 @@ ExitFunctionSuspendResumePoint:
   // file-backed mmaps); the only runnable copy lives in the dual-mapped JIT
   // pool. Translate the target through the alias table (IosJitAlias.cpp)
   // before branching — otherwise every x64→EC call lands on the PE VA and
-  // costs a Mach exec-fault redirect (~33us each, measured ~40K/frame in
-  // Thumper's menu = the entire frame budget).
+  // costs a Mach exec-fault redirect (~33us each, measured ~40K/frame in a
+  // 64-bit title's menu = the entire frame budget).
   // x16/x17/x23 are already clobbered on all downstream paths; x4 maps to
   // x64 R10 (volatile at this call/ret boundary) and is clobbered by the
   // entry-thunk path below. NZCV is clobbered by the cmp at check_thunk
   // regardless.
+  // MADEIRA ml990: IS THE TARGET ALREADY A POOL ADDRESS?  Answer that FIRST,
+  // because on a 64-bit title it is the majority case and the scan below can
+  // never answer it.
+  //
+  // ExitFunctionEC is reached on two kinds of transition:
+  //   CALL    x9 is a PE virtual address (from the EcCodeBitMap or a
+  //           relocation) and must be translated to its pool copy.
+  //   RETURN  x9 is the instruction after a `blr x16` in an exit thunk that is
+  //           ALREADY EXECUTING, so it is already a pool address.
+  // The table maps PeBase -> JitBase, so a return address matched nothing: it
+  // walked every live entry (~50 x 6 instructions), bumped the "faulted"
+  // counter and fell through with x9 unchanged.  Unchanged was the right
+  // answer all along.  Device log q1: 1.4 M of these per second against 214
+  // real exec-fault redirects, with this stub 6.4% of ALL CPU on one
+  // instruction and fexrt 10.3% overall.
+  //
+  // IosAliasJitSpan is {lo, hi-lo} over every registered JitBase..+Size, and
+  // IosJitAlias.cpp publishes a ZERO span -- making this compare always fail
+  // and restoring the pre-ml990 path instruction for instruction -- both when
+  // MADEIRA_EC_POOL_FASTOUT=0 and whenever a live PE range would intersect the
+  // span, which is the case in which skipping the scan could change an answer.
+  adrp x16, IosAliasJitSpan
+  add x16, x16, #:lo12:IosAliasJitSpan
+  ldp x17, x4, [x16]    // x17 = lo, x4 = span (0 = feature off)
+  sub x23, x9, x17
+  cmp x23, x4
+  b.lo ios_ec_xlate_inpool
+
   // 2026-09-23 LAST-HIT CACHE in front of the scan. The scan is O(images) —
   // ~50 entries x 6 instructions on a path taken once per x64->EC CALL, and a
   // 64-bit title's CRT string loop takes it hundreds of thousands of times a
@@ -368,11 +396,25 @@ ios_ec_xlate_hit:
   add x17, x17, #1
   str x17, [x16]
   b ios_ec_xlate_done
+ios_ec_xlate_inpool:
+  // ml990: already a pool address (the RETURN half). x9 is correct as it
+  // stands; nothing to translate and nothing to fault.
+  adrp x16, IosAliasStats
+  add x16, x16, #:lo12:IosAliasStats
+  ldr x17, [x16, #16]
+  add x17, x17, #1
+  str x17, [x16, #16]
+  b ios_ec_xlate_done
 ios_ec_xlate_miss:
-  // No entry covers the target, so it stays a PE VA and the branch below takes
-  // an exec fault that the Mach handler redirects (~50-100us). Counting these
-  // is the whole point: `[ec-call] translated=N faulted=M` with M climbing
-  // means the alias table is missing an image, not that the fast path is off.
+  // No entry covers the target AND it is not already in the pool, so it stays
+  // a PE VA and the branch below takes an exec fault that the Mach handler
+  // redirects (~50-100us). Counting these is the whole point:
+  // `[ec-call] translated=N faulted=M inpool=P` with M climbing means the
+  // alias table is missing an image, not that the fast path is off.
+  //
+  // ml990: before the in-pool test above, M counted BOTH this and every
+  // return transition, which made it useless as the "missing image" signal it
+  // was written to be -- it ran at 1.4 M/s against 214 real redirects/s.
   adrp x16, IosAliasStats
   add x16, x16, #:lo12:IosAliasStats
   ldr x17, [x16, #8]
@@ -411,7 +453,7 @@ ret_sp_misaligned:
   // which a variadic entry thunk then advances by 0x20 to reach the first stack argument:
   //   $ientry_thunk$cdecl$i8$varargs:  add x4, x4, #0x20
   // Here the address is deliberately LEFT on the stack, so x4 = RSP is one slot short and
-  // every stack argument is read 8 bytes early. Measured directly in a Steam RPC call:
+  // every stack argument is read 8 bytes early. Measured directly in an RPC call:
   //   [ndr-shift] param3 off=0x18 StackTop=0x703CD5EBF0 HERE=0x10 next=0x703CD5EC88
   //               => SHIFT: real pointer is ONE SLOT LATER (+8)
   // which is how ccontext arrived as 0x10 and faulted in #NdrContextHandleUnmarshall+0xcc.
