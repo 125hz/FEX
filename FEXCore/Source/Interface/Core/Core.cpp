@@ -2267,13 +2267,17 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
      * measurement it feeds. Count thread-locally and publish a batch; the
      * global is then only touched once per kCbBatch dispatches per thread, and
      * a rate averaged over 10 s cannot tell the difference. */
-    constexpr uint64_t kCbBatch = 512;
-    static thread_local uint64_t CbLocal = 0;
-    uint64_t total = g_cb_total;
-    if (++CbLocal >= kCbBatch) {
-      CbLocal = 0;
-      total = __sync_add_and_fetch(&g_cb_total, kCbBatch);
-    }
+    /* 2026-09-25: NO `thread_local` IN THIS MODULE. The batch counter above
+     * was one, and it took every program down at start: implicit TLS in a PE
+     * DLL is reached through TEB->ThreadLocalStoragePointer, this function
+     * runs while the emulator initialises a thread -- before the loader has
+     * given that thread its TLS vector -- so the access was
+     * `ldr x9, [NULL, idx, lsl #3]`. A statistics counter does not need to be
+     * exact: a plain, unlocked increment of the shared word costs no bus lock,
+     * can at worst lose a count under contention, and a rate averaged over
+     * 10 s cannot tell. */
+    uint64_t total = g_cb_total + 1;
+    g_cb_total = total;
     if ((total - g_cb_last_summary_total) >= 16384) {
       g_cb_last_summary_total = total;
       uint64_t reals = g_cb_real_compiles;
