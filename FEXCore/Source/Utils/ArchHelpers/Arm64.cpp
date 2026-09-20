@@ -2416,7 +2416,27 @@ static std::optional<int32_t> HandleUnalignedAccessImpl(FEXCore::Core::InternalT
   // thread identity into the word (waiters only ever test zero/nonzero); on
   // timeout, emulate this one access with the same helpers the !IsJIT path
   // uses and leave the code unpatched.
-  uint32_t* BPFutex = &InlineTail->SpinLockFutex;
+  /* iOS-Madeira 2026-09-23: THE BACKPATCH LOCK LIVES IN THE CODE BUFFER, AND ON
+   * iOS THE CODE BUFFER IS EXECUTE-ONLY.
+   *
+   * JITCodeTail is emitted after each block's code, so &SpinLockFutex is an
+   * address in the dual-mapped pool's RX view. The acquire below is a real
+   * LDAXR/STLXR pair; the load reads fine (RX is readable) and the STORE takes a
+   * permission fault. A device log caught precisely that, INSIDE this function:
+   * the handler faulted while handling a fault and the process died on the
+   * second one. It is also the one place a Mach-side emulator cannot rescue
+   * cheaply, because an exclusive pair cannot be completed instruction by
+   * instruction once the monitor has been lost to the exception.
+   *
+   * The lock word is only ever reached through this pointer (the CAS here and
+   * SpinWaitLock::Wait/Wake below all take it), so moving the WHOLE lock to the
+   * writable alias keeps every participant agreeing on one address — which is
+   * what a futex keyed on an address requires. Both views map the same physical
+   * page, so an exclusive pair on the alias is a genuine hardware atomic against
+   * anything else touching the same memory.
+   *
+   * Off iOS, DualMap::WriteAddr is the identity. */
+  uint32_t* BPFutex = FEXCore::DualMap::WriteAddr(&InlineTail->SpinLockFutex);
   const uint32_t BPStamp = 0x80000000u | (static_cast<uint32_t>(reinterpret_cast<uintptr_t>(Thread) >> 4) & 0x7FFFFFFFu);
   bool BPLocked = false;
   for (int Attempt = 0; Attempt < 8; ++Attempt) {

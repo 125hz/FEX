@@ -82,6 +82,22 @@ extern "C" uint64_t IosJitReverseTranslate(uint64_t Addr);
  * target. Read by the [ffs-bypass] reporter in Core.cpp's CompileBlock. */
 extern "C" uint64_t IosFfsBypassLog[4];
 
+/* 2026-09-23: defined in Module.S inside `#ifdef FEX_IOS_HOST`. Referencing it
+ * from this TU (which only compiles when the define is set) makes a build whose
+ * assembler never saw the define fail at LINK time. See the tripwire comment in
+ * Module.S and the CMakeLists note next to target_compile_definitions. */
+extern "C" const uint64_t IosEcAsmIosBuilt;
+
+/* ExitFunctionEC's inline alias translation keeps score: [0] translated to the
+ * JIT-pool copy, [1] left in PE space (each of those is a Mach exec fault). */
+extern "C" uint64_t IosAliasStats[2];
+
+/* Bisect switch for ExitToX64's fast-forward-sequence bypass; see IosJitAlias.cpp.
+ * Namespace scope, because a linkage-specification is ill-formed at block scope —
+ * clang then resolved the name against the nearest visible array and reported the
+ * mistake as a pointer-to-bool warning three errors later. */
+extern "C" volatile int IosFfsBypassEnable;
+
 /* Raw TSD byte offset (from TPIDRRO_EL0 & ~7) of the slot holding the TEB.
  * Discovered and published by wine's ntdll-unix; imported in ProcessInit.
  * Defined in FEXCore Arm64Emitter.cpp, where the JIT emitters also read it. */
@@ -895,8 +911,22 @@ NTSTATUS ProcessInit() {
  * __DATE__/__TIME__ below is compiler-generated and therefore the
  * authoritative identity; if the two disagree, the tag is wrong, not the
  * build. */
-#define MADEIRA_REV "ml755"
+#define MADEIRA_REV "ml1000"
   LogMan::Msg::EFmt("[build-id] xtajit64 rev=" MADEIRA_REV " compiled " __DATE__ " " __TIME__);
+#ifdef FEX_IOS_HOST
+  /* The load is what keeps the tripwire reference alive through -O2; the value
+   * itself is only interesting as proof on the device that the assembler and
+   * the compiler agreed about FEX_IOS_HOST for this binary. */
+  {
+    const char* Bypass = getenv("MADEIRA_EC_FFS_BYPASS");
+    if (Bypass && Bypass[0] == '0') {
+      IosFfsBypassEnable = 0;
+    }
+    LogMan::Msg::EFmt("[build-id] Module.S iOS paths present (stamp {}) -- alias xlate and sweep "
+                      "gate are compiled in; ExitToX64 FFS bypass {}",
+                      IosEcAsmIosBuilt, IosFfsBypassEnable ? "ENABLED" : "disabled by MADEIRA_EC_FFS_BYPASS=0");
+  }
+#endif
 #ifdef FEX_IOS_HOST
   /* ml751: flush the VA band selector's beacons.
    *

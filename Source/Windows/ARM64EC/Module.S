@@ -1,6 +1,23 @@
 .text
 .balign 16
 
+#ifdef FEX_IOS_HOST
+// 2026-09-23 BUILD-FLAG TRIPWIRE. Module.cpp reads this word, so a build that
+// compiles the C++ half with FEX_IOS_HOST but assembles THIS file without it
+// fails to link instead of producing a plausible DLL in which every iOS-only
+// path below has silently vanished. That exact mismatch shipped for months: the
+// define was passed in CMAKE_C_FLAGS/CMAKE_CXX_FLAGS only, and a .S file is
+// built with CMAKE_ASM_FLAGS. Do not give this a weak/fallback definition
+// anywhere -- the missing symbol IS the diagnostic.
+.section .rdata,"dr"
+.balign 8
+.global IosEcAsmIosBuilt
+IosEcAsmIosBuilt:
+  .quad 20260923
+.text
+.balign 16
+#endif
+
 // iOS clobbers x18 on context switches. Read TEB from TPIDRRO_EL0 + the raw
 // pthread TSD slot that wine's ntdll-unix publishes the TEB in, instead of
 // trusting x18 directly. TPIDRRO_EL0 IS preserved by iOS across context
@@ -91,6 +108,13 @@ ExitToX64:
   // from the native sp on every JIT entry. The `br` targets the PE VA; the Mach
   // exec-fault redirect translates it to the pool copy (proven ~33us path, and this
   // is RPC-call frequency, not per-frame).
+  // 2026-09-23: one-env-var bisect (MADEIRA_EC_FFS_BYPASS=0). This whole block
+  // shipped disabled for months because the assembler never saw FEX_IOS_HOST,
+  // so its first real execution is on the device that runs this build; the rest
+  // of the iOS asm can stay on while this is turned off. x16 is scratch here.
+  adrp x16, IosFfsBypassEnable
+  ldr w16, [x16, #:lo12:IosFfsBypassEnable]
+  cbz w16, ios_ffs_no_bypass
   ldr x16, [x9]
   movz x17, #0x8b48
   movk x17, #0x48c4, lsl #16
@@ -140,14 +164,40 @@ ios_ffs_xlate_done:
   lsr x23, x17, #12
   lsr x16, x16, x23
   tbz x16, #0, ios_ffs_reject
+  // 2026-09-23: x17 is in PE SPACE because the bitmap demanded it, and a PE VA
+  // is not executable on iOS -- the original code branched there and paid a Mach
+  // exec fault on purpose, on the argument that this path runs at RPC frequency.
+  // That argument does not survive a title whose EC calls come through here in a
+  // string loop, and the table that answers it is the one we just walked
+  // backwards. Walk it FORWARDS and branch to the copy that can actually run.
+  // On a miss x17 is left alone, which is exactly the old behaviour.
+  // x4/x9 are still spilled here, so four scratch registers are available.
+  adrp x16, IosAliasEntries
+  add x16, x16, #:lo12:IosAliasEntries
+  adrp x4, IosAliasCount
+  ldr w4, [x4, #:lo12:IosAliasCount]
+ios_ffs_fwd_loop:
+  cbz w4, ios_ffs_fwd_done
+  ldr x23, [x16]         // Entry.PeBase
+  sub x23, x17, x23
+  ldr x9, [x16, #16]     // Entry.Size
+  cmp x23, x9
+  b.lo ios_ffs_fwd_hit
+  add x16, x16, #32
+  sub w4, w4, #1
+  b ios_ffs_fwd_loop
+ios_ffs_fwd_hit:
+  ldr x9, [x16, #8]      // Entry.JitBase
+  add x17, x9, x23
+ios_ffs_fwd_done:
   ldp x4, x9, [sp], #16
   adrp x16, IosFfsBypassLog
   add x16, x16, #:lo12:IosFfsBypassLog
   ldr x23, [x16]
   add x23, x23, #1
   str x23, [x16]         // [0] = bypass count (diagnostic, read by Core.cpp reporter)
-  str x17, [x16, #8]     // [1] = last EC target taken natively
-  br x17                 // PE VA; the Mach exec-fault redirect maps it to the pool copy
+  str x17, [x16, #8]     // [1] = last EC target taken natively (pool VA when translated)
+  br x17
 ios_ffs_reject:
   // Pattern matched but the (PE-space) target is not EC per the bitmap: fall
   // through to normal emulation -- correct for genuine x64 jmp targets -- but
@@ -267,23 +317,67 @@ ExitFunctionSuspendResumePoint:
   // x64 R10 (volatile at this call/ret boundary) and is clobbered by the
   // entry-thunk path below. NZCV is clobbered by the cmp at check_thunk
   // regardless.
+  // 2026-09-23 LAST-HIT CACHE in front of the scan. The scan is O(images) —
+  // ~50 entries x 6 instructions on a path taken once per x64->EC CALL, and a
+  // 64-bit title's CRT string loop takes it hundreds of thousands of times a
+  // second. IosAliasHot names the entry that answered last; a per-character
+  // tolower()/_stricmp() loop hits the same image every time, so the common
+  // case becomes four loads and a compare. A stale index cannot be wrong, only
+  // slow: the entry is re-tested against the target before it is believed.
   adrp x16, IosAliasEntries
   add x16, x16, #:lo12:IosAliasEntries
+  adrp x17, IosAliasHot
+  ldr w17, [x17, #:lo12:IosAliasHot]
+  and x17, x17, #0xff   // kMaxEntries is 256 (static_assert in IosJitAlias.cpp)
+  add x4, x16, x17, lsl #5
+  ldr x23, [x4]         // Entry.PeBase
+  sub x23, x9, x23
+  ldr x17, [x4, #16]    // Entry.Size  (0 for a retired slot -> always misses)
+  cmp x23, x17
+  b.hs ios_ec_xlate_scan
+  ldr x17, [x4, #8]     // Entry.JitBase
+  add x9, x17, x23
+  b ios_ec_xlate_hit
+ios_ec_xlate_scan:
   adrp x17, IosAliasCount
   ldr w17, [x17, #:lo12:IosAliasCount]
 ios_ec_xlate_loop:
-  cbz w17, ios_ec_xlate_done
+  cbz w17, ios_ec_xlate_miss
   ldr x23, [x16]        // Entry.PeBase
   sub x23, x9, x23      // offset into image (unsigned-wraps huge if below base)
   ldr x4, [x16, #16]    // Entry.Size
   cmp x23, x4
-  b.lo ios_ec_xlate_hit
+  b.lo ios_ec_xlate_found
   add x16, x16, #32
   sub w17, w17, #1
   b ios_ec_xlate_loop
-ios_ec_xlate_hit:
+ios_ec_xlate_found:
   ldr x4, [x16, #8]     // Entry.JitBase
   add x9, x4, x23
+  // Publish the winning slot for the next call: index = (entry - base) / 32.
+  adrp x17, IosAliasEntries
+  add x17, x17, #:lo12:IosAliasEntries
+  sub x17, x16, x17
+  lsr x17, x17, #5
+  adrp x4, IosAliasHot
+  str w17, [x4, #:lo12:IosAliasHot]
+ios_ec_xlate_hit:
+  adrp x16, IosAliasStats
+  add x16, x16, #:lo12:IosAliasStats
+  ldr x17, [x16]
+  add x17, x17, #1
+  str x17, [x16]
+  b ios_ec_xlate_done
+ios_ec_xlate_miss:
+  // No entry covers the target, so it stays a PE VA and the branch below takes
+  // an exec fault that the Mach handler redirects (~50-100us). Counting these
+  // is the whole point: `[ec-call] translated=N faulted=M` with M climbing
+  // means the alias table is missing an image, not that the fast path is off.
+  adrp x16, IosAliasStats
+  add x16, x16, #:lo12:IosAliasStats
+  ldr x17, [x16, #8]
+  add x17, x17, #1
+  str x17, [x16, #8]
 ios_ec_xlate_done:
 #endif
   // Either return to an exit thunk (return to ARM64EC function) or call an entry thunk (call to ARM64EC function).

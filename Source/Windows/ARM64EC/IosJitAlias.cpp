@@ -39,7 +39,45 @@ constexpr int kMaxEntries = 256;
 extern "C" {
 IosAliasEntry IosAliasEntries[kMaxEntries];
 volatile int IosAliasCount = 0;
+
+// 2026-09-23 LAST-HIT CACHE. Index of the entry that satisfied the most recent
+// lookup, probed by Module.S BEFORE the linear scan.
+//
+// Race-free by construction, which is why it is an INDEX and not a copy of the
+// entry: a single naturally-aligned 32-bit load/store is atomic on AArch64, so a
+// reader sees some index that was published at some point, never a torn one. The
+// probe then RE-TESTS that entry's PeBase/Size against the target, so a stale or
+// retired index simply misses and falls into the scan. No generation counter, no
+// barrier, and nothing a wrong value can do beyond costing one extra compare.
+//
+// Module.S masks the value with 0xFF instead of range-checking it, so kMaxEntries
+// must stay a power of two no larger than 256.
+volatile int IosAliasHot = 0;
+
+// [0] = calls whose target was translated to its JIT-pool copy inline,
+// [1] = calls left in PE space (no entry matched) — each of those costs a Mach
+// exception round trip through the unix-side exec-fault redirect. Printed as
+// `[ec-call] translated=N faulted=M` by the ntdll-unix stats reporter, which
+// reads this array through the pool copy of this image. Plain increments: a
+// lost count under contention is cheaper than a bus-locked RMW on this path,
+// and the number is a diagnostic, not a decision input.
+uint64_t IosAliasStats[2] = {0, 0};
+
+// 2026-09-23 BISECT SWITCH for ExitToX64's fast-forward-sequence bypass.
+//
+// Enabling FEX_IOS_HOST for Module.S switched on four mechanisms at once that
+// had never executed on a device: the TEB-from-TSD reads, the JIT-pool alias
+// translation (the fix), the code-buffer sweep gate, and this bypass. Three of
+// them are either verified statically or are the counterpart of C++ code that
+// was already running one-sided. The bypass is the one that CHANGES DISPATCH
+// BEHAVIOUR for native EC callers, so it gets an off switch:
+// MADEIRA_EC_FFS_BYPASS=0 restores the plain emulation round trip without
+// giving up the alias translation. Read once in ProcessInit; the asm tests it
+// with two instructions on a path that is about to clobber x16 anyway.
+volatile int IosFfsBypassEnable = 1;
 }
+
+static_assert(kMaxEntries == 256, "Module.S bounds IosAliasHot with `and #0xff`");
 
 namespace {
 IosAliasEntry* const g_Entries = IosAliasEntries;

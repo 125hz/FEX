@@ -79,6 +79,37 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostF
   HostFeatures.SupportsFlagM2 = true;
   HostFeatures.SupportsAFP = true;
 
+  /* MADEIRA 2026-09-23: the list above is an ASSUMPTION that is only true of
+   * the newest cores, and a wrong `true` is silent corruption rather than a
+   * crash -- FEAT_AFP claimed on a core without it leaves FPCR.NEP RES0, so
+   * every scalar SSE operation zeroes the upper lanes of its destination
+   * instead of preserving them.  This module cannot call sysctl, but the app
+   * can: it publishes `FEX_MADEIRA_HOSTPROBE=AFP=0,FLAGM=1,...` ("?" when the
+   * sysctl does not exist).  Only an explicit `=0` turns a feature off; an
+   * absent variable or a "?" keeps the old assumption. */
+  if (const char* Probe = getenv("FEX_MADEIRA_HOSTPROBE")) {
+    const auto Absent = [Probe](const char* Key) {
+      const size_t Len = strlen(Key);
+      for (const char* p = Probe; (p = strstr(p, Key)) != nullptr; p += Len) {
+        const bool AtStart = p == Probe || p[-1] == ',';
+        if (AtStart && p[Len] == '=' ) {
+          return p[Len + 1] == '0';
+        }
+      }
+      return false;
+    };
+    if (Absent("AFP")) HostFeatures.SupportsAFP = false;
+    if (Absent("FLAGM")) HostFeatures.SupportsFlagM = false;
+    if (Absent("FLAGM2")) HostFeatures.SupportsFlagM2 = false;
+    if (Absent("FCMA")) HostFeatures.SupportsFCMA = false;
+    if (Absent("RCPC")) HostFeatures.SupportsRCPC = false;
+    if (Absent("AES")) HostFeatures.SupportsAES = false;
+    if (Absent("PMULL")) HostFeatures.SupportsPMULL_128Bit = false;
+    if (Absent("SHA")) HostFeatures.SupportsSHA = false;
+    if (Absent("CRC")) HostFeatures.SupportsCRC = false;
+    if (Absent("ATOMICS")) HostFeatures.SupportsAtomics = false;
+  }
+
   /* MADEIRA ml970: FEAT_LRCPC2 (SupportsTSOImm9) is OPT-IN here, and off by
    * default, because this branch cannot probe for it.
    *
