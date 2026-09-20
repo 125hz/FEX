@@ -204,9 +204,13 @@ public:
    * L1_WAYS == 1 reproduces upstream's direct-mapped cache byte-for-byte, in the emitted probe and
    * in the C++ paths, and is what every non-iOS build gets.
    */
-  // Gated to the 32-bit WoW64 CPU module: the ARM64EC module and every non-iOS build keep the
-  // direct-mapped cache and byte-identical emitted probes.
-#if defined(FEX_IOS_HOST) && !defined(ARCHITECTURE_arm64ec)
+  // 2026-09-29: the ARM64EC module gets the 2-way cache too. It was left direct-mapped out of
+  // caution only; device statistics then showed x86-64 titles taking 77,000-105,000 L1 misses per
+  // second, 99% of them for blocks that already exist (l1_miss_l3hit), i.e. pure conflict misses,
+  // against 3,000-6,000/s for 32-bit titles on the 2-way cache. Both emitted probes
+  // (Dispatcher.cpp, BranchOps.cpp) are generic over L1_WAYS and the ARM64EC module has no probe
+  // of its own. Non-iOS builds keep the direct-mapped cache and byte-identical emitted code.
+#if defined(FEX_IOS_HOST)
   constexpr static size_t L1_WAYS = 2;
 #else
   constexpr static size_t L1_WAYS = 1;

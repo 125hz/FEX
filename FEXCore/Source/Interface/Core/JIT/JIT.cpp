@@ -768,6 +768,12 @@ Arm64JITCore::Arm64JITCore(FEXCore::Context::ContextImpl* ctx, FEXCore::Core::In
 
   CurrentCodeBuffer = CodeBuffers.GetLatest();
   ThreadState->LookupCache->Shared = CurrentCodeBuffer->LookupCache.get();
+#ifdef FEX_IOS_HOST
+  // ml630 (#78): the only CurrentCodeBuffer assignment outside a critical
+  // section. Seed the lock-free range table the fault path reads, so a fault
+  // taken before this thread's first compile still answers correctly.
+  IosPublishCodeBufferRangesLocked();
+#endif
 }
 
 #ifdef FEX_IOS_HOST

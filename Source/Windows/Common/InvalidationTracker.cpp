@@ -146,6 +146,59 @@ struct TrackerLockScope {
   TrackerLockScope& operator=(const TrackerLockScope&) = delete;
 };
 
+/* iOS-Madeira ml630 (#78): the unmap/free invalidation filter.
+ *
+ * A 20-minute 32-bit session logged 72,072 via=section invalidations over the SAME ~880
+ * half-to-one-megabyte ranges (a 6-line map/unmap cycle repeating verbatim) plus ~2.9M
+ * via=aligned guest frees. Every one of them takes CodeInvalidationMutex EXCLUSIVELY and
+ * walks every thread's lookup cache, and the block census shows the result: a steady state
+ * of 324,278 blocks at +0/s collapsing into +125,112 real compiles in 12 s, with
+ * real_compile == the block delta (nothing was reused - the cache was wiped, not missed).
+ * That recompile storm is what exhausted the JIT pool's tail partition, and pool exhaustion
+ * is what fired the deliberate 0xdead fault that wedged the process.
+ *
+ * The filter rests on this class's own documented invariant (see the QueryExecutableRange
+ * note below): the ONLY thing that decides whether a guest address may be executed is
+ * XIntervals - an address not in XIntervals decodes as NOEXEC. So no guest page outside
+ * XIntervals can ever have been translated, and invalidating a range that does not
+ * intersect XIntervals cannot remove any block. It is pure cost.
+ *
+ * Removal from XIntervals always invalidates first (HandleMemoryProtectionNotification
+ * removes then calls InvalidateIntervalInternal; the unmap/free paths below invalidate then
+ * remove), so "not in XIntervals now" also means "already invalidated if it ever mattered".
+ *
+ * MADEIRA_FEX_SKIP_EMPTY_INVALIDATE=0 restores the unconditional behaviour. */
+std::atomic<int8_t> SkipEmptyInvalidateCached {-1};
+bool SkipEmptyInvalidate() {
+  int8_t V = SkipEmptyInvalidateCached.load(std::memory_order_relaxed);
+  if (V < 0) {
+    const char* E = getenv("MADEIRA_FEX_SKIP_EMPTY_INVALIDATE");
+    V = (E && E[0] == '0') ? 0 : 1;
+    SkipEmptyInvalidateCached.store(V, std::memory_order_relaxed);
+  }
+  return V != 0;
+}
+
+// Quantifies the filter: how many invalidations were skipped vs performed, by path.
+std::atomic<uint64_t> InvalSkippedSection {0};
+std::atomic<uint64_t> InvalKeptSection {0};
+std::atomic<uint64_t> InvalSkippedAligned {0};
+std::atomic<uint64_t> InvalKeptAligned {0};
+
+void ReportInvalidationFilter() {
+  static std::atomic<uint64_t> Next {8192};
+  const uint64_t Total = InvalSkippedSection.load(std::memory_order_relaxed) + InvalKeptSection.load(std::memory_order_relaxed) +
+                         InvalSkippedAligned.load(std::memory_order_relaxed) + InvalKeptAligned.load(std::memory_order_relaxed);
+  uint64_t Want = Next.load(std::memory_order_relaxed);
+  if (Total < Want || !Next.compare_exchange_strong(Want, Want * 2, std::memory_order_relaxed)) {
+    return;
+  }
+  LogMan::Msg::EFmt("[inval-filter] ml630 section: skipped={} kept={} | aligned: skipped={} kept={} "
+                    "(skipped = range held no translated code; each kept one takes CodeInvalidationMutex exclusively)",
+                    InvalSkippedSection.load(std::memory_order_relaxed), InvalKeptSection.load(std::memory_order_relaxed),
+                    InvalSkippedAligned.load(std::memory_order_relaxed), InvalKeptAligned.load(std::memory_order_relaxed));
+}
+
 /// Returns true when this thread is already inside a tracker lock, i.e. the caller must bail
 /// out instead of locking. Rate-capped so a storm cannot drown the log.
 bool TrackerReentered(const char* Site, uint64_t Address, uint64_t Size) {
@@ -724,7 +777,24 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
     SectionSize += Info.RegionSize;
   }
 
-  InvalidateIntervalInternal(SectionBase, SectionSize);
+  /* ml630 (#78): skip the exclusive-locked invalidation when this section provably holds no
+   * translated code. See the SkipEmptyInvalidate note above for why XIntervals is the exact
+   * discriminator. Section bounds are still computed and returned, so HandleImageUnmap is
+   * unaffected. */
+  bool MayHoldCode = true;
+  if (SkipEmptyInvalidate()) {
+    TrackerLockScope Reentry;
+    std::shared_lock Lock(IntervalsLock);
+    MayHoldCode = XIntervals.Intersect({SectionBase, SectionBase + SectionSize});
+  }
+
+  if (MayHoldCode) {
+    InvalKeptSection.fetch_add(1, std::memory_order_relaxed);
+    InvalidateIntervalInternal(SectionBase, SectionSize);
+  } else {
+    InvalSkippedSection.fetch_add(1, std::memory_order_relaxed);
+  }
+  ReportInvalidationFilter();
 
   if (Free) {
     {
@@ -734,8 +804,16 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
       XIntervals.Remove({SectionBase, SectionBase + SectionSize});
       RWXIntervals.Remove({SectionBase, SectionBase + SectionSize});
     }
-    LogMan::Msg::EFmt("[iOS-xrem] via=section tracker={} {:#x}-{:#x}", static_cast<void*>(this),
-                      SectionBase, SectionBase + SectionSize);
+    /* ml630 (#78): this was 72,072 of the 137,368 lines in a 20-minute session - 55% of the
+     * whole log, one dprintf syscall each, for ~880 ranges repeating a fixed cycle. Sample it
+     * exactly as via=aligned is sampled (first 32, then 1-in-1024): the signal is WHICH range
+     * a section removal covers, which a sample carries, not the rate. */
+    static std::atomic<uint32_t> SectionRemoveCount;
+    const auto N = SectionRemoveCount.fetch_add(1) + 1;
+    if (N <= 32 || !(N & 1023)) {
+      LogMan::Msg::EFmt("[iOS-xrem] via=section #{} tracker={} {:#x}-{:#x}", N, static_cast<void*>(this),
+                        SectionBase, SectionBase + SectionSize);
+    }
   }
 
   return {SectionBase, SectionSize};
@@ -755,7 +833,25 @@ void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t S
   const auto AlignedBase = Address & FEXCore::Utils::FEX_PAGE_MASK;
   const auto AlignedSize = std::max(Size, (Address - AlignedBase + Size + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK);
 
-  InvalidateIntervalInternal(AlignedBase, AlignedSize);
+  /* ml630 (#78): same filter as InvalidateContainingSection, and this is the higher-volume
+   * path by far - ~2.9M guest frees in a 20-minute session, each one an exclusive
+   * CodeInvalidationMutex acquisition plus a walk of every thread's lookup cache. The
+   * Address==0 ("everything") case is left unfiltered on purpose: it is rare and the
+   * clamped end would overflow. */
+  bool MayHoldCode = true;
+  if (Address && SkipEmptyInvalidate()) {
+    TrackerLockScope Reentry;
+    std::shared_lock Lock(IntervalsLock);
+    MayHoldCode = XIntervals.Intersect({AlignedBase, AlignedBase + AlignedSize});
+  }
+
+  if (MayHoldCode) {
+    InvalKeptAligned.fetch_add(1, std::memory_order_relaxed);
+    InvalidateIntervalInternal(AlignedBase, AlignedSize);
+  } else {
+    InvalSkippedAligned.fetch_add(1, std::memory_order_relaxed);
+  }
+  ReportInvalidationFilter();
 
   if (Free) {
     {

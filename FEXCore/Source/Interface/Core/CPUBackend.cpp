@@ -10,6 +10,7 @@
 #include <FEXCore/Utils/PrctlUtils.h>
 
 #include <cstdint>
+#include <cstdlib> // ml630: getenv for MADEIRA_FEX_CODEBUF_LOCKFREE
 
 #if defined(__linux__)
 #include <linux/prctl.h>
@@ -285,9 +286,20 @@ namespace CPU {
     return TotalLUT;
   }()};
 
+#ifdef FEX_IOS_HOST
+  namespace {
+    // Defined below; primed here so the fault path only ever reads the cache.
+    bool IosCodeBufLockFree();
+  } // namespace
+#endif
+
   CPUBackend::CPUBackend(CodeBufferManager& CodeBuffers, FEXCore::Core::InternalThreadState* ThreadState)
     : ThreadState(ThreadState)
     , CodeBuffers(CodeBuffers) {
+#ifdef FEX_IOS_HOST
+    // ml630: resolve MADEIRA_FEX_CODEBUF_LOCKFREE off the fault path.
+    IosCodeBufLockFree();
+#endif
 
     auto& Ptrs = ThreadState->CurrentFrame->Pointers;
 
@@ -329,28 +341,184 @@ namespace CPU {
 #ifdef FEX_IOS_HOST
   /* iOS-Madeira ml460 (#75): every C++ toucher of CurrentCodeBuffer /
    * SignalHandlerCodeBuffers holds this while the sweeper may run (see the
-   * header comment). Plain test-and-set spin — all critical sections are a
-   * few pointer ops. NOT recursive: RegisterForSignalHandler is only called
-   * from already-guarded scopes and must not re-acquire. */
+   * header comment). All critical sections are a few pointer ops.
+   *
+   * ml630 (#78): three changes, because the unqualified version of this lock
+   * is what froze 32-bit titles after 5-10 minutes of play.
+   *  1. It records its owner and is RECURSION-TOLERANT. A host fault taken
+   *     inside a critical section runs the exception path on the SAME thread;
+   *     if anything down there re-enters, it now proceeds instead of spinning
+   *     on a lock its own thread holds.
+   *  2. Acquisition can be BOUNDED (SpinBudget != 0). The sweeper uses that,
+   *     because it holds a LookupCache write lock while acquiring and must
+   *     never convert one wedged thread into a process-wide park. Owner-side
+   *     compile paths still block: they must not mutate unprotected, and with
+   *     the fault path out of the lock (below) nothing can hold it forever.
+   *  3. The fault-path reader does not take it at all any more; see
+   *     IsAddressInCodeBuffer. */
   namespace {
+    static inline uint64_t IosSelfTeb() {
+      uint64_t Teb = 0;
+      __asm volatile("mov %0, x18" : "=r"(Teb));
+      return Teb;
+    }
+
     struct IosMigrateLockGuard {
       std::atomic<uint32_t>& Lock;
-      explicit IosMigrateLockGuard(std::atomic<uint32_t>& Lock)
-        : Lock(Lock) {
+      std::atomic<uint64_t>& Owner;
+      uint32_t& Depth;
+      bool Acquired = false;
+      bool Recursive = false;
+
+      IosMigrateLockGuard(std::atomic<uint32_t>& Lock, std::atomic<uint64_t>& Owner, uint32_t& Depth, uint64_t SpinBudget = 0)
+        : Lock(Lock)
+        , Owner(Owner)
+        , Depth(Depth) {
+        const uint64_t Self = IosSelfTeb();
+        if (Self && Owner.load(std::memory_order_acquire) == Self) {
+          // Re-entered from a fault taken inside our own critical section.
+          Recursive = true;
+          Acquired = true;
+          ++Depth;
+          static std::atomic<int> ReentryLogCount {0};
+          if (ReentryLogCount.fetch_add(1, std::memory_order_relaxed) < 16) {
+            LogMan::Msg::EFmt("[migrate-lock] RECURSIVE acquire depth={} ra={} rev=ml630", Depth, __builtin_return_address(0));
+          }
+          return;
+        }
+
+        uint64_t Spins = 0;
         while (Lock.exchange(1, std::memory_order_acquire) != 0) {
+          if (SpinBudget && ++Spins >= SpinBudget) {
+            static std::atomic<int> TimeoutLogCount {0};
+            if (TimeoutLogCount.fetch_add(1, std::memory_order_relaxed) < 16) {
+              LogMan::Msg::EFmt("[migrate-lock] bounded acquire GAVE UP after {} spins owner={:#x} rev=ml630", Spins,
+                                Owner.load(std::memory_order_relaxed));
+            }
+            return; // Acquired stays false; caller must check.
+          }
           __asm volatile("yield");
         }
+        Acquired = true;
+        Depth = 1;
+        Owner.store(Self, std::memory_order_release);
       }
+
       ~IosMigrateLockGuard() {
+        if (!Acquired) {
+          return;
+        }
+        if (Recursive) {
+          --Depth;
+          return;
+        }
+        Depth = 0;
+        Owner.store(0, std::memory_order_release);
         Lock.store(0, std::memory_order_release);
       }
     };
+
+    /* MADEIRA_FEX_CODEBUF_LOCKFREE=0 restores the pre-ml630 behaviour: the
+     * fault-path query takes IosMigrateLock again and the sweeper spins
+     * without a bound. Primed from the CPUBackend constructor so the fault
+     * path only ever reads the cached value. */
+    std::atomic<int8_t> IosCodeBufLockFreeCached {-1};
+    bool IosCodeBufLockFree() {
+      int8_t V = IosCodeBufLockFreeCached.load(std::memory_order_relaxed);
+      if (V < 0) {
+        const char* E = getenv("MADEIRA_FEX_CODEBUF_LOCKFREE");
+        V = (E && E[0] == '0') ? 0 : 1;
+        IosCodeBufLockFreeCached.store(V, std::memory_order_relaxed);
+      }
+      return V != 0;
+    }
+
+    // Bounded acquisitions for the remote (sweeper) side. ~2M yields is tens
+    // of ms on this hardware - orders of magnitude longer than any legitimate
+    // critical section, and it only costs a skipped migration when it fires.
+    constexpr uint64_t IosMigrateSweepSpinBudget = 2u * 1024 * 1024;
   } // namespace
+
+#define IOS_MIGRATE_GUARD(name) IosMigrateLockGuard name {IosMigrateLock, IosMigrateOwner, IosMigrateDepth}
+#define IOS_MIGRATE_GUARD_BOUNDED(name) \
+  IosMigrateLockGuard name { \
+    IosMigrateLock, IosMigrateOwner, IosMigrateDepth, IosCodeBufLockFree() ? IosMigrateSweepSpinBudget : 0 \
+  }
+
+  /* ml630: encode one code buffer as a single 64-bit word. The usable range
+   * is [Ptr, LastPageAddr) exactly as CheckCodeBuffer computes it below - the
+   * final guard page is excluded. Returns 0 if the range cannot be
+   * represented, which latches IosRangesDegraded at the call site. */
+  static uint64_t IosEncodeRange(const CodeBuffer& Buffer) {
+    const uintptr_t Base = reinterpret_cast<uintptr_t>(Buffer.Ptr);
+    if (!Base || (Base & (FEXCore::Utils::FEX_PAGE_SIZE - 1))) {
+      return 0; // not page aligned; cannot be described by a page range
+    }
+    const uintptr_t LastPageAddr = AlignDown(Base + Buffer.AllocatedSize - 1, FEXCore::Utils::FEX_PAGE_SIZE);
+    if (LastPageAddr <= Base) {
+      return 0;
+    }
+    const uint64_t BasePage = static_cast<uint64_t>(Base) >> FEXCore::Utils::FEX_PAGE_SHIFT;
+    const uint64_t Pages = (static_cast<uint64_t>(LastPageAddr) - Base) >> FEXCore::Utils::FEX_PAGE_SHIFT;
+    if (Pages == 0 || Pages >= (1ULL << CPUBackend::IosRangePageBits)) {
+      return 0;
+    }
+    if (BasePage >= (1ULL << (64 - CPUBackend::IosRangePageBits))) {
+      return 0;
+    }
+    return (BasePage << CPUBackend::IosRangePageBits) | Pages;
+  }
+
+  void CPUBackend::IosPublishCodeBufferRanges() {
+    size_t Slot = 0;
+    bool Degraded = false;
+
+    auto Publish = [&](const CodeBuffer* Buffer) {
+      if (!Buffer) {
+        return;
+      }
+      if (Slot >= IosMaxPublishedRanges) {
+        Degraded = true;
+        return;
+      }
+      const uint64_t Word = IosEncodeRange(*Buffer);
+      if (!Word) {
+        Degraded = true;
+        return;
+      }
+      IosPublishedRanges[Slot++].store(Word, std::memory_order_release);
+    };
+
+    Publish(CurrentCodeBuffer.get());
+    for (auto& Buffer : SignalHandlerCodeBuffers) {
+      Publish(Buffer.get());
+    }
+
+    // Clear the tail. A reader that is mid-scan sees a slot either before or
+    // after this store; both describe a range that was live a moment ago,
+    // and stale-live is exactly what the locked version could return too.
+    for (size_t i = Slot; i < IosMaxPublishedRanges; i++) {
+      IosPublishedRanges[i].store(0, std::memory_order_release);
+    }
+
+    if (Degraded && !IosRangesDegraded.exchange(1, std::memory_order_release)) {
+      LogMan::Msg::EFmt("[code-range] DEGRADED: {} live buffers exceed the {}-slot table or are unrepresentable; "
+                        "IsAddressInCodeBuffer falls back to the locked path rev=ml630",
+                        SignalHandlerCodeBuffers.size() + 1, IosMaxPublishedRanges);
+    } else if (!Degraded) {
+      IosRangesDegraded.store(0, std::memory_order_release);
+    }
+  }
+
+  void CPUBackend::IosPublishCodeBufferRangesLocked() {
+    IOS_MIGRATE_GUARD(g);
+    IosPublishCodeBufferRanges();
+  }
 #endif
 
   auto CPUBackend::GetEmptyCodeBuffer() -> CodeBuffer* {
 #ifdef FEX_IOS_HOST
-    IosMigrateLockGuard g {IosMigrateLock};
+    IOS_MIGRATE_GUARD(g);
 #endif
     auto PrevCodeBuffer = CurrentCodeBuffer;
 
@@ -358,6 +526,9 @@ namespace CPU {
     CurrentCodeBuffer = CodeBuffers.StartLargerCodeBuffer();
 
     RegisterForSignalHandler(std::move(PrevCodeBuffer));
+#ifdef FEX_IOS_HOST
+    IosPublishCodeBufferRanges();
+#endif
     return CurrentCodeBuffer.get();
   }
 
@@ -396,11 +567,15 @@ namespace CPU {
   fextl::shared_ptr<CodeBuffer> CPUBackend::CheckCodeBufferUpdate() {
     auto NewCodeBuffer = CodeBuffers.GetLatest();
 #ifdef FEX_IOS_HOST
-    IosMigrateLockGuard g {IosMigrateLock};
+    IOS_MIGRATE_GUARD(g);
 #endif
     if (CurrentCodeBuffer != NewCodeBuffer) {
       RegisterForSignalHandler(CurrentCodeBuffer);
-      return std::exchange(CurrentCodeBuffer, NewCodeBuffer);
+      auto Prev = std::exchange(CurrentCodeBuffer, NewCodeBuffer);
+#ifdef FEX_IOS_HOST
+      IosPublishCodeBufferRanges();
+#endif
+      return Prev;
     }
     return nullptr;
   }
@@ -421,14 +596,27 @@ namespace CPU {
     for (int Attempt = 0; Attempt < 4; Attempt++) {
       fextl::shared_ptr<CodeBuffer> KeepAlive;
       {
-        IosMigrateLockGuard g {IosMigrateLock};
+        /* ml630: bounded. This runs on the SWEEPER's thread against a foreign
+         * CPUBackend; migration is a pool-pressure optimisation and is never
+         * required for correctness, so a target that is slow (or wedged) must
+         * cost a skipped migration, not a process-wide park. */
+        IOS_MIGRATE_GUARD_BOUNDED(g);
+        if (!g.Acquired) {
+          return -2;
+        }
         KeepAlive = CurrentCodeBuffer;
       }
       if (!KeepAlive || KeepAlive == LatestBuf) {
         return 0;
       }
       auto lk = KeepAlive->LookupCache->AcquireWriteLock();
-      IosMigrateLockGuard g {IosMigrateLock};
+      // Bounded again, and much more important here: a LookupCache write lock
+      // is held across this acquire, so an unbounded spin would block every
+      // thread that shares the buffer.
+      IOS_MIGRATE_GUARD_BOUNDED(g);
+      if (!g.Acquired) {
+        return -2;
+      }
       if (CurrentCodeBuffer != KeepAlive) {
         continue; // owner-side state moved between the peek and the locks; retry
       }
@@ -442,6 +630,7 @@ namespace CPU {
       // stays — zeroed entries just mispredict into the slow path.
       FEXCore::Core::ResetCallRetStack(ThreadState, "cpubackend");
       SignalHandlerCodeBuffers.clear();
+      IosPublishCodeBufferRanges();
       return 1;
       // Prev + KeepAlive drop after lk releases; the final ref frees the
       // buffer to the pool tail on this (the sweeper's) thread.
@@ -746,10 +935,44 @@ namespace CPU {
 
   bool CPUBackend::IsAddressInCodeBuffer(uintptr_t Address) const {
 #ifdef FEX_IOS_HOST
-    /* ml460: exception paths call this on threads that are native-side
-     * (InSimulation==0) — exactly the threads the sweeper may be migrating.
-     * Serialize against the CurrentCodeBuffer exchange. */
-    IosMigrateLockGuard g {IosMigrateLock};
+    /* ml630 (#78): THE fault-path query. It must never block.
+     *
+     * ml460 took IosMigrateLock here to serialize against the sweeper's
+     * CurrentCodeBuffer exchange, and that is what froze 32-bit titles after
+     * 5-10 minutes: at JIT-pool exhaustion the CodeBuffer constructor takes a
+     * deliberate fault at 0xdead (rev=ml364) while GetEmptyCodeBuffer holds
+     * this very lock, the Mach delivery path asks "is this host pc JIT code?"
+     * on the SAME thread, and the query spins on a lock its own thread owns.
+     * Observed: a 20-byte spin window at libwow64fex+0x1b240 burning a whole
+     * core, with the FEX shared read lock leaked underneath it
+     * ([deliver-hold]) so every writer piled up behind it too.
+     *
+     * The published range table is a snapshot of exactly what the locked code
+     * below would have read, maintained by the (serialized) mutators. Each
+     * slot is one 64-bit word, so no torn {base,size} pair is observable and
+     * no retry loop is needed. A reader racing a publish sees a range that
+     * was live an instant earlier - which is the same answer the locked
+     * version could return, since the buffer could be swapped the instant
+     * after it released. */
+    if (IosCodeBufLockFree() && !IosRangesDegraded.load(std::memory_order_acquire)) {
+      const uint64_t Page = static_cast<uint64_t>(Address) >> FEXCore::Utils::FEX_PAGE_SHIFT;
+      constexpr uint64_t PageMask = (1ULL << IosRangePageBits) - 1;
+      for (size_t i = 0; i < IosMaxPublishedRanges; i++) {
+        const uint64_t Word = IosPublishedRanges[i].load(std::memory_order_acquire);
+        if (!Word) {
+          continue;
+        }
+        const uint64_t BasePage = Word >> IosRangePageBits;
+        if (Page >= BasePage && Page < BasePage + (Word & PageMask)) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    /* Degraded (or knob off): fall back to the locked read. The guard is
+     * recursion-tolerant now, so even this path cannot self-deadlock. */
+    IOS_MIGRATE_GUARD(g);
 #endif
     auto CheckCodeBuffer = [](CodeBuffer& Buffer, uintptr_t Address) {
       // The last page of the code buffer is protected, so we need to exclude it from the valid range
