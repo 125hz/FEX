@@ -4,6 +4,8 @@
 #include <ntstatus.h>
 #include <windef.h>
 #include <winternl.h>
+#include <cstdlib>
+#include <atomic>
 
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Debug/InternalThreadState.h>
@@ -66,6 +68,16 @@ static inline EXCEPTION_RECORD HandleGuestException(FEXCore::Core::CpuStateFrame
     case FEXCore::X86State::X86_TRAPNO_OF: Dst.ExceptionCode = EXCEPTION_INT_OVERFLOW; return Dst;
     case FEXCore::X86State::X86_TRAPNO_PF:
       // A page-fault raised by an explicit break in JIT code is always an execute fault
+      {
+        const char* Legacy = std::getenv("MADEIRA_EXEC_FAULT_CODE");
+        if (!Legacy || Legacy[0] != '0') {
+          Dst.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+          static std::atomic<unsigned> Reports {0};
+          if (Reports.fetch_add(1, std::memory_order_relaxed) < 4) {
+            LogMan::Msg::IFmt("[exec-fault] ml1150 synthesized execute access violation rip=0x{:x}", Rip);
+          }
+        }
+      }
       Dst.NumberParameters = 2;
       Dst.ExceptionInformation[0] = EXCEPTION_EXECUTE_FAULT;
       Dst.ExceptionInformation[1] = Rip;
