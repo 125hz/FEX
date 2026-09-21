@@ -291,6 +291,10 @@ namespace CPU {
     // Defined below; primed here so the fault path only ever reads the cache.
     bool IosCodeBufLockFree();
   } // namespace
+  // ml1020 (#86): how many exec allocations the JIT pool degraded (halved) so
+  // far. Reported by the [code-buffer] recycled summary; a healthy run keeps it
+  // at 0, and a non-zero value names the pool-tail budget as the thing to fix.
+  static std::atomic<uint64_t> IosCodeBufDegradeCount {0};
 #endif
 
   CPUBackend::CPUBackend(CodeBufferManager& CodeBuffers, FEXCore::Core::InternalThreadState* ThreadState)
@@ -437,6 +441,21 @@ namespace CPU {
     // of ms on this hardware - orders of magnitude longer than any legitimate
     // critical section, and it only costs a skipped migration when it fires.
     constexpr uint64_t IosMigrateSweepSpinBudget = 2u * 1024 * 1024;
+
+    /* ml1020 (#86): MADEIRA_FEX_RECYCLE=0 restores the pre-ml1020 code-buffer
+     * size behaviour exactly - StartLargerCodeBuffer doubles the size that was
+     * GRANTED rather than the size that was ASKED for, so a degraded carve
+     * ratchets the process down the ladder permanently. */
+    std::atomic<int8_t> IosCodeBufLadderCached {-1};
+    bool IosCodeBufLadder() {
+      int8_t V = IosCodeBufLadderCached.load(std::memory_order_relaxed);
+      if (V < 0) {
+        const char* E = getenv("MADEIRA_FEX_RECYCLE");
+        V = (E && E[0] == '0') ? 0 : 1;
+        IosCodeBufLadderCached.store(V, std::memory_order_relaxed);
+      }
+      return V != 0;
+    }
   } // namespace
 
 #define IOS_MIGRATE_GUARD(name) IosMigrateLockGuard name {IosMigrateLock, IosMigrateOwner, IosMigrateDepth}
@@ -660,11 +679,34 @@ namespace CPU {
       Ptr = static_cast<uint8_t*>(FEXCore::Allocator::VirtualAlloc(Size, true));
     }
     if (Ptr && Size != AllocatedSize) {
-      LogMan::Msg::EFmt("[code-buffer] rev=ml364 exec alloc degraded 0x{:x} -> 0x{:x} (pool pressure)", AllocatedSize, Size);
+      /* ml1020: sampled, and it says how many times this has happened. w50 spent
+       * 31 identical copies of this line while the ratchet it reports was
+       * dragging the process from 32MB buffers down to 1MB ones; the count is
+       * the number that matters, not the repetition. */
+      const uint64_t DN = IosCodeBufDegradeCount.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (DN <= 8 || (DN & (DN - 1)) == 0) {
+        LogMan::Msg::EFmt("[code-buffer] rev=ml1020 exec alloc degraded #{} 0x{:x} -> 0x{:x} (pool pressure; the NEXT rotation "
+                          "still asks for the full size — see [pool-tail] budget=)",
+                          DN, AllocatedSize, Size);
+      }
       AllocatedSize = Size;
     }
     if (!Ptr) {
-      LogMan::Msg::EFmt("[code-buffer] rev=ml364 EXEC ALLOC FAILED even at 0x{:x} — JIT pool exhausted; forcing honest fault at 0xdead", Size);
+      /* ml1020: this deliberate fault is the last resort and must stay
+       * unreachable in normal operation. Reaching it means BOTH the pool-tail
+       * bump budget was spent AND not one carve in the free list was free at
+       * this instant — the allocator now re-scans the free list after the budget
+       * refusal (rev=ml1020 "tail REUSE-LATE") precisely to rule the second half
+       * out. There is no safe in-place recycle to fall back to here: in this FEX
+       * the active CodeBuffer is SHARED by every thread (CodeBufferManager
+       * ::Latest + the process-wide LatestOffset), so resetting its cursor would
+       * overwrite blocks other threads are executing. Anything that frees a
+       * buffer needs CodeBufferWriteMutex, which this thread holds, so waiting
+       * here would deadlock rather than help. */
+      LogMan::Msg::EFmt("[code-buffer] rev=ml1020 EXEC ALLOC FAILED even at 0x{:x} after {} degrades — JIT pool tail has no free "
+                        "carve AND no budget; forcing honest fault at 0xdead. Raise Documents/madeira-pool.txt, or lower "
+                        "MADEIRA_FEX_CODEBUF_MAX_MB / MADEIRA_POOL_HEAD_MARGIN_MB",
+                        Size, IosCodeBufDegradeCount.load(std::memory_order_relaxed));
       *reinterpret_cast<volatile uint64_t*>(0xdeadULL) = Size;
     }
 #endif
@@ -748,6 +790,23 @@ namespace CPU {
       if (GenLogCount.fetch_add(1, std::memory_order_relaxed) < 64) {
         LogMan::Msg::EFmt("[gen] alloc#{} size=0x{:x} prev_size=0x{:x} prev_use_count={} rev=ml460", Gen, Size, PrevSize, PrevUseCount);
       }
+      /* ml1020 (#86): the [gen] line above stops at 64 allocations, and w50's
+       * run made 53 of them before it died — so the one number that says whether
+       * the rotation rate is healthy was about to disappear exactly when it
+       * mattered. This summary is sampled (first 8, then every power of two) and
+       * never stops. asked= vs got= is the degradation ratchet made visible:
+       * they must stay equal in a healthy run. pinned= is prev_use_count minus
+       * the manager's own reference, i.e. how many threads are still holding the
+       * outgoing generation — the direct measure of how much tail the port needs
+       * (w50: 6..13, with an 11-generation / 240MB live census). */
+      static std::atomic<uint64_t> RecycleLogCount {0};
+      const uint64_t RN = RecycleLogCount.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (RN <= 8 || (RN & (RN - 1)) == 0) {
+        LogMan::Msg::EFmt("[code-buffer] recycled #{} gen={} asked=0x{:x} got=0x{:x} prev_size=0x{:x} pinned={} "
+                          "degraded_total={} rev=ml1020",
+                          RN, Gen, Size, Buffer ? Buffer->AllocatedSize : 0, PrevSize, PrevUseCount ? PrevUseCount - 1 : 0,
+                          IosCodeBufDegradeCount.load(std::memory_order_relaxed));
+      }
     }
 #else
     Latest = Buffer;
@@ -797,6 +856,25 @@ namespace CPU {
       // Allocate initial CodeBuffer and return it
       return GetLatest();
     }
+
+#ifdef FEX_IOS_HOST
+    /* ml1020 (#86): ask for the size we WANT, not the size we last GOT.
+     *
+     * See the DesiredSize comment in CPUBackend.h. The granted size can be
+     * smaller than the ask (the JIT pool degrades a refused carve by halving in
+     * the CodeBuffer ctor), and deriving the next ask from the granted size is a
+     * one-way ratchet: w50 walked 32MB -> 16 -> 8 -> 4 -> 2 -> 1MB over ~15
+     * generations and then spent the rest of the session rotating 1-2MB buffers.
+     * The ladder below only ever grows, so a degraded grant costs exactly one
+     * generation and the next rotation asks for the cap again - which the pool's
+     * tail free-list can satisfy from the large carves that are already sitting
+     * there free. */
+    if (IosCodeBufLadder()) {
+      const size_t PrevAsk = DesiredSize ? DesiredSize : GetLatest()->AllocatedSize;
+      DesiredSize = std::min<size_t>(PrevAsk * 2, MAX_CODE_SIZE);
+      return AllocateNew(DesiredSize);
+    }
+#endif
 
     auto NewCodeBufferSize = GetLatest()->AllocatedSize;
     NewCodeBufferSize = std::min<size_t>(NewCodeBufferSize * 2, MAX_CODE_SIZE);

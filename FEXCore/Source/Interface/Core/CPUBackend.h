@@ -110,6 +110,28 @@ namespace CPU {
   private:
     fextl::shared_ptr<CodeBuffer> Latest;
 
+#ifdef FEX_IOS_HOST
+    /* ml1020 (#86): the size we last ASKED for, which is NOT the size we got.
+     *
+     * On iOS every code buffer is carved from the finite JIT pool, and a refused
+     * carve is degraded rather than failed: CodeBuffer's ctor halves the request
+     * down (rev=ml364, "[code-buffer] exec alloc degraded"). StartLargerCodeBuffer
+     * used to compute the next size from Latest->AllocatedSize — the DEGRADED
+     * value — so one transient refusal ratcheted the whole process down a size
+     * ladder it could never climb back up. w50 shows it exactly: allocations #2
+     * through #15 are 32MB, then #16 is 16MB, #17 8MB, #28 4MB, #31 2MB, and from
+     * there the run alternates 1MB/2MB for 20+ more generations while 240MB of
+     * 16-32MB carves sit pinned. Small buffers rotate ~32x more often, each
+     * rotation is a ClearCodeCache that wipes every thread's L1/L2 (w50's
+     * real_compile spike of +72960 blocks in one 10s window), and the rotation
+     * storm is what eventually caught a moment with zero free carves.
+     *
+     * The ladder is kept here instead, monotonic up to MAX_CODE_SIZE, so a
+     * degraded grant costs ONE generation rather than the rest of the session.
+     * MADEIRA_FEX_RECYCLE=0 restores the pre-ml1020 "double the granted size". */
+    size_t DesiredSize {};
+#endif
+
     fextl::shared_ptr<CodeBuffer> AllocateNew(size_t Size);
   };
 
