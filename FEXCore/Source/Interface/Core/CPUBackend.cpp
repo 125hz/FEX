@@ -799,9 +799,14 @@ namespace CPU {
        * the manager's own reference, i.e. how many threads are still holding the
        * outgoing generation — the direct measure of how much tail the port needs
        * (w50: 6..13, with an 11-generation / 240MB live census). */
+      /* ml1100: powers of two went silent exactly where the question lives. A 32-minute
+       * device session rotated ~298 times and logged 13 lines, the last at #256 — so the
+       * whole second half of the session, where the rotation RATE is the thing being
+       * measured, produced one data point. First 8 then every 16th is ~25 lines for that
+       * same session and states the rate directly. */
       static std::atomic<uint64_t> RecycleLogCount {0};
       const uint64_t RN = RecycleLogCount.fetch_add(1, std::memory_order_relaxed) + 1;
-      if (RN <= 8 || (RN & (RN - 1)) == 0) {
+      if (RN <= 8 || (RN & 15) == 0) {
         LogMan::Msg::EFmt("[code-buffer] recycled #{} gen={} asked=0x{:x} got=0x{:x} prev_size=0x{:x} pinned={} "
                           "degraded_total={} rev=ml1020",
                           RN, Gen, Size, Buffer ? Buffer->AllocatedSize : 0, PrevSize, PrevUseCount ? PrevUseCount - 1 : 0,

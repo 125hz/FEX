@@ -2373,17 +2373,35 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
           const uint64_t L1MaskNow = Frame ? Frame->State.L1Mask : 0;
           const uint64_t L1SetBytes = LookupCache::L1_SET_BYTES;
           const uint64_t L1Entries = L1MaskNow ? ((L1MaskNow / L1SetBytes) + 1) * LookupCache::L1_WAYS : 0;
-          LogMan::Msg::EFmt("[fex-stats] rev=ml990 window_ms={} blocks={} (+{}, {}/s) insts/blk={} "
+          /* ml1100: THE NUMBER THAT EXPLAINS blocks/s, and the one this line was missing.
+           *
+           * A code-buffer rotation throws away every block in the outgoing buffer — the new
+           * buffer gets a brand-new empty GuestToHostMap — so the steady-state compile rate is
+           * not "how much new code the program reached", it is "buffer size / rotation period".
+           * A 32-minute device session makes that arithmetic exact: 4,911,610 blocks x 54 insts
+           * x 18 host bytes = 4.77 GB of emitted code, against ~298 rotations x 16 MB = 4.77 GB.
+           * Every byte the JIT emitted went into a buffer that was then discarded.
+           * gen=+N per window is therefore the cause and blocks/s the effect; reading them
+           * apart is what tells a later log whether a change made code SMALLER or made the
+           * buffer LAST LONGER. */
+#ifdef FEX_IOS_HOST
+          const uint64_t Gen = FEXCore::CPU::IosCodeBufferGeneration();
+#else
+          const uint64_t Gen = 0;
+#endif
+          static std::atomic<uint64_t> LastStatsGen {0};
+          const uint64_t GenDelta = Gen - LastStatsGen.exchange(Gen, std::memory_order_relaxed);
+          LogMan::Msg::EFmt("[fex-stats] rev=ml1100 window_ms={} blocks={} (+{}, {}/s) insts/blk={} "
                             "host_b/inst={} cpp_dispatch=+{} ({}/s) hit_rate={}% "
                             "l1_miss_l3hit=+{} ({}/s, {}% of dispatches) real_compile=+{} "
-                            "l1_entries={} ways={} "
+                            "l1_entries={} ways={} gen={} (+{} rotations) "
                             "ua_emu={} ua_patch={}",
                             ElapsedMs, Blocks, BlockDelta, ElapsedMs ? (BlockDelta * 1000 / ElapsedMs) : 0, Blocks ? (Insts / Blocks) : 0,
                             Insts ? (HostBytes / Insts) : 0, DispatchDelta, ElapsedMs ? (DispatchDelta * 1000 / ElapsedMs) : 0,
                             (total > 0) ? (100 * (total - reals) / total) : 0,
                             L3Only, ElapsedMs ? (L3Only * 1000 / ElapsedMs) : 0,
                             DispatchDelta ? (100 * L3Only / DispatchDelta) : 0, RealDelta,
-                            L1Entries, static_cast<uint64_t>(LookupCache::L1_WAYS),
+                            L1Entries, static_cast<uint64_t>(LookupCache::L1_WAYS), Gen, GenDelta,
                             MadeiraStats::UnalignedAtomicEmulated.load(std::memory_order_relaxed),
                             MadeiraStats::UnalignedAtomicPatched.load(std::memory_order_relaxed));
         }

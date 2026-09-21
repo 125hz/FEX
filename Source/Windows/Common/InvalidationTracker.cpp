@@ -179,11 +179,46 @@ bool SkipEmptyInvalidate() {
   return V != 0;
 }
 
+/* iOS-Madeira ml1100: the SECOND half of the same filter — the exclusive removal.
+ *
+ * ml630 stopped the invalidation itself, and a 32-minute device session proves it works:
+ * `[inval-filter] ml630 ... aligned: skipped=4090441 kept=0` — not one guest free in four
+ * million removed a single translated block. What that session ALSO shows is that the
+ * removal underneath it kept running: every one of those frees still took IntervalsLock
+ * EXCLUSIVELY to ask two sorted lists to remove a range neither of them contains.
+ *
+ * That is not a cheap no-op. IntervalsLock is the lock QueryExecutableRange takes SHARED on
+ * the JIT's decode path, so a writer arriving ~3400 times a second (the measured guest
+ * free rate for that title) parks every compiling thread behind it — on a shared_mutex a
+ * waiting writer also blocks arriving readers, which is exactly the "compiles stall while
+ * the heap churns" shape.
+ *
+ * The skip is exact rather than heuristic, and it is decided inside the SAME shared-lock
+ * scope that ml630's MayHoldCode already needed: if the range intersects neither XIntervals
+ * nor RWXIntervals, Remove() on both is a provable no-op, so not taking the exclusive lock
+ * cannot change any observable state. Nothing happens between the two decisions, so this
+ * adds no window that ml630 did not already have.
+ *
+ * MADEIRA_FEX_SKIP_EMPTY_REMOVE=0 restores the unconditional removal. */
+std::atomic<int8_t> SkipEmptyRemoveCached {-1};
+bool SkipEmptyRemove() {
+  int8_t V = SkipEmptyRemoveCached.load(std::memory_order_relaxed);
+  if (V < 0) {
+    const char* E = getenv("MADEIRA_FEX_SKIP_EMPTY_REMOVE");
+    V = (E && E[0] == '0') ? 0 : 1;
+    SkipEmptyRemoveCached.store(V, std::memory_order_relaxed);
+  }
+  return V != 0;
+}
+
 // Quantifies the filter: how many invalidations were skipped vs performed, by path.
 std::atomic<uint64_t> InvalSkippedSection {0};
 std::atomic<uint64_t> InvalKeptSection {0};
 std::atomic<uint64_t> InvalSkippedAligned {0};
 std::atomic<uint64_t> InvalKeptAligned {0};
+// ml1100: exclusive IntervalsLock acquisitions avoided / taken on the removal half.
+std::atomic<uint64_t> RemoveSkipped {0};
+std::atomic<uint64_t> RemoveTaken {0};
 
 void ReportInvalidationFilter() {
   static std::atomic<uint64_t> Next {8192};
@@ -194,9 +229,12 @@ void ReportInvalidationFilter() {
     return;
   }
   LogMan::Msg::EFmt("[inval-filter] ml630 section: skipped={} kept={} | aligned: skipped={} kept={} "
-                    "(skipped = range held no translated code; each kept one takes CodeInvalidationMutex exclusively)",
+                    "| ml1100 xlock: skipped={} taken={} "
+                    "(skipped = range held no translated code; each kept one takes CodeInvalidationMutex exclusively; "
+                    "xlock skipped = an IntervalsLock WRITE the JIT's decode path no longer waits behind)",
                     InvalSkippedSection.load(std::memory_order_relaxed), InvalKeptSection.load(std::memory_order_relaxed),
-                    InvalSkippedAligned.load(std::memory_order_relaxed), InvalKeptAligned.load(std::memory_order_relaxed));
+                    InvalSkippedAligned.load(std::memory_order_relaxed), InvalKeptAligned.load(std::memory_order_relaxed),
+                    RemoveSkipped.load(std::memory_order_relaxed), RemoveTaken.load(std::memory_order_relaxed));
 }
 
 /// Returns true when this thread is already inside a tracker lock, i.e. the caller must bail
@@ -782,10 +820,13 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
    * discriminator. Section bounds are still computed and returned, so HandleImageUnmap is
    * unaffected. */
   bool MayHoldCode = true;
+  // ml1100: decided in the same shared-lock scope; see SkipEmptyRemove.
+  bool MayNeedRemove = true;
   if (SkipEmptyInvalidate()) {
     TrackerLockScope Reentry;
     std::shared_lock Lock(IntervalsLock);
     MayHoldCode = XIntervals.Intersect({SectionBase, SectionBase + SectionSize});
+    MayNeedRemove = MayHoldCode || RWXIntervals.Intersect({SectionBase, SectionBase + SectionSize});
   }
 
   if (MayHoldCode) {
@@ -797,12 +838,15 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
   ReportInvalidationFilter();
 
   if (Free) {
-    {
+    if (MayNeedRemove || !SkipEmptyRemove()) {
       // ml760: remove under the lock, log after releasing it -- EFmt allocates.
+      RemoveTaken.fetch_add(1, std::memory_order_relaxed);
       TrackerLockScope Reentry;
       std::unique_lock Lock(IntervalsLock);
       XIntervals.Remove({SectionBase, SectionBase + SectionSize});
       RWXIntervals.Remove({SectionBase, SectionBase + SectionSize});
+    } else {
+      RemoveSkipped.fetch_add(1, std::memory_order_relaxed);
     }
     /* ml630 (#78): this was 72,072 of the 137,368 lines in a 20-minute session - 55% of the
      * whole log, one dprintf syscall each, for ~880 ranges repeating a fixed cycle. Sample it
@@ -839,10 +883,13 @@ void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t S
    * Address==0 ("everything") case is left unfiltered on purpose: it is rare and the
    * clamped end would overflow. */
   bool MayHoldCode = true;
+  // ml1100: decided in the same shared-lock scope; see SkipEmptyRemove.
+  bool MayNeedRemove = true;
   if (Address && SkipEmptyInvalidate()) {
     TrackerLockScope Reentry;
     std::shared_lock Lock(IntervalsLock);
     MayHoldCode = XIntervals.Intersect({AlignedBase, AlignedBase + AlignedSize});
+    MayNeedRemove = MayHoldCode || RWXIntervals.Intersect({AlignedBase, AlignedBase + AlignedSize});
   }
 
   if (MayHoldCode) {
@@ -854,12 +901,15 @@ void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t S
   ReportInvalidationFilter();
 
   if (Free) {
-    {
+    if (MayNeedRemove || !SkipEmptyRemove()) {
       // ml760: remove under the lock, report after releasing it.
+      RemoveTaken.fetch_add(1, std::memory_order_relaxed);
       TrackerLockScope Reentry;
       std::unique_lock Lock(IntervalsLock);
       XIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
       RWXIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
+    } else {
+      RemoveSkipped.fetch_add(1, std::memory_order_relaxed);
     }
     // ml437 (#74): this fires on EVERY guest free/decommit (the ml201 probe is
     // unconditional) — ml436 logged 4,234 lines of ordinary heap decommit
