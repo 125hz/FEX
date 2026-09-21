@@ -1293,6 +1293,37 @@ void BTCpuProcessInit() {
                       CfgMultiblock() ? 1 : 0, CfgMaxInst(), CfgSMCChecks(), CfgX87Reduced() ? 1 : 0, CfgDisableL2() ? 1 : 0,
                       CfgDynamicL1() ? 1 : 0, CfgTSO() ? 1 : 0, CfgHalfBarrier() ? 1 : 0, CfgVectorTSO() ? 1 : 0,
                       CfgMemcpyTSO() ? 1 : 0, Overridden.empty() ? "none" : Overridden.c_str());
+
+    /* ml1050: TSOENABLED=0 IS THE LARGEST SINGLE KNOB IN THIS BUILD AND IT IS UNSAFE, SO IT SAYS SO.
+     *
+     * With TSO on, every guest GPR memory access becomes an acquire/release form (ldapr/stlr, plus
+     * a back-patch nop while HalfBarrierTSOEnabled is set) and cannot be folded into the guest
+     * window's addressing mode -- the acquire/release encodings have no register-offset form at
+     * all -- so it costs an extra `add` per access on top of the ordering instruction itself. The
+     * gameplay profile this was written against puts 96.3 % of JIT samples in blocks that contain
+     * TSO ops, at 0.48 TSO ops per memory op.
+     *
+     * With it off, x86's store ordering is no longer emulated on a machine that does not provide
+     * it. A guest that synchronises through plain loads and stores -- which is most lock-free code
+     * written for x86, including many job systems and most hand-rolled spin locks -- can then
+     * observe orderings x86 would never have produced. The failure is silent data corruption or a
+     * hang, not a clean crash, and it is timing dependent, so a session that looks fine proves
+     * nothing about the next one.
+     *
+     * It is deliberately NOT exposed as a default or as a per-title rule: this port ships no
+     * program-specific configuration. It is one line in Documents/madeira-fex.txt, and this is the
+     * line in the log that says a run took it. */
+    if (!CfgTSO()) {
+      LogMan::Msg::EFmt("[fex-cfg] ml1050 *** TSOEnabled=0: x86 store ordering is NOT being emulated. "
+                        "Faster, and UNSAFE for any multithreaded guest that synchronises through plain "
+                        "loads and stores -- expect silent corruption or a hang rather than a clean fault. "
+                        "Set by Documents/madeira-fex.txt; remove the line to restore correctness. ***");
+    }
+    if (!CfgHalfBarrier()) {
+      LogMan::Msg::EFmt("[fex-cfg] ml1050 HalfBarrierTSOEnabled=0: the 4-byte back-patch slot is gone from "
+                        "every TSO GPR access and unaligned atomics fall to the non-patching handler. Smaller "
+                        "and faster; a real ordering trade, not a free one.");
+    }
   }
 
   FEX_CONFIG_OPT(ProfileStats, PROFILESTATS);

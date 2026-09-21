@@ -21,6 +21,7 @@
 #endif
 
 #include <array>
+#include <cstdlib>   /* ml1050: getenv for FEX_X32_RECLAIM_CALLRET */
 #include <tuple>
 #include <utility>
 
@@ -306,6 +307,63 @@ namespace x32 {
     return std::array<ARMEmitter::Register, sizeof...(I)> {RA[I]...};
   }(std::make_index_sequence<RA.size() - 2> {});
 
+  // MADEIRA ml1050: x25 (REG_CALLRET_SP) IS A RESERVED REGISTER WITH NO READER, AND 32-BIT CODE IS
+  // SHORT OF REGISTERS.
+  //
+  // ml920 compiled the call-ret shadow stack out on this host (FEX_CALLRET_STACK_UNUSED, see
+  // Arm64Emitter.h): the pushes, the pops, the bounds guard, the dispatcher's opportunistic return
+  // and the spill/fill of REG_CALLRET_SP in Spill/FillStaticRegs are all gone, and under
+  // ARCHITECTURE_arm64 (which is what xtajit.dll is) the only remaining mentions of x25 are inside
+  // `#ifdef ARCHITECTURE_arm64ec` blocks where it is x17 instead. So on the WoW64 module x25 is
+  // written by nothing, read by nothing, and reserved out of both register pools.
+  //
+  // Meanwhile 32-bit mode allocates from 14 dynamic registers, and a guest window takes two of them
+  // (x19 and x24) leaving TWELVE for a workload that the profiler puts at 42 % of all CPU inside one
+  // 32-bit module. Returning x25 takes that to thirteen -- an 8 % larger pool, which is spills
+  // removed from the hottest code in the process.
+  //
+  // It is safe by the same three properties that made x19/x24 safe as reservations, read the other
+  // way round:
+  //  - x25 is AAPCS64 callee-saved, so it survives every host call the JIT makes and every
+  //    `preserve_all` call, and it is already saved and restored across the whole JIT entry by
+  //    PushCalleeSavedRegisters/PopCalleeSavedRegisters (they cover x19-x30). It therefore does NOT
+  //    belong in NotPreserved_Dynamic or PreserveAll_Dynamic, which is why neither list changes.
+  //  - it is appended past RAPairs (== 10), so pair allocation is untouched.
+  //  - nothing in the emitter names it outside the arm64ec paths.
+  //
+  // Both pools gain it: RA_CallRet is the no-window pool, RA_GuestBase_CallRet the windowed one.
+  // Runtime selectable (FEX_X32_RECLAIM_CALLRET=0) because it is a codegen change and a codegen
+  // change needs a way off that does not need a rebuild.
+  //
+  // Guarded on the same macro that removes the readers, and NOT merely on FEX_IOS_HOST: namespace
+  // x32 is compiled for ARM64EC as well, and there REG_CALLRET_SP is x17 -- which is already in
+  // x32::RA. Defining these pools there would hand the same register out twice.
+#ifdef FEX_CALLRET_STACK_UNUSED
+  constexpr auto RA_GuestBase_CallRet = []<size_t... I>(std::index_sequence<I...>) {
+    return std::array<ARMEmitter::Register, sizeof...(I) + 1> {RA[I]..., REG_CALLRET_SP.R()};
+  }(std::make_index_sequence<RA.size() - 2> {});
+
+  constexpr auto RA_CallRet = []<size_t... I>(std::index_sequence<I...>) {
+    return std::array<ARMEmitter::Register, sizeof...(I) + 3> {RA[I]..., REG_CALLRET_SP.R(), REG_GUEST_ADDR_TMP.R(),
+                                                               REG_GUEST_BASE.R()};
+  }(std::make_index_sequence<RA.size() - 2> {});
+
+  static_assert(RA_CallRet.size() == RA.size() + 1, "Reclaiming x25 must add exactly one register");
+  static_assert(RA_GuestBase_CallRet.size() == RA_GuestBase.size() + 1,
+                "Reclaiming x25 must add exactly one register to the windowed pool too");
+  // The reclaimed register must not already be in either pool, or it would be handed out twice.
+  static_assert(
+    []() {
+      for (auto Reg : RA) {
+        if (Reg == REG_CALLRET_SP.R()) {
+          return false;
+        }
+      }
+      return true;
+    }(),
+    "x25 is already in x32::RA -- reclaiming it would alias two IR values onto one register");
+#endif // FEX_CALLRET_STACK_UNUSED
+
   // The two dropped registers must be exactly REG_GUEST_ADDR_TMP and REG_GUEST_BASE, in that order.
   static_assert(RA[RA.size() - 2] == REG_GUEST_ADDR_TMP.R() && RA[RA.size() - 1] == REG_GUEST_BASE.R(),
                 "x32::RA's last two entries must be the guest-window registers, since RA_GuestBase "
@@ -461,8 +519,39 @@ Arm64Emitter::Arm64Emitter(FEXCore::Context::ContextImpl* ctx, void* EmissionPtr
     // MADEIRA: reserve REG_GUEST_BASE and REG_GUEST_ADDR_TMP out of the dynamic pool, but only when
     // a guest window is actually configured - with no window the full pool is used and codegen is
     // identical to upstream.
+#ifdef FEX_CALLRET_STACK_UNUSED
+    // MADEIRA ml1050: and give x25 back, since the shadow stack it was reserved for is compiled
+    // out on this host. See the RA_CallRet block in namespace x32 above. Read once: this runs in
+    // the emitter's constructor, which is per-thread, and the answer cannot change within a run.
+    //
+    // DEFAULT OFF, and that is a statement about EVIDENCE, not about confidence. This is a
+    // register-allocation change to the hottest code in the process and the rule in this tree is
+    // that codegen changes ship validated. The validation exists and is cheap -- FEX's own
+    // InstructionCountCI harness, which only EMITS and disassembles and therefore runs on an
+    // x86_64 host (FEX-host-build is already configured with ENABLE_X86_HOST_DEBUG and
+    // ENABLE_VIXL_DISASSEMBLER, and Bin/CodeSizeValidation is already built) -- but it needs
+    // `nasm` to assemble the test snippets, and nasm is not installed on the machine this was
+    // written on. Until a run of
+    //     cmake -S FEX-host-src -B FEX-host-build -DBUILD_TESTING=True \
+    //           -DCMAKE_CXX_FLAGS=-DFEX_IOS_HOST -DENABLE_VIXL_DISASSEMBLER=True \
+    //           -DENABLE_X86_HOST_DEBUG=True
+    //     cmake --build FEX-host-build --target CodeSizeValidation instcountci_test_files
+    //     FEX_GUEST32BASE=0x7c00000000 FEX_X32_RECLAIM_CALLRET=1 \
+    //       ./Bin/CodeSizeValidation .../MultiInst_TSO_32bit.json.instcountci
+    // shows the 32-bit expectations getting SHORTER (fewer spill/fill pairs) and never wrong,
+    // this is an opt-in.
+    static const bool ReclaimCallRetReg = [] {
+      const char* Env = getenv("FEX_X32_RECLAIM_CALLRET");
+      return Env && Env[0] != '0';
+    }();
+    GeneralRegisters = GuestBase ? (ReclaimCallRetReg ? std::span<const ARMEmitter::Register> {x32::RA_GuestBase_CallRet} :
+                                                        std::span<const ARMEmitter::Register> {x32::RA_GuestBase}) :
+                                   (ReclaimCallRetReg ? std::span<const ARMEmitter::Register> {x32::RA_CallRet} :
+                                                        std::span<const ARMEmitter::Register> {x32::RA});
+#else
     GeneralRegisters = GuestBase ? std::span<const ARMEmitter::Register> {x32::RA_GuestBase} :
                                    std::span<const ARMEmitter::Register> {x32::RA};
+#endif
     GeneralRegistersNotPreserved = x32::NotPreserved_Dynamic;
 
     StaticFPRegisters = x32::SRAFPR;
