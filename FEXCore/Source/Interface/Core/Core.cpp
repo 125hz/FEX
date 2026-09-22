@@ -1760,14 +1760,15 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
 
 #endif
 
-  /* iOS-Madeira: refuse to compile obviously-invalid guest RIPs. After a
-   * NULL-vtable virtual call (`call [rax+8]` with rax=0), control flow
-   * lands at RIP=0x8, which then loops compiling thousands of garbage
-   * blocks before SEH unwinds. Returning 0 here raises C0000005 to the
-   * guest immediately so the first AV is the only AV. */
+  // A null native return target loses the guest fault location and bypasses
+  // JIT exception reconstruction. Let the executable-range checked decoder
+  // emit its normal NoExecOp instead, just as for any other unmapped address.
   if (GuestRIP < 0x10000) {
-    LogMan::Msg::IFmt("[iOS] CompileBlock: REFUSING low/invalid RIP={:#x}", GuestRIP);
-    return 0;
+    const char* FaultPath = std::getenv("MADEIRA_LOW_RIP_FAULT");
+    if (FaultPath && FaultPath[0] == '0') return 0;
+    static std::atomic<uint32_t> LowRipReports {0};
+    if (LowRipReports.fetch_add(1, std::memory_order_relaxed) < 8)
+      LogMan::Msg::IFmt("[low-rip-fault] ml1160 checked guest decode rip={:#x}", GuestRIP);
   }
 
 #ifdef FEX_IOS_HOST
