@@ -255,6 +255,17 @@ public:
     // Keeping track not L1 misses, but specifically L2/L3 hits.
     ++L2L3CacheHits;
 
+#ifdef FEX_IOS_HOST
+    /* ml1059: this runs on EVERY L1 miss, and system_clock::now() is a call through a
+     * GetProcAddress'd kernelbase pointer. On iOS such a pointer names the image's
+     * non-executable backing, so each call is an exec fault -> Mach exception ->
+     * redirect to the pool copy: measured as the exception thread pinned at 32-54%
+     * CPU and the hottest guest threads stalling a kernel round trip per lookup miss
+     * (>= 1.38M redirects at this one pc in a 10-minute run). The heuristic only
+     * needs a coarse rate, so look at the clock once per 256 hits; the hit COUNT
+     * stays exact. */
+    if (L2L3CacheHits & 0xff) return;
+#endif
     const auto CurrentTime = std::chrono::system_clock::now();
     const auto Period = CurrentTime - LastPeriod;
     if (Period >= SamplePeriod) {
