@@ -16,6 +16,7 @@ $end_info$
 #ifdef FEX_IOS_HOST
 #include <atomic>
 #include <cstring>
+#include <cstdlib>
 #endif
 
 namespace FEXCore {
@@ -45,6 +46,20 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
   // lookup against an L1-only allocation. The [lookup-cache] line below prints
   // the mode actually chosen, so a mismatch is visible rather than silent.
   L2Enabled = !DisableL2Cache();
+#if defined(FEX_IOS_HOST) && defined(_WIN32)
+  // ml1180: MEM_DECOMMIT left the live lookup array readable only by accident:
+  // the iOS zero-fill workaround maps RW, but Wine records it as uncommitted.
+  // A DEP transition reapplies those records and turns the dispatcher tables
+  // into PROT_NONE. Recommit after every clear, before resuming translated code.
+  // This does not fault in the pages or memset them; physical storage remains
+  // demand allocated. Keep the native Unix madvise implementation unchanged.
+  const char* Recommit = std::getenv("FEX_LOOKUP_RECOMMIT");
+  RecommitOnClear = !Recommit || std::strcmp(Recommit, "0") != 0;
+  static std::atomic<bool> Reported {false};
+  if (!Reported.exchange(true, std::memory_order_relaxed)) {
+    LogMan::Msg::EFmt("[lookup-commit] ml1180 recommit-after-clear={} (FEX_LOOKUP_RECOMMIT=0 restores decommit-only)", RecommitOnClear);
+  }
+#endif
 
   const size_t L2TableSize = ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_PAGE_SIZE * 8;
   TotalCacheSize = L2TableSize + CODE_SIZE + MAX_L1_SIZE;
@@ -160,12 +175,9 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
    * the scan proved -- at zero footprint. ClearThreadLocalCaches() below already zeroes this
    * exact allocation exactly this way, so this is the same mechanism at construction time.
    *
-   * Recommit=true, unlike ClearThreadLocalCaches() below, which passes false. That call runs on
-   * a cache that is already live and stays live, so the pages demonstrably remain usable after a
-   * bare decommit on this host. This one runs at construction, where the two lines above went out
-   * of their way to MEM_COMMIT the range because "the auto-commit-on-access-violation path
-   * doesn't take effect cleanly on iOS". Re-committing costs one syscall once per cache and
-   * leaves the allocation in exactly the state the constructor promised. */
+   * ml1180: construction AND later clears must recommit on the Windows path.
+   * A bare decommit only stayed usable until Wine reapplied page protections;
+   * a DEP transition exposed that mismatch in the live dispatcher lookup. */
   FEXCore::Allocator::VirtualDontNeed(reinterpret_cast<void*>(AllocationBase), AllocationSize);
   LogMan::Msg::EFmt("[TI-IC] zero-by-decommit rev=ml900 base=0x{:x} size=0x{:x} l2={} "
                     "(was a full-range read scan, which materialised every page on Darwin)",
@@ -198,7 +210,7 @@ void LookupCache::ClearL2Cache(const FEXCore::LookupCacheBaseLockToken& lk) {
   // Clear out the page memory
   // PagePointer and PageMemory are sequential with each other. Clear both at once.
   FEXCore::Allocator::VirtualDontNeed(reinterpret_cast<void*>(PagePointer),
-                                      ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_PAGE_SIZE * 8 + CODE_SIZE, false);
+                                      ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_PAGE_SIZE * 8 + CODE_SIZE, RecommitOnClear);
   AllocateOffset = 0;
 }
 
@@ -206,7 +218,7 @@ void LookupCache::ClearThreadLocalCaches(const LookupCacheWriteLockToken&) {
   // TODO: Preserve code cache entries?
   // ml606: clear exactly what is mapped. In L1-only mode that is the L1 array
   // alone; using TotalCacheSize here would decommit 48MB we never allocated.
-  FEXCore::Allocator::VirtualDontNeed(reinterpret_cast<void*>(AllocationBase), AllocationSize, false);
+  FEXCore::Allocator::VirtualDontNeed(reinterpret_cast<void*>(AllocationBase), AllocationSize, RecommitOnClear);
 
   // TODO: Rename this member to avoid confusion with code caching
   CachedCodePages.clear();

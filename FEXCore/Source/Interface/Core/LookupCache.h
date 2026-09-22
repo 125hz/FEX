@@ -313,7 +313,7 @@ public:
           // Madvise the entries that we are dropping. Gives the memory back to the OS.
           LookupCacheEntry* FirstZeroL1Entry = &reinterpret_cast<LookupCacheEntry*>(L1Pointer)[CurrentL1Entries];
           size_t ZeroMemorySize = (MAX_L1_ENTRIES - CurrentL1Entries) * sizeof(LookupCacheEntry);
-          FEXCore::Allocator::VirtualDontNeed(FirstZeroL1Entry, ZeroMemorySize, false);
+          FEXCore::Allocator::VirtualDontNeed(FirstZeroL1Entry, ZeroMemorySize, RecommitOnClear);
 
           // Update the thread's L1 pointer mask to increase how much cache it uses.
           // Since we're in C-code, this is safe to update here.
@@ -563,6 +563,9 @@ private:
   // destructor and the clear paths stay correct in both layouts rather than
   // operating on PagePointer/TotalCacheSize which only describe the full one.
   bool L2Enabled;
+  // iOS eagerly commits lookup storage: keep Wine's page state consistent
+  // after a discard, including the inactive tail of a dynamic L1 cache.
+  bool RecommitOnClear {false};
   uintptr_t AllocationBase;
   size_t AllocationSize;
 
