@@ -50,6 +50,7 @@ $end_info$
 #include "Windows/Common/SHMStats.h"
 
 #include <cstdint>
+#include <cstdlib> // MADEIRA ml1430: getenv for MADEIRA_WOW_SYSCALL_SWEEP
 #include <type_traits>
 #include <atomic>
 #include <chrono> // MADEIRA: the ~10 s wall clock behind the periodic [dep-off] summary
@@ -254,6 +255,16 @@ struct TLS {
 
 struct FrontendThreadData {
   bool InLockedRWXRead {};
+  // MADEIRA ml1430: syscall parking for the code-buffer sweeper (see IosWowSyscallC).
+  // IosInSim is the sweeper's per-thread "may be executing emitted code" byte; it is 0
+  // only while the thread is blocked in an outermost-level syscall whose return can be
+  // redirected. IosMigrated is set by the sweeper when it moves the thread to a newer
+  // generation; IosSyscallArmed/IosSyscallDepth are owner-only.
+  volatile uint8_t IosInSim {1};
+  volatile uint8_t IosMigrated {0};
+  bool IosSyscallArmed {};
+  bool IosSweepRegistered {};
+  uint32_t IosSyscallDepth {};
 };
 
 class WowSyscallHandler;
@@ -387,6 +398,68 @@ TLS GetTLS() {
 
 FrontendThreadData* GetFrontendThreadData(FEXCore::Core::InternalThreadState* Thread) {
   return static_cast<FrontendThreadData*>(Thread->FrontendPtr);
+}
+
+/* MADEIRA ml1430: WOW64 SYSCALL PARKING FOR THE CODE-BUFFER SWEEPER.
+ *
+ * The emitted code of every process shares one code buffer that is replaced by a new
+ * generation when it fills; an old generation is freed only when no thread references it.
+ * The ml460 sweeper moves parked threads to the newest generation, but only the ARM64EC
+ * frontend ever registered threads with it: there, a syscall leaves emitted code
+ * (InSimulation=0). Here a syscall is a call OUT of an emitted block (BranchOps.cpp
+ * DEF_OP(Syscall)), so a thread waiting in a syscall has a return address into its
+ * generation on the stack and could never be moved. Device log: the Windows Steam client's
+ * 32-bit browser processes (hundreds of mostly waiting threads) kept 30 generations live,
+ * 720 MB of the 896 MB pool, until code allocation failed and a thread died at the
+ * out-of-pool fault.
+ *
+ * What the block does after the handler returns is fixed for these syscalls: the bridge
+ * instructions end their block, and the tail spills nothing new: it restores SP, refills
+ * every static register, clears InSyscallInfo, pops the dynamic registers and exits to the
+ * dispatcher at the RIP the handler wrote (OpcodeDispatcher.cpp SyscallOp, OS_GENERIC:
+ * no result register). The dispatcher's LoopTopFillSRA entry does exactly that from the
+ * dispatcher's own stack pointer. So a thread that is moved while blocked resumes there
+ * instead of in its old block, and its old generation can go.
+ *
+ * Only the outermost syscall of a simulation is ever parked: a callback that re-enters
+ * simulation from inside a syscall sets IosInSim=1 again (BTCpuSimulateImpl), and nested
+ * syscalls are never parked, so no emitted frame other than the one being redirected can
+ * be below a moved thread. MADEIRA_WOW_SYSCALL_SWEEP=0 disables all of it. */
+extern "C" void IosSweepRegisterThreadEx(FEXCore::Core::InternalThreadState* Thread, volatile uint8_t* InSimPtr,
+                                         volatile uint8_t* MigratedPtr);
+extern "C" void IosSweepUnregisterThread(FEXCore::Core::InternalThreadState* Thread);
+extern "C" uint64_t IosCodeBufferSweepGate;
+
+static bool IosWowSweepEnabled() {
+  static std::atomic<int8_t> Cached {-1};
+  int8_t V = Cached.load(std::memory_order_relaxed);
+  if (V < 0) {
+    const char* E = getenv("MADEIRA_WOW_SYSCALL_SWEEP");
+    V = (E && E[0] == '0') ? 0 : 1;
+    Cached.store(V, std::memory_order_relaxed);
+    LogMan::Msg::EFmt("[wow-sweep] ml1430 syscall parking {} (MADEIRA_WOW_SYSCALL_SWEEP=0 disables)", V ? "on" : "off");
+  }
+  return V != 0;
+}
+
+// Leaving emitted code for a blocking call: the sweeper may now move this thread.
+static void IosWowPark(FrontendThreadData* TD) {
+  if (TD && TD->IosSyscallArmed) {
+    __atomic_store_n(&TD->IosInSim, 0, __ATOMIC_RELEASE);
+  }
+}
+
+// Back from the call: publish "in simulation" before looking at the gate (Dekker pair with
+// IosMaybeSweepCodeBuffers), then wait out any sweep, so IosMigrated is final when read.
+static void IosWowUnpark(FrontendThreadData* TD) {
+  if (!TD || TD->IosInSim) {
+    return;
+  }
+  __atomic_store_n(&TD->IosInSim, 1, __ATOMIC_RELAXED);
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  while (__atomic_load_n(&IosCodeBufferSweepGate, __ATOMIC_ACQUIRE)) {
+    __asm volatile("yield");
+  }
 }
 
 // Returns the HOST address of the 32-bit TEB paired with the given 64-bit TEB.
@@ -761,7 +834,10 @@ public:
       // inside that parameter block is still a guest address and must be converted by the unixlib
       // thunk that owns the struct layout, exactly as wow64.dll's `*_32to64` helpers do for
       // syscalls. FEX cannot do it - it does not know the layout.
+      auto* TD = GetFrontendThreadData(TLS.ThreadState());
+      IosWowPark(TD); // ml1430
       ReturnRAX = static_cast<uint64_t>(WineUnixCall(StackArgs->Handle, StackArgs->ID, GuestWindow::ToHostPtr(StackArgs->Args)));
+      IosWowUnpark(TD);
       Context::LockJITContext(TLS);
     } else if (Frame->State.rip == (uint64_t)BridgeInstrs::Syscall) {
       const uint64_t EntryRAX = Frame->State.gregs[FEXCore::X86State::REG_RAX];
@@ -772,8 +848,11 @@ public:
       // wow64.dll reads the argument block directly, so it needs a host pointer. The 32-bit values
       // *inside* the block stay guest and are converted by wow64.dll's own get_ptr/*_32to64
       // helpers, which the design makes window-aware.
+      auto* TD = GetFrontendThreadData(TLS.ThreadState());
+      IosWowPark(TD); // ml1430
       ReturnRAX = static_cast<uint64_t>(
         Wow64SystemServiceEx(static_cast<UINT>(EntryRAX), reinterpret_cast<UINT*>(GuestWindow::ToHost(ReturnRSP + 4))));
+      IosWowUnpark(TD);
       Context::LockJITContext(TLS);
     }
     // If a new context has been set, use it directly and don't return to the syscall caller
@@ -900,6 +979,82 @@ public:
                       Stats.Regions, Stats.Bytes >> 10, Stats.Declined);
   }
 };
+
+/* MADEIRA ml1430: the syscall entry emitted blocks call (Pointers.SyscallHandlerFunc, set
+ * per thread in BTCpuThreadInit). IosWowSyscallC arms parking for an outermost-level syscall
+ * and, when the sweeper moved the thread while it was blocked, answers where to resume: the
+ * dispatcher's stack pointer and LoopTopFillSRA. See the ml1430 comment at IosWowPark. */
+struct IosSyscallResume {
+  uint64_t NewSP;  // 0: return into the calling block as usual
+  uint64_t Target; // DispatcherLoopTopFillSRA when NewSP != 0
+};
+
+extern "C" IosSyscallResume IosWowSyscallC(FEXCore::HLE::SyscallHandler* Obj, FEXCore::Core::CpuStateFrame* Frame,
+                                           FEXCore::HLE::SyscallArguments* Args, uint64_t CallerSP) {
+  static std::atomic<uint32_t> Redirects {0}, Declined {0};
+  const auto TLS = GetTLS();
+  auto* TD = GetFrontendThreadData(TLS.ThreadState());
+  const uint32_t Depth = TD->IosSyscallDepth++;
+  const bool PrevArmed = TD->IosSyscallArmed;
+  // The dispatcher's stack pointer, as its entry stored it. A callback that re-entered
+  // simulation and was left by a long jump leaves a deeper (lower) value behind; the calling
+  // block sits a few hundred bytes below the real one. Anything else is not trusted.
+  const uint64_t DispatcherSP = Frame->ReturningStackLocation;
+  const uint64_t ResumeAt = Frame->Pointers.DispatcherLoopTopFillSRA;
+  bool Arm = TD->IosSweepRegistered && Depth == 0 && ResumeAt != 0;
+  if (Arm && (DispatcherSP < CallerSP || DispatcherSP - CallerSP > 0x2000 || (DispatcherSP & 15))) {
+    Arm = false;
+    if (Declined.fetch_add(1, std::memory_order_relaxed) < 4) {
+      LogMan::Msg::EFmt("[wow-sweep] ml1430 not parked: dispatcher sp {:#x} caller sp {:#x}", DispatcherSP, CallerSP);
+    }
+  }
+  TD->IosSyscallArmed = Arm;
+  if (Arm) {
+    TD->IosMigrated = 0;
+  }
+
+  Obj->HandleSyscall(Frame, Args);
+
+  TD->IosSyscallArmed = PrevArmed;
+  TD->IosSyscallDepth = Depth;
+  if (Arm && TD->IosMigrated) {
+    TD->IosMigrated = 0;
+    Frame->ReturningStackLocation = DispatcherSP;
+    Frame->InSyscallInfo = 0;
+    const uint32_t N = Redirects.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (N <= 8 || (N & 1023) == 0) {
+      LogMan::Msg::EFmt("[wow-sweep] ml1430 resumed #{} at the dispatcher after a move while blocked (rip {:#x})", N,
+                        Frame->State.rip);
+    }
+    return {DispatcherSP, ResumeAt};
+  }
+  return {0, 0};
+}
+
+// Same arguments as SyscallHandler::HandleSyscall (x0 handler, x1 frame, x2 args) plus the
+// caller's SP. Normal case: return into the block (x0, the ignored OS_GENERIC result, is 0).
+// Moved case: the callee-saved registers the block relies on (STATE in x28, PF/AF, the static
+// registers) are already restored by IosWowSyscallC's epilogue; switch to the dispatcher's
+// stack, clear the single-instruction entry flag (TMP2 = x1) and enter LoopTopFillSRA, which
+// refills the static registers and dispatches at State.rip.
+extern "C" __attribute__((naked)) void IosWowSyscallEntry() {
+  asm(".seh_proc IosWowSyscallEntry;"
+      "mov x3, sp;"
+      ".seh_nop;"
+      "stp x29, x30, [sp, #-16]!;"
+      ".seh_save_fplr_x 16;"
+      ".seh_endprologue;"
+      "bl IosWowSyscallC;"
+      "ldp x29, x30, [sp], #16;"
+      "cbnz x0, 1f;"
+      "ret;"
+      "1:;"
+      "mov sp, x0;"
+      "mov x16, x1;"
+      "mov x1, #0;"
+      "br x16;"
+      ".seh_endproc;");
+}
 
 void BTCpuProcessInit() {
   FEX::Windows::InitCRTProcess();
@@ -1384,6 +1539,15 @@ void BTCpuThreadInit() {
 
   Thread->FrontendPtr = new FrontendThreadData();
 
+  // MADEIRA ml1430: route this thread's syscalls through the parking entry and let the
+  // code-buffer sweeper see it (see IosWowPark).
+  if (IosWowSweepEnabled()) {
+    auto* TD = GetFrontendThreadData(Thread);
+    Thread->CurrentFrame->Pointers.SyscallHandlerFunc = reinterpret_cast<uint64_t>(&IosWowSyscallEntry);
+    IosSweepRegisterThreadEx(Thread, &TD->IosInSim, &TD->IosMigrated);
+    TD->IosSweepRegistered = true;
+  }
+
   auto ThreadTID = GetCurrentThreadId();
   Threads.emplace(ThreadTID, Thread);
   if (StatAllocHandler) {
@@ -1430,6 +1594,11 @@ void BTCpuThreadTerm(HANDLE Thread, LONG ExitCode) {
   }
   auto ThreadState = TLS.ThreadState();
 
+  // MADEIRA ml1430: the sweeper's registry points into the frontend data; leave it (and
+  // wait out any sweep in flight) before that is freed. No locks are held here.
+  if (GetFrontendThreadData(ThreadState)->IosSweepRegistered) {
+    IosSweepUnregisterThread(ThreadState);
+  }
   delete GetFrontendThreadData(ThreadState);
 
   // GDT and LDT are mirrored, only free one.
@@ -1583,6 +1752,9 @@ __attribute__((naked)) void BTCpuSimulate() {
 
 extern "C" void BTCpuSimulateImpl(CONTEXT* entry_context) {
   const auto TLS = GetTLS();
+  // MADEIRA ml1430: a callback can re-enter simulation from inside a parked syscall; it runs
+  // emitted code, so the sweeper must see it as in-simulation again (and any sweep finish).
+  IosWowUnpark(GetFrontendThreadData(TLS.ThreadState()));
   TLS.EntryContext() = entry_context;
   TLS.CachedCallRetSp() = TLS.ThreadState()->CurrentFrame->State.callret_sp;
 

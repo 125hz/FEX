@@ -920,6 +920,10 @@ namespace CPU {
     struct IosSweepSlot {
       FEXCore::Core::InternalThreadState* Thread;
       volatile uint8_t* InSim;
+      // ml1430: optional; set to 1 when the sweeper migrates this thread. The WOW64
+      // frontend parks threads inside a syscall whose return address points into the
+      // generation being dropped, and must know to resume at the dispatcher instead.
+      volatile uint8_t* Migrated;
     };
     constexpr size_t IosSweepSlotMax = 512;
     IosSweepSlot IosSweepSlots[IosSweepSlotMax];
@@ -934,11 +938,12 @@ namespace CPU {
     }
   } // namespace
 
-  extern "C" void IosSweepRegisterThread(FEXCore::Core::InternalThreadState* Thread, volatile uint8_t* InSimPtr) {
+  extern "C" void IosSweepRegisterThreadEx(FEXCore::Core::InternalThreadState* Thread, volatile uint8_t* InSimPtr,
+                                           volatile uint8_t* MigratedPtr) {
     std::scoped_lock lk {IosSweepRegistryLock()};
     for (size_t i = 0; i < IosSweepSlotMax; i++) {
       if (!IosSweepSlots[i].Thread) {
-        IosSweepSlots[i] = {Thread, InSimPtr};
+        IosSweepSlots[i] = {Thread, InSimPtr, MigratedPtr};
         if (i + 1 > IosSweepSlotHighWater) {
           IosSweepSlotHighWater = i + 1;
         }
@@ -946,6 +951,10 @@ namespace CPU {
       }
     }
     LogMan::Msg::EFmt("[gen-sweep] registry FULL — thread unswept rev=ml460");
+  }
+
+  extern "C" void IosSweepRegisterThread(FEXCore::Core::InternalThreadState* Thread, volatile uint8_t* InSimPtr) {
+    IosSweepRegisterThreadEx(Thread, InSimPtr, nullptr);
   }
 
   extern "C" void IosSweepUnregisterThread(FEXCore::Core::InternalThreadState* Thread) {
@@ -996,7 +1005,14 @@ namespace CPU {
         continue;
       }
       switch (Snap[i].Thread->CPUBackend->IosRemoteMigrateStale(Latest)) {
-      case 1: Migrated++; break;
+      case 1:
+        Migrated++;
+        // Written while the gate is still set: the owner reads it only after
+        // its own gate spin, so it observes the flag before it can return.
+        if (Snap[i].Migrated) {
+          *Snap[i].Migrated = 1;
+        }
+        break;
       case -1: SigPinSkip++; break;
       case -2: Raced++; break;
       default: break;
