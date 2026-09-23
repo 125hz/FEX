@@ -94,6 +94,17 @@ extern "C" uint32_t IosTebTsdOffset;
  * lld generates for the neighbouring word ("misaligned ldr/str offset"). */
 static uint32_t IosTebTsdImportFound = 0;
 uint64_t IosFfsBypassLog[4] {};
+/* ml1131: transition probe, written by Module.S and read by wine's ntdll-unix
+ * sampler through this DATA export (libarm64ecfex.def). Layout in bytes:
+ *   0     magic 'MADXPFEX' (set in ProcessInit)
+ *   64    x64->EC calls, 16 shards x 64 bytes (shard = bits 16..19 of sp), LSE add
+ *   1088  FPCR writes actually performed in ExitFunctionEC, 16 shards
+ *   2112  EC->x64 calls through ExitToX64 (not the FFS bypass), 16 shards
+ *   3136  ring index (every 64th x64->EC call of a shard appends its target)
+ *   3200  ring[4096] of target addresses (as the x64 caller called them)
+ * Keep in sync with Module.S and build/ntdll-unix/server_ios.c (ios_xp_fex_*). */
+extern "C" __attribute__((aligned(64))) uint64_t IosXpFex[4496];
+__attribute__((aligned(64))) uint64_t IosXpFex[4496] {};
 #endif // FEX_IOS_HOST
 
 namespace Exception {
@@ -874,6 +885,7 @@ NTSTATUS ProcessInit() {
     if (!IosTebTsdOffset) {
       return STATUS_UNSUCCESSFUL;
     }
+    IosXpFex[0] = 0x5845465058444d41ull;   /* ml1131 'AMDXPFEX' little-endian magic */
   }
 #endif
 

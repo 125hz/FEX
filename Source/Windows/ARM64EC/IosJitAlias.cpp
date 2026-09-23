@@ -41,6 +41,14 @@ constexpr int kMaxEntries = 256;
 extern "C" {
 IosAliasEntry IosAliasEntries[kMaxEntries];
 volatile int IosAliasCount = 0;
+/* ml1116: the entry that satisfied the last translation, checked first by
+ * Module.S before the walk. A pointer (one atomic 8-byte store) rather than a
+ * copy of the fields, so a reader can never see a torn entry; a retired entry
+ * has Size 0 and simply misses. The walk itself now runs NEWEST-FIRST: the
+ * images the game calls (its own EC ntdll/kernel32/kernelbase, the D3D12
+ * runtime) are registered late, so oldest-first cost ~150 iterations per
+ * x64->EC call at up to a million calls a second. */
+IosAliasEntry* volatile IosAliasLast = nullptr;
 }
 
 namespace {
