@@ -1056,6 +1056,86 @@ extern "C" __attribute__((naked)) void IosWowSyscallEntry() {
       ".seh_endproc;");
 }
 
+/* MADEIRA ml1470: STRICTER ORDERING FOR CHROMIUM-BASED PROCESSES.
+ *
+ * Chromium hosts (CEF browsers embedded in launchers and clients) are heavily multi-threaded and
+ * pass messages between threads and processes through shared memory. Other FEX front ends that
+ * run these hosts reliably use a stricter profile for them: single-block compilation
+ * (Multiblock=0) and x86 ordering for vector loads and stores as well as GPR accesses
+ * (VectorTSOEnabled=1, HalfBarrierTSOEnabled=1). Madeira's default leaves vector accesses
+ * unordered, which is fine for games and wrong for a producer that publishes a message with a
+ * vector store.
+ *
+ * Selection is by what the process is, never by its name: a Chromium host has libcef.dll or
+ * chrome_elf.dll next to its executable. A front end that launches a known client can also list
+ * executable base names in MADEIRA_ORDERED_PROFILE_EXES (separated by ';' or ','), so the client
+ * that talks to the Chromium host gets the same ordering without it applying to the games it
+ * starts (the front end uses MADEIRA_ORDERED_PROFILE_CLIENT for that). An option the user set (madeira-fex.txt / FEX_<NAME>) is never replaced.
+ * MADEIRA_ORDERED_PROFILE=0 turns all of this off. */
+static bool IosFileExists(const fextl::string& Path) {
+  UNICODE_STRING PathW;
+  if (!RtlCreateUnicodeStringFromAsciiz(&PathW, Path.c_str())) {
+    return false;
+  }
+  UNICODE_STRING NtPath;
+  const bool Converted = RtlDosPathNameToNtPathName_U(PathW.Buffer, &NtPath, nullptr, nullptr);
+  RtlFreeUnicodeString(&PathW);
+  if (!Converted) {
+    return false;
+  }
+  OBJECT_ATTRIBUTES Attributes;
+  InitializeObjectAttributes(&Attributes, &NtPath, OBJ_CASE_INSENSITIVE, nullptr, nullptr);
+  FILE_BASIC_INFORMATION Info;
+  const bool Found = !NtQueryAttributesFile(&Attributes, &Info);
+  RtlFreeUnicodeString(&NtPath);
+  return Found;
+}
+
+static bool IosNameListed(std::string_view List, std::string_view Name) {
+  const auto Lower = [](char C) { return (C >= 'A' && C <= 'Z') ? static_cast<char>(C - 'A' + 'a') : C; };
+  while (!List.empty()) {
+    const size_t End = List.find_first_of(";,");
+    std::string_view Item = List.substr(0, End);
+    List = End == std::string_view::npos ? std::string_view {} : List.substr(End + 1);
+    while (!Item.empty() && Item.front() == ' ') {
+      Item.remove_prefix(1);
+    }
+    while (!Item.empty() && Item.back() == ' ') {
+      Item.remove_suffix(1);
+    }
+    if (Item.empty() || Item.size() != Name.size()) {
+      continue;
+    }
+    bool Same = true;
+    for (size_t i = 0; i < Item.size() && Same; ++i) {
+      Same = Lower(Item[i]) == Lower(Name[i]);
+    }
+    if (Same) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Returns why this process gets the profile, or nullptr.
+static const char* IosOrderedProfileReason(const fextl::string& ExePath, std::string_view ExeName) {
+  const size_t Slash = ExePath.find_last_of('\\');
+  if (Slash != fextl::string::npos) {
+    const fextl::string Dir = ExePath.substr(0, Slash + 1);
+    if (IosFileExists(Dir + "libcef.dll") || IosFileExists(Dir + "chrome_elf.dll")) {
+      return "chromium-host";
+    }
+  }
+  // _EXES is the user's list; _CLIENT is set by the front end for the client it launches.
+  for (const char* Var : {"MADEIRA_ORDERED_PROFILE_EXES", "MADEIRA_ORDERED_PROFILE_CLIENT"}) {
+    const char* Listed = getenv(Var);
+    if (Listed && IosNameListed(Listed, ExeName)) {
+      return "listed";
+    }
+  }
+  return nullptr;
+}
+
 void BTCpuProcessInit() {
   FEX::Windows::InitCRTProcess();
 
@@ -1089,7 +1169,10 @@ void BTCpuProcessInit() {
   }
 #endif
 
-  const auto ExecutableName = FEX::Windows::BaseName(FEX::Windows::GetExecutableFilePath());
+  // MADEIRA ml1470: keep the path alive; BaseName returns a view into it (the view used to point
+  // into a temporary that was already freed).
+  const fextl::string ExecutablePath = FEX::Windows::GetExecutableFilePath();
+  const auto ExecutableName = FEX::Windows::BaseName(ExecutablePath);
   FEX::Config::LoadConfig(fextl::string {ExecutableName}, _environ, FEX::ReadPortabilityInformation());
   FEXCore::Config::ReloadMetaLayer();
   FEX::Windows::Logging::Init();
@@ -1122,6 +1205,38 @@ void BTCpuProcessInit() {
   const bool MadeiraX87DefaultApplied = !FEXCore::Config::Exists(FEXCore::Config::CONFIG_X87REDUCEDPRECISION);
   if (MadeiraX87DefaultApplied) {
     FEXCore::Config::Set(FEXCore::Config::CONFIG_X87REDUCEDPRECISION, "1");
+  }
+
+  // ml1470: see IosOrderedProfileReason. Applied before CreateNewContext reads the options.
+  fextl::string MadeiraOrderedApplied;
+  {
+    const char* Switch = getenv("MADEIRA_ORDERED_PROFILE");
+    const char* Reason = (Switch && Switch[0] == '0') ? nullptr : IosOrderedProfileReason(ExecutablePath, ExecutableName);
+    if (Reason) {
+      static constexpr struct {
+        FEXCore::Config::ConfigOption Option;
+        const char* Name;
+        const char* Value;
+      } Profile[] = {
+        {FEXCore::Config::ConfigOption::CONFIG_MULTIBLOCK, "Multiblock", "0"},
+        {FEXCore::Config::ConfigOption::CONFIG_VECTORTSOENABLED, "VectorTSOEnabled", "1"},
+        {FEXCore::Config::ConfigOption::CONFIG_HALFBARRIERTSOENABLED, "HalfBarrierTSOEnabled", "1"},
+      };
+      fextl::string Kept;
+      for (const auto& Entry : Profile) {
+        fextl::string& Into = FEXCore::Config::Exists(Entry.Option) ? Kept : MadeiraOrderedApplied;
+        Into += Into.empty() ? "" : ",";
+        Into += Entry.Name;
+        if (&Into == &MadeiraOrderedApplied) {
+          FEXCore::Config::Set(Entry.Option, Entry.Value);
+        }
+      }
+      LogMan::Msg::EFmt("[ordered-profile] ml1470 {} reason={} applied=[{}] user-set=[{}] (MADEIRA_ORDERED_PROFILE=0 disables)",
+                        ExecutableName, Reason, MadeiraOrderedApplied.empty() ? "none" : MadeiraOrderedApplied.c_str(),
+                        Kept.empty() ? "none" : Kept.c_str());
+    } else if (Switch && Switch[0] == '0') {
+      LogMan::Msg::EFmt("[ordered-profile] ml1470 {} off (MADEIRA_ORDERED_PROFILE=0)", ExecutableName);
+    }
   }
 
   // MADEIRA: pick up the guest window before anything else touches a guest address, and in
@@ -1429,6 +1544,10 @@ void BTCpuProcessInit() {
       if (Entry.Option == FEXCore::Config::ConfigOption::CONFIG_X87REDUCEDPRECISION && MadeiraX87DefaultApplied) {
         continue;
       }
+      // ml1470: likewise for the ordered profile's own settings.
+      if (IosNameListed(MadeiraOrderedApplied, Entry.Name)) {
+        continue;
+      }
       if (FEXCore::Config::Exists(Entry.Option)) {
         if (!Overridden.empty()) {
           Overridden += ",";
@@ -1439,6 +1558,10 @@ void BTCpuProcessInit() {
     if (MadeiraX87DefaultApplied) {
       Overridden += Overridden.empty() ? "" : ",";
       Overridden += "X87ReducedPrecision(madeira-32bit-default)";
+    }
+    if (!MadeiraOrderedApplied.empty()) {
+      Overridden += Overridden.empty() ? "" : ",";
+      Overridden += MadeiraOrderedApplied + "(ordered-profile)";
     }
 
     LogMan::Msg::EFmt("[fex-cfg] rev=ml900 bitness=32 Multiblock={} MaxInst={} SMCChecks={} X87ReducedPrecision={} "
