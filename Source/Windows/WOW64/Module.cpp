@@ -2247,3 +2247,16 @@ BOOLEAN WINAPI BTCpuIsProcessorFeaturePresent(UINT Feature) {
 void BTCpuUpdateProcessorInformation(SYSTEM_CPU_INFORMATION* Info) {
   CPUFeatures->UpdateInformation(Info);
 }
+
+/* MADEIRA (upstream merge 2026-09-23): FEXCore's Frontend and OpcodeDispatcher
+ * now call the ARM64EC module's sub-floor window lookups (upstream ml951/ml1057,
+ * ARM64EC/IosJitAlias.cpp), which the WOW64 module does not link. A 32-bit guest
+ * lives entirely inside its own 4 GB window and never has a PE image mapped below
+ * the 4 GB floor, so here there is no window: addresses map to themselves and no
+ * code belongs to one. */
+extern "C" uint64_t IosSubfloorToReal(uint64_t Addr) {
+  return Addr;
+}
+extern "C" int IosSubfloorWindowForCode(uint64_t, uint64_t*, uint64_t*, uint64_t*) {
+  return 0;
+}
