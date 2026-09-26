@@ -16,6 +16,7 @@ $end_info$
 #ifdef FEX_IOS_HOST
 #include <atomic>
 #include <cstring>
+#include <cstdlib>
 #endif
 
 namespace FEXCore {
@@ -45,6 +46,20 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
   // lookup against an L1-only allocation. The [lookup-cache] line below prints
   // the mode actually chosen, so a mismatch is visible rather than silent.
   L2Enabled = !DisableL2Cache();
+#if defined(FEX_IOS_HOST) && defined(_WIN32)
+  // ml1180: MEM_DECOMMIT left the live lookup array readable only by accident:
+  // the iOS zero-fill workaround maps RW, but Wine records it as uncommitted.
+  // A DEP transition reapplies those records and turns the dispatcher tables
+  // into PROT_NONE. Recommit after every clear, before resuming translated code.
+  // This does not fault in the pages or memset them; physical storage remains
+  // demand allocated. Keep the native Unix madvise implementation unchanged.
+  const char* Recommit = std::getenv("FEX_LOOKUP_RECOMMIT");
+  RecommitOnClear = !Recommit || std::strcmp(Recommit, "0") != 0;
+  static std::atomic<bool> Reported {false};
+  if (!Reported.exchange(true, std::memory_order_relaxed)) {
+    LogMan::Msg::EFmt("[lookup-commit] ml1180 recommit-after-clear={} (FEX_LOOKUP_RECOMMIT=0 restores decommit-only)", RecommitOnClear);
+  }
+#endif
 
   const size_t L2TableSize = ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_PAGE_SIZE * 8;
   TotalCacheSize = L2TableSize + CODE_SIZE + MAX_L1_SIZE;
@@ -144,10 +159,29 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
    * guest thread — ~1.3GB at 40 threads (ml361 [phys-map]), against a 4096MB
    * jetsam limit. ZeroScrub verifies by read (untouched anon pages map the
    * shared zero page, no footprint) and memsets only stale pages. The stale
-   * counts double as the probe for whether the hazard still exists at all. */
-  size_t StaleL2 = L2Enabled ? FEXCore::Allocator::ZeroScrub(reinterpret_cast<void*>(PageMemory), L2TableSize) : 0;
-  size_t StaleL1 = FEXCore::Allocator::ZeroScrub(reinterpret_cast<void*>(L1Pointer), MAX_L1_SIZE);
-  LogMan::Msg::EFmt("[TI-IC] zero-scrub rev=ml606 l2-stale=0x{:x} l1-stale=0x{:x}", StaleL2, StaleL1);
+   * counts double as the probe for whether the hazard still exists at all.
+   *
+   * ml900: THE READ SCAN COSTS EXACTLY WHAT THE MEMSET COST. "Untouched anon pages map the
+   * shared zero page" is a Linux fact; on Darwin a read fault on an absent page of an
+   * internal VM object allocates a real zero-filled page into the object, and internal pages
+   * are charged to phys_footprint written or not. So scanning 2MB of L1 per cache
+   * materialised 2MB per cache -- [lookup-cache] reported fleet_live=50MB at 25 live caches
+   * in madeira-log 26, all of it created by this scan rather than by use.
+   *
+   * Hand the pages back instead of touching them: VirtualDontNeed() is MEM_DECOMMIT +
+   * MEM_COMMIT and wine's decommit_pages() answers it with anon_mmap_fixed(), which drops
+   * the physical pages and reinstalls zero-fill-on-demand ([decommit-zero] branch=
+   * "mmap-over (zero)"). That guarantees the WHOLE range reads zero -- strictly more than
+   * the scan proved -- at zero footprint. ClearThreadLocalCaches() below already zeroes this
+   * exact allocation exactly this way, so this is the same mechanism at construction time.
+   *
+   * ml1180: construction AND later clears must recommit on the Windows path.
+   * A bare decommit only stayed usable until Wine reapplied page protections;
+   * a DEP transition exposed that mismatch in the live dispatcher lookup. */
+  FEXCore::Allocator::VirtualDontNeed(reinterpret_cast<void*>(AllocationBase), AllocationSize);
+  LogMan::Msg::EFmt("[TI-IC] zero-by-decommit rev=ml900 base=0x{:x} size=0x{:x} l2={} "
+                    "(was a full-range read scan, which materialised every page on Darwin)",
+                    AllocationBase, AllocationSize, L2Enabled ? 1 : 0);
 #endif
 }
 
@@ -176,7 +210,7 @@ void LookupCache::ClearL2Cache(const FEXCore::LookupCacheBaseLockToken& lk) {
   // Clear out the page memory
   // PagePointer and PageMemory are sequential with each other. Clear both at once.
   FEXCore::Allocator::VirtualDontNeed(reinterpret_cast<void*>(PagePointer),
-                                      ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_PAGE_SIZE * 8 + CODE_SIZE, false);
+                                      ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_PAGE_SIZE * 8 + CODE_SIZE, RecommitOnClear);
   AllocateOffset = 0;
 }
 
@@ -184,7 +218,7 @@ void LookupCache::ClearThreadLocalCaches(const LookupCacheWriteLockToken&) {
   // TODO: Preserve code cache entries?
   // ml606: clear exactly what is mapped. In L1-only mode that is the L1 array
   // alone; using TotalCacheSize here would decommit 48MB we never allocated.
-  FEXCore::Allocator::VirtualDontNeed(reinterpret_cast<void*>(AllocationBase), AllocationSize, false);
+  FEXCore::Allocator::VirtualDontNeed(reinterpret_cast<void*>(AllocationBase), AllocationSize, RecommitOnClear);
 
   // TODO: Rename this member to avoid confusion with code caching
   CachedCodePages.clear();

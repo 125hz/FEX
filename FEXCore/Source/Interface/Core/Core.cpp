@@ -21,6 +21,7 @@ $end_info$
 #include "Interface/Core/OpcodeDispatcher.h"
 #include "Interface/Core/JIT/JITClass.h"
 #include "Interface/Core/Dispatcher/Dispatcher.h"
+#include "Interface/Core/IosProfMap.h"
 #include "Interface/Core/X86Tables/X86Tables.h"
 #include <Interface/GDBJIT/GDBJIT.h>
 #include "Interface/IR/IR.h"
@@ -62,7 +63,19 @@ $end_info$
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <string_view>
+
+#if defined(FEX_IOS_HOST) && defined(_WIN32)
+/* MADEIRA ml708: the dual-mapped JIT pool's RX range, defined in rpmalloc.c and published by the
+ * CPU module at process init (see AllocatorHooks.h). Zero until then. Used by the callret reset
+ * path below to reject host targets that cannot possibly be emitted code. */
+extern "C" {
+extern uintptr_t ios_fex_jit_pool_rx;
+extern uintptr_t ios_fex_jit_pool_end;
+}
+#endif
 
 /* iOS-Madeira ml622: mirror of rpmalloc's POD snapshot (rpmalloc.c). Declared here
  * rather than in a shared header because rpmalloc is C and vendored; keep the two
@@ -98,6 +111,10 @@ int rpm_cas_snapshot_take(struct rpm_cas_snapshot* out);
  * thread leaks callret entries; need to confirm WHICH thread leaks and
  * separate game-thread vs render-thread vs FMOD-worker activity). 4 thread
  * slots hashed by Frame pointer. */
+/* MADEIRA: ARM64EC-only, matching the reader in CompileBlock. The probe is keyed on hardcoded
+ * 64-bit guest RIPs and dereferences guest GPRs directly, neither of which is meaningful (or safe)
+ * in 32-bit mode under a guest window. */
+#ifdef ARCHITECTURE_arm64ec
 static volatile uint64_t g_madeira_hot_count[12] = {0,0,0,0,0,0,0,0,0,0,0,0};
 static volatile uint64_t g_madeira_max_alloc_size = 0;
 static volatile uint64_t g_madeira_last_str = 0;
@@ -116,6 +133,7 @@ static volatile uint64_t g_madeira_thr_crsp_max[4] = {0,0,0,0};
 static volatile uint64_t g_madeira_thr_crsp_last[4] = {0,0,0,0};
 static volatile uint64_t g_madeira_thr_count[4] = {0,0,0,0};
 static volatile uint64_t g_madeira_thr_last_rip[4] = {0,0,0,0};
+#endif // ARCHITECTURE_arm64ec
 
 /* iOS-Madeira 2026-05-18 low-noise CompileBlock instrumentation counters. */
 static volatile uint64_t g_cb_total = 0;
@@ -136,6 +154,15 @@ ContextImpl::ContextImpl(const FEXCore::HostFeatures& Features)
   if (!Config.Is64BitMode()) {
     // When operating in 32-bit mode, the virtual memory we care about is only the lower 32-bits.
     Config.VirtualMemSize = 1ULL << 32;
+
+    // MADEIRA: Resolve the guest window base. See Context.h for the invariants. Note that
+    // VirtualMemSize deliberately stays 4GiB: it describes the *guest* address space, which the
+    // window does not enlarge.
+    Config.GuestBase = Config.Guest32BaseOption();
+    LOGMAN_THROW_A_FMT((Config.GuestBase & (FEXCore::Utils::FEX_PAGE_SIZE - 1)) == 0, "GUEST32BASE must be page aligned");
+  } else {
+    // The 64-bit (and ARM64EC) path is always identity mapped.
+    Config.GuestBase = 0;
   }
 #ifdef FEX_IOS_HOST
   /* iOS-Madeira: shrink the per-thread LookupCache L2 page table from 128MB
@@ -833,8 +860,212 @@ static void IRDumper(FEXCore::Core::InternalThreadState* Thread, IR::IREmitter* 
 };
 
 bool ContextImpl::CheckIfBlockIsCacheable(FEXCore::Core::InternalThreadState& Thread, uint64_t GuestRIP, uint64_t MaxInst) {
-  return Thread.FrontendDecoder->CheckIfCacheable(Thread, reinterpret_cast<const uint8_t*>(GuestRIP), GuestRIP, MaxInst);
+  // MADEIRA: as in GenerateIR, the byte pointer is a host pointer and the RIP stays guest.
+  return Thread.FrontendDecoder->CheckIfCacheable(Thread, reinterpret_cast<const uint8_t*>(Config.GuestBase + GuestRIP), GuestRIP, MaxInst);
 }
+
+/* ml900: process-wide JIT accumulators behind the periodic [fex-stats] line.
+ *
+ * Deliberately NOT FEXCore::SHMStats/ProfileStats: that path publishes into a shared-memory
+ * block mapped by a FEXServer process, and on iOS everything is one Mach task with no server,
+ * so ProfileStats produces nothing a device log can show. These are three relaxed counters
+ * bumped once per real compile and printed from the existing CB_SUMMARY cadence, so the cost
+ * is bounded by the compile rate, not the execution rate. */
+namespace MadeiraStats {
+std::atomic<uint64_t> BlocksCompiled {};
+std::atomic<uint64_t> GuestInstsCompiled {};
+std::atomic<uint64_t> HostCodeBytes {};
+/* 2026-09-19: unaligned-atomic fixups, bumped by ArchHelpers/Arm64.cpp (arm64
+ * hosts only — defined here so the [fex-stats] line can read them on every
+ * host). `ua_emu` counts accesses the handler performed itself, which includes
+ * the whole LSE atomic-memory class because no single instruction can replace
+ * one; `ua_patch` counts sites rewritten to plain access + barrier, which fault
+ * once and then cost nothing. A large, still-growing ua_emu is normal for a
+ * guest that spins on a misaligned lock word — it is not by itself a fault. */
+std::atomic<uint64_t> UnalignedAtomicEmulated {};
+std::atomic<uint64_t> UnalignedAtomicPatched {};
+} // namespace MadeiraStats
+
+} // namespace FEXCore::Context (ml930: reopened below — IosProfMap is its own
+  // top-level namespace and must not nest inside Context)
+
+#ifdef FEX_IOS_HOST
+/* ml930: the published host-PC -> guest-RIP map. Rationale and invariants live in
+ * IosProfMap.h; this is only the storage and the two hot-ish entry points.
+ *
+ * The ring is allocated LAZILY, on the first compile after the [prof] sampler has
+ * set Enable through the published header. A run with the profiler off therefore
+ * costs one relaxed load per COMPILE (not per execution) and zero bytes. */
+namespace FEXCore::IosProfMap {
+Header Hdr {
+  .Magic = FEX_IOSPROFMAP_MAGIC,
+  .Version = FEX_IOSPROFMAP_VERSION,
+  .EntrySize = sizeof(Block),
+  .Capacity = 0,
+};
+
+/* 64 K x 24 B = 1.5 MB, and only while the sampler is attached. Sized against the
+ * device log's steady state (~40 k live blocks): a wrap costs attribution of the
+ * OLDEST compiles only, and the sampler reports the wrap so the loss is never
+ * silent. Must stay a power of two — the slot index is a mask, not a modulo. */
+static constexpr uint32_t kCapacity = 64 * 1024;
+
+static std::atomic<uint32_t> AllocState {0}; // 0 = untried, 1 = in progress, 2 = done
+
+bool Enabled() {
+  if (Hdr.Entries) [[likely]] {
+    return true;
+  }
+  if (!Hdr.Enable.load(std::memory_order_relaxed)) {
+    return false;
+  }
+  uint32_t Expected = 0;
+  if (!AllocState.compare_exchange_strong(Expected, 1, std::memory_order_acq_rel)) {
+    return Hdr.Entries != 0;
+  }
+  void* Ring = std::calloc(kCapacity, sizeof(Block));
+  if (!Ring) {
+    Hdr.AllocFailed.fetch_add(1, std::memory_order_relaxed);
+    AllocState.store(2, std::memory_order_release);
+    return false;
+  }
+  Hdr.Capacity = kCapacity;
+  /* Capacity before Entries, and a barrier between: the sampler validates
+   * Entries last, so it can never see a ring address with a zero capacity. */
+  std::atomic_thread_fence(std::memory_order_release);
+  Hdr.Entries = reinterpret_cast<uint64_t>(Ring);
+  AllocState.store(2, std::memory_order_release);
+  LogMan::Msg::EFmt("[prof-map] ml930 ring armed at {} ({} entries x {} B) — [prof] can now name JIT samples", Ring, kCapacity,
+                    (unsigned)sizeof(Block));
+  return true;
+}
+
+static inline uint16_t Sat16(uint32_t v) {
+  return v > 0xffff ? 0xffff : static_cast<uint16_t>(v);
+}
+
+void Record(uint64_t HostStart, uint64_t HostSize, uint64_t GuestRIP, uint32_t NumInst, uint32_t NumX87, uint32_t NumVec, uint32_t NumAtomic,
+            uint32_t NumTSO, uint32_t NumMem) {
+  Hdr.X87Ops.fetch_add(NumX87, std::memory_order_relaxed);
+  Hdr.VecOps.fetch_add(NumVec, std::memory_order_relaxed);
+  Hdr.AtomicOps.fetch_add(NumAtomic, std::memory_order_relaxed);
+  Hdr.TSOOps.fetch_add(NumTSO, std::memory_order_relaxed);
+  Hdr.MemOps.fetch_add(NumMem, std::memory_order_relaxed);
+  Hdr.GuestInsts.fetch_add(NumInst, std::memory_order_relaxed);
+  Hdr.HostBytes.fetch_add(HostSize, std::memory_order_relaxed);
+  Hdr.Blocks.fetch_add(1, std::memory_order_relaxed);
+
+  auto* Ring = reinterpret_cast<Block*>(Hdr.Entries);
+  if (!Ring || !HostStart || !HostSize) {
+    return;
+  }
+  const uint64_t Index = Hdr.Head.fetch_add(1, std::memory_order_relaxed);
+  Block& E = Ring[Index & (Hdr.Capacity - 1)];
+  /* HostStart is written LAST. The sampler rejects a zero HostStart, so a reader
+   * racing this write sees either the previous tenant or nothing — never a live
+   * host range paired with another block's RIP. */
+  E.HostSize = static_cast<uint32_t>(HostSize);
+  E.GuestRIP = static_cast<uint32_t>(GuestRIP);
+  E.NumInst = Sat16(NumInst);
+  E.NumX87 = Sat16(NumX87);
+  E.NumVec = Sat16(NumVec);
+  E.NumTSO = Sat16(NumTSO);
+  E.NumMem = Sat16(NumMem);
+  E.NumAtomic = Sat16(NumAtomic);
+  E.Reserved0 = 0;
+  std::atomic_thread_fence(std::memory_order_release);
+  E.HostStart = HostStart;
+}
+
+void ClearDispRegions() {
+  Hdr.DispatcherBegin = 0;
+  Hdr.DispatcherEnd = 0;
+  Hdr.NumDispRegions = 0;
+}
+
+void AddDispRegion(const char* Name, uint64_t Begin) {
+  if (!Begin || Hdr.NumDispRegions >= MaxDispRegions) {
+    return;
+  }
+  auto& R = Hdr.DispRegions[Hdr.NumDispRegions];
+  R.Begin = Begin;
+  size_t i = 0;
+  for (; Name[i] && i < sizeof(R.Name) - 1; ++i) {
+    R.Name[i] = Name[i];
+  }
+  R.Name[i] = 0;
+  ++Hdr.NumDispRegions;
+}
+
+void SetDispatcherRange(uint64_t Begin, uint64_t End) {
+  Hdr.DispatcherBegin = Begin;
+  Hdr.DispatcherEnd = End;
+}
+
+/* Built once from FEXCore::IR::GetName(), never from a hand-written opcode list:
+ * an out-of-date list would quietly under-count exactly the ops a codegen change
+ * just added, which is the one situation these counters exist for. */
+uint8_t ClassifyOp(FEXCore::IR::IROps Op) {
+  static uint8_t Table[FEXCore::IR::IROps::OP_LAST + 1];
+  static std::atomic<bool> Built {false};
+  if (!Built.load(std::memory_order_acquire)) {
+    for (unsigned i = 0; i <= FEXCore::IR::IROps::OP_LAST; ++i) {
+      const auto O = static_cast<FEXCore::IR::IROps>(i);
+      const std::string_view N = FEXCore::IR::GetName(O);
+      uint8_t C = 0;
+      /* LoweredX87 is IR.json's own "X87": true flag, so this set cannot drift
+       * from the emitter. The name test only adds the F64 reduced-precision
+       * lowering, which is not flagged but is still x87 work. */
+      if (FEXCore::IR::LoweredX87(O) || N.starts_with("F80") || N.starts_with("F64") || N.find("Stack") != std::string_view::npos) {
+        C |= OpIsX87;
+      }
+      if (N.size() > 1 && N[0] == 'V') {
+        C |= OpIsVec; // every vector op FEX names V*
+      }
+      if (N.find("Atomic") != std::string_view::npos || N.starts_with("CAS")) {
+        C |= OpIsAtomic;
+      }
+      if (N.ends_with("TSO")) {
+        C |= OpIsTSO; // LoadMemTSO / StoreMemTSO — what TSOEnabled costs
+      }
+      /* ml960: the DENOMINATOR for the TSO share. Every op that touches guest
+       * memory, named the way MemoryOps.cpp names them, so the TSO ops above are
+       * a strict subset ("LoadMemTSO" contains "LoadMem"). */
+      if (N.find("LoadMem") != std::string_view::npos || N.find("StoreMem") != std::string_view::npos || N.starts_with("MemSet") ||
+          N.starts_with("MemCpy")) {
+        C |= OpIsMem;
+      }
+      Table[i] = C;
+    }
+    Built.store(true, std::memory_order_release);
+  }
+  return Op <= FEXCore::IR::IROps::OP_LAST ? Table[Op] : 0;
+}
+} // namespace FEXCore::IosProfMap
+
+/* C-linkage handles for Source/Windows/WOW64/Module.cpp, which builds against the
+ * mingw SDK and has no FEXCore/Source include path. */
+extern "C" uint64_t ios_prof_map_header(void) {
+  return reinterpret_cast<uint64_t>(&FEXCore::IosProfMap::Hdr);
+}
+/* ml960: the ABI the published header speaks, so the one line the CPU module
+ * prints at publish time is enough to convict a half-updated pair of binaries —
+ * the sampler refuses a header whose version/entry size it does not share, and
+ * a refusal that only shows up as "all counters zero" is what this round is
+ * for. */
+extern "C" uint32_t ios_prof_map_abi_version(void) {
+  return FEX_IOSPROFMAP_VERSION;
+}
+extern "C" uint32_t ios_prof_map_entry_size(void) {
+  return static_cast<uint32_t>(sizeof(FEXCore::IosProfMap::Block));
+}
+extern "C" void ios_prof_map_set_guest(uint64_t GuestBase, uint32_t Bitness) {
+  FEXCore::IosProfMap::Hdr.GuestBase = GuestBase;
+  FEXCore::IosProfMap::Hdr.Bitness = Bitness;
+}
+#endif
+
+namespace FEXCore::Context { // ml930: reopened
 
 /* iOS-Madeira ml623: targeted IR capture (PassManager.cpp). FEX_MadeiraIRCapTarget is the
  * absolute guest address of the ONE instruction under investigation, published by the
@@ -897,7 +1128,10 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
 
   if (!HasCustomIR) {
     const uint8_t* GuestCode {};
-    GuestCode = reinterpret_cast<const uint8_t*>(GuestRIP);
+    // MADEIRA: instruction fetch reads from `GuestBase + RIP`. GuestRIP itself is passed through
+    // unchanged below - BeginFunction, the block info, the LookupCache and every downstream
+    // consumer key on the guest address, and only this byte pointer is a host pointer.
+    GuestCode = reinterpret_cast<const uint8_t*>(Config.GuestBase + GuestRIP);
 
     /* perf-silenced GenerateIR GuestCode log */
 
@@ -975,7 +1209,9 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
 
 #ifdef ZYDIS_DISASSEMBLER
         if (FEXCore::Config::Get_X86DISASSEMBLE()) {
-          const uint8_t* InstBytes = reinterpret_cast<const uint8_t*>(InstAddress);
+          // MADEIRA: the byte pointer is a host pointer, but the runtime address Zydis uses to
+          // render RIP-relative operands must stay guest - same split as _ValidateCode.
+          const uint8_t* InstBytes = reinterpret_cast<const uint8_t*>(Config.GuestBase + InstAddress);
           ZydisDisassembledInstruction ZydisInst;
           if (ZYAN_SUCCESS(ZydisDisassembleIntel(ZydisMachineMode, InstAddress, InstBytes, DecodedInfo->InstSize, &ZydisInst))) {
             LogMan::Msg::IFmt("    {:#x}: {}", InstAddress, ZydisInst.text);
@@ -1006,7 +1242,10 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
         }
 
         if (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection) {
-          auto ExistingCodePtr = reinterpret_cast<uint8_t*>(Block.Entry + BlockInstructionsLength);
+          // MADEIRA: snapshotting the guest's current code bytes is a guest read, so it goes through
+          // the window. The address handed to _ValidateCode below stays guest (it is an entrypoint
+          // offset), and DEF_OP(ValidateCode) applies the window itself.
+          auto ExistingCodePtr = reinterpret_cast<uint8_t*>(Config.GuestBase + Block.Entry + BlockInstructionsLength);
           auto InstAddressReg = Thread->OpDispatcher->_EntrypointOffset(GPRSize, InstAddress - GuestRIP);
           std::array<uint8_t, 0x10> CodeOriginal;
           memcpy(CodeOriginal.data(), ExistingCodePtr, DecodedInfo->InstSize);
@@ -1232,6 +1471,58 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
 
   auto CompiledCode = Thread->CPUBackend->CompileCode(GuestRIP, Length, TotalInstructions == 1, &*IRView, DebugData.get(), TFSet);
 
+  /* ml900: [fex-stats] accumulators. Three relaxed adds on the compile path (which already costs
+   * microseconds), no allocation, no formatting -- the printing happens in the CB_SUMMARY block.
+   *
+   * These are the four numbers a next-run log needs in order to judge a JIT setting change
+   * without a profiler: how many blocks were really compiled, how many guest instructions went
+   * into them (=> instructions per block, which is what Multiblock/MaxInst move), and how many
+   * host bytes came out (=> host bytes per guest instruction, which is what TSO and
+   * X87ReducedPrecision move). ProfileStats/SHMStats cannot be used for this on iOS: it needs a
+   * FEXServer to map the shared stats block, and there is none in this process. */
+  MadeiraStats::BlocksCompiled.fetch_add(1, std::memory_order_relaxed);
+  MadeiraStats::GuestInstsCompiled.fetch_add(TotalInstructions, std::memory_order_relaxed);
+  MadeiraStats::HostCodeBytes.fetch_add(DebugData->HostCodeSize, std::memory_order_relaxed);
+
+#ifdef FEX_IOS_HOST
+  /* ml930: publish this block's host range, its guest RIP and its op mix for the
+   * [prof] sampler (IosProfMap.h). Gated on the sampler having attached, so a
+   * profiler-less run pays ONE relaxed load here and nothing else. The IR walk is
+   * on the compile path — which already costs microseconds — never on the
+   * execution path, and each op is a single table lookup.
+   *
+   * CompiledCode.BlockBegin is the FINAL RX address: JIT.cpp:1351-1356 rebases it
+   * by Delta after the block is migrated into the CodeBuffer, so this is the same
+   * namespace the sampler's host PC is in. */
+  if (FEXCore::IosProfMap::Enabled() && CompiledCode.BlockBegin && CompiledCode.Size) {
+    uint32_t NX87 = 0, NVec = 0, NAtomic = 0, NTSO = 0, NMem = 0;
+    for (auto [BlockNode, BlockHeader] : IRView->GetBlocks()) {
+      for (auto [CodeNode, IROp] : IRView->GetCode(BlockNode)) {
+        /* ml960: a bitmask — the classes overlap (a TSO access is also a memory
+         * access), so each property is counted on its own. */
+        const uint8_t C = FEXCore::IosProfMap::ClassifyOp(IROp->Op);
+        if (C & FEXCore::IosProfMap::OpIsX87) {
+          ++NX87;
+        }
+        if (C & FEXCore::IosProfMap::OpIsVec) {
+          ++NVec;
+        }
+        if (C & FEXCore::IosProfMap::OpIsAtomic) {
+          ++NAtomic;
+        }
+        if (C & FEXCore::IosProfMap::OpIsTSO) {
+          ++NTSO;
+        }
+        if (C & FEXCore::IosProfMap::OpIsMem) {
+          ++NMem;
+        }
+      }
+    }
+    FEXCore::IosProfMap::Record(reinterpret_cast<uint64_t>(CompiledCode.BlockBegin), CompiledCode.Size, GuestRIP, TotalInstructions, NX87,
+                                NVec, NAtomic, NTSO, NMem);
+  }
+#endif
+
   /* ml623: the final arm of the capture -- the host bytes actually emitted for the
    * target instruction, bounded to [its HostEntryOffset, the next one). This is the
    * arm that separates "the emitter dropped it" from "SMC/cache/alias lifetime rewrote
@@ -1296,6 +1587,7 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
 }
 
 #ifdef FEX_IOS_HOST
+#ifdef ARCHITECTURE_arm64ec
 /* iOS-Madeira ml306 (task #51): CallbackPtr entry-state capture buffer, defined in Dispatcher.cpp
  * and written by emitted code at CallbackPtr entry. Read by the [cb-entry] reporter below. */
 extern "C" uint64_t IosCbEntryLog[8];
@@ -1305,6 +1597,20 @@ extern "C" uint64_t IosJitReverseTranslate(uint64_t Addr);
 /* iOS-Madeira ml316: ExitToX64's FFS-bypass counters, defined in Module.cpp and written by
  * the bypass asm in Module.S. Reported below the same way as [cb-entry]. */
 extern "C" uint64_t IosFfsBypassLog[4];
+#else
+/* MADEIRA: the WoW64 module (libwow64fex.dll) is a plain aarch64 PE. It has no Module.S, no EC
+ * entry thunks and no FFS bypass path, so the three symbols above simply do not exist in that
+ * link. Provide zeroed storage rather than sprinkling a second guard around every use: the
+ * reporters below compare against a counter that nothing increments, so they never fire. This is
+ * "the event genuinely cannot happen here", not a silenced diagnostic. */
+static uint64_t IosCbEntryLog[8] {};
+static uint64_t IosFfsBypassLog[4] {};
+static inline uint64_t IosJitReverseTranslate(uint64_t Addr) {
+  /* No PE-image-to-pool alias table in the WoW64 module: guest images are mapped normally, and the
+   * only alias this module has is the JIT code pool's RX/RW pair, which is not a guest address. */
+  return Addr;
+}
+#endif
 #endif
 
 #ifdef FEX_IOS_HOST
@@ -1363,9 +1669,39 @@ static inline bool MonoBackpatcherBridgeArmed() {
   return ios_fex_mono_bridge_armed() != 0;
 }
 
+/* iOS-Madeira ml2000: host-data mode (MADEIRA_GUEST_RWX_DATA, ARM64EC module only; mirrors
+ * FEX::Windows::IosGuestRwxDataMode, re-read here because FEXCore cannot depend on the Windows
+ * frontend). In that mode anonymous x64-guest RWX memory has no JIT-pool alias, so:
+ *   - a MonoBackpatcherWrite that finds no alias is the NORMAL direct store, not a degraded one;
+ *   - the Mono backpatcher block must only be marked through InvalidationTracker's
+ *     DetectMonoBackpatcherBlock, which disables SMC write-trapping FIRST. Marking it from the
+ *     native alias capture below would let MonoBackpatcherWrite store directly into a page that is
+ *     still write-trapped while it holds CodeInvalidationMutex, and the resulting SMC fault needs
+ *     that same mutex. So the native activation is consumed and declined in this mode. */
+static bool IosCoreGuestRwxDataMode() {
+#if defined(ARCHITECTURE_arm64ec)
+  static std::atomic<int8_t> Cached {-1};
+  int8_t V = Cached.load(std::memory_order_relaxed);
+  if (V < 0) {
+    const char* E = getenv("MADEIRA_GUEST_RWX_DATA");
+    V = (E && E[0] == '0') ? 0 : 1;
+    Cached.store(V, std::memory_order_relaxed);
+  }
+  return V != 0;
+#else
+  return false;
+#endif
+}
+
 static void IosMonoTryActivate(ContextImpl* CTX, FEXCore::Core::InternalThreadState* Thread) {
   uint64_t BlockBegin = 0, HostPC = 0, FaultAddr = 0;
   if (!ios_fex_mono_take_pending(&BlockBegin, &HostPC, &FaultAddr)) {
+    return;
+  }
+  if (IosCoreGuestRwxDataMode()) {
+    LogMan::Msg::EFmt("[mono-bridge] ml2000 native activation DECLINED in host-data mode (block_begin={:#x} fault={:#x}); "
+                      "the SMC-fault detector marks the backpatcher after disabling write-trapping",
+                      BlockBegin, FaultAddr);
     return;
   }
 
@@ -1383,7 +1719,10 @@ static void IosMonoTryActivate(ContextImpl* CTX, FEXCore::Core::InternalThreadSt
     return;
   }
   static constexpr uint8_t XChgOp = 0x87;
-  const uint8_t* Code = reinterpret_cast<const uint8_t*>(InsnRIP);
+  // MADEIRA: ios_fex_rip_from_hostpc returns a GUEST rip, so reading the opcode byte at it is a
+  // guest read. BlockEntry below stays guest - it is a MarkMonoBackpatcherBlock /
+  // InvalidateGuestCodeRange key, not a pointer.
+  const uint8_t* Code = reinterpret_cast<const uint8_t*>(CTX->Config.GuestBase + InsnRIP);
   if (Code[0] != XChgOp && Code[1] != XChgOp) {
     LogMan::Msg::EFmt("[mono-bridge] ml648 REJECT: not an XCHG at {:#x} ({:#x} {:#x})", InsnRIP, Code[0], Code[1]);
     return;
@@ -1463,6 +1802,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
    * reached via its x64 fast-forward sequence -- preserves the x4/x5 varargs contract that
    * the emulation round trip destroys; see Module.S). Same change-detection pattern as
    * [cb-entry] below: CompileBlock runs often enough to notice promptly. */
+#ifdef FEX_IOS_HOST
   {
     static uint64_t FfsLastCount = 0;
     static uint32_t FfsReports = 0;
@@ -1490,14 +1830,17 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     }
   }
 
-  /* iOS-Madeira: refuse to compile obviously-invalid guest RIPs. After a
-   * NULL-vtable virtual call (`call [rax+8]` with rax=0), control flow
-   * lands at RIP=0x8, which then loops compiling thousands of garbage
-   * blocks before SEH unwinds. Returning 0 here raises C0000005 to the
-   * guest immediately so the first AV is the only AV. */
+#endif
+
+  // A null native return target loses the guest fault location and bypasses
+  // JIT exception reconstruction. Let the executable-range checked decoder
+  // emit its normal NoExecOp instead, just as for any other unmapped address.
   if (GuestRIP < 0x10000) {
-    LogMan::Msg::IFmt("[iOS] CompileBlock: REFUSING low/invalid RIP={:#x}", GuestRIP);
-    return 0;
+    const char* FaultPath = std::getenv("MADEIRA_LOW_RIP_FAULT");
+    if (FaultPath && FaultPath[0] == '0') return 0;
+    static std::atomic<uint32_t> LowRipReports {0};
+    if (LowRipReports.fetch_add(1, std::memory_order_relaxed) < 8)
+      LogMan::Msg::IFmt("[low-rip-fault] ml1160 checked guest decode rip={:#x}", GuestRIP);
   }
 
 #ifdef FEX_IOS_HOST
@@ -1579,7 +1922,15 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
    * as "pool" produced 17 false positives. IsAddressInCodeBuffer is the exact discriminator that
    * was missing -- FEX knows its own code-buffer bounds, so a guest RIP inside them is
    * unambiguously a host-PC leak with no possibility of a guest-image false positive. */
-  const bool RIPInFEXCodeBuffer = IsAddressInCodeBuffer(Thread, GuestRIP);
+  /* MADEIRA: IsAddressInCodeBuffer compares against HOST code-buffer bounds, so a guest RIP has to
+   * be lifted into the host namespace for the comparison to mean anything. Under a guest window a
+   * raw guest RIP is always below 4GiB and so could never fall inside a code buffer - the probe
+   * would silently stop catching the host-PC leak it exists for.
+   *
+   * The 0x7400000000 band test below deliberately stays on the raw GuestRIP: that one asks "is this
+   * value obviously a host address that leaked into a guest RIP field?", which is a question about
+   * the un-based value. */
+  const bool RIPInFEXCodeBuffer = IsAddressInCodeBuffer(Thread, Config.GuestBase + GuestRIP);
 
   /* iOS-Madeira ml300 (task #52): ALSO catch pool MODULE-COPY addresses, not just FEX's code buffer.
    *
@@ -1838,6 +2189,41 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
       }
       /* Tier-1 reset to DefaultLocation, matching CallRetStack::HandleAccessViolation. */
       Frame->State.callret_sp = default_loc;
+
+#if defined(FEX_IOS_HOST) && defined(_WIN32)
+      /* MADEIRA ml708: REJECT NON-POOL HOST TARGETS ON THE RESET PATH.
+       *
+       * Every 16-byte callret frame is {guest_rip, host_code_ptr}, and the host half is a raw
+       * branch target (an intra-block `adr(&l_CallReturn)` label). After a reset the next pop
+       * reads whatever bytes happen to sit at DefaultLocation -- a frame this thread abandoned
+       * long ago, or, if the pointer had walked into a neighbouring mapping, bytes that were
+       * never a callret frame at all. A host half that is not inside the JIT pool can only ever
+       * be wrong: a sub-4GB value or a value inside the guest window is a GUEST address, and
+       * branching to one executes at `rip` instead of `GuestBase + rip`.
+       *
+       * So validate the frames the reset is about to expose and zero any that fail: a {0, 0}
+       * frame can never satisfy BranchOps' `sub TMP1, popped_rip, RipReg` compare, so the RET
+       * falls through to the L1 lookup, which is always correct. Nothing is branched to. */
+      if (ios_fex_jit_pool_rx && ios_fex_jit_pool_end) {
+        static volatile uint32_t reject_cnt = 0;
+        for (int i = 0; i < 4; ++i) {
+          uint64_t* Entry = reinterpret_cast<uint64_t*>(default_loc + i * 0x10);
+          const uint64_t EntryRip = Entry[0];
+          const uint64_t EntryHost = Entry[1];
+          if (!EntryRip && !EntryHost) {
+            continue;
+          }
+          if (EntryHost >= ios_fex_jit_pool_rx && EntryHost < ios_fex_jit_pool_end) {
+            continue;
+          }
+          if (__sync_add_and_fetch(&reject_cnt, 1) <= 16) {
+            LogMan::Msg::EFmt("[callret] rejected non-pool target host=0x{:x} rip=0x{:x}", EntryHost, EntryRip);
+          }
+          Entry[0] = 0;
+          Entry[1] = 0;
+        }
+      }
+#endif
     }
   }
 
@@ -1897,15 +2283,74 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     static volatile uint64_t g_cb_last_summary_total = 0;
     static volatile uint64_t g_cb_hot_rip = 0;
     static volatile uint64_t g_cb_hot_rip_count = 0;
-    if (GuestRIP == g_cb_hot_rip) {
-      __sync_add_and_fetch(&g_cb_hot_rip_count, 1);
-    } else if (g_cb_hot_rip_count == 0) {
-      g_cb_hot_rip = GuestRIP;
-      __sync_add_and_fetch(&g_cb_hot_rip_count, 1);
-    } else {
-      __sync_sub_and_fetch(&g_cb_hot_rip_count, 1);
+    /* MADEIRA ml920: this estimator was reporting a fossil.
+     *
+     * Two bugs, one line apart. (1) The `== 0` test and the `__sync_sub_and_fetch` below it were
+     * separate operations on a counter every guest thread writes, so two threads that both observed
+     * 1 both decremented and the *unsigned* counter wrapped to ~1.8e19. After that the candidate
+     * could never be displaced (the weight never returns to 0 again) and `hottest_rip` stayed
+     * whatever RIP happened to be current at the moment of the wrap, forever. (2) The field was
+     * printed as `repeats~`, which it never was: Boyer-Moore's counter is the candidate's WEIGHT
+     * (hits minus misses), a lower bound on nothing unless the candidate is an actual majority. It
+     * was read as a visit count at least once. Decrement with a saturating CAS, and name it.
+     *
+     * The estimator stays deliberately lock-free and approximate: a lost race just picks a
+     * different candidate, which is fine for a hint. `[prof]` is what decides anything. */
+    /* MADEIRA ml990: THIS ESTIMATOR IS DIAGNOSTIC AND IT WAS NOT FREE.
+     *
+     * It runs on EVERY C++ CompileBlock dispatch -- which is every inline-L1
+     * miss, measured at 42-65 k/s in [fex-stats] -- and every iteration does a
+     * bus-locked RMW on one of two process-wide words that every guest thread
+     * writes. That is a cache line ping-ponging between cores tens of thousands
+     * of times a second to maintain a HINT whose own comment says "`[prof]` is
+     * what decides anything".
+     *
+     * Behind MADEIRA_DIAG now. The two numbers that are actually load-bearing
+     * -- dispatches and real compiles -- survive below, and they are batched
+     * per thread so the shipping build pays one un-contended thread-local
+     * increment per dispatch instead of two contended global ones. */
+    static const bool CbCensus = [] {
+      const char* Env = getenv("MADEIRA_DIAG");
+      return Env && *Env && Env[0] != '0';
+    }();
+    if (CbCensus) {
+      if (GuestRIP == g_cb_hot_rip) {
+        __sync_add_and_fetch(&g_cb_hot_rip_count, 1);
+      } else {
+        uint64_t Weight = g_cb_hot_rip_count;
+        while (true) {
+          if (Weight == 0) {
+            // Claim the empty slot. A racing claimant simply wins instead.
+            g_cb_hot_rip = GuestRIP;
+            __sync_add_and_fetch(&g_cb_hot_rip_count, 1);
+            break;
+          }
+          const uint64_t Prev = __sync_val_compare_and_swap(&g_cb_hot_rip_count, Weight, Weight - 1);
+          if (Prev == Weight) {
+            break;
+          }
+          Weight = Prev;
+        }
+      }
     }
-    uint64_t total = __sync_add_and_fetch(&g_cb_total, 1);
+    /* ml990: BATCHED. The dispatch count is the L1-miss rate the tuning
+     * questions are asked in (see cpp_dispatch/s in [fex-stats]), so it stays
+     * on unconditionally -- but a shared counter incremented 65 k times a
+     * second across ~40 threads is a contention artefact in the very
+     * measurement it feeds. Count thread-locally and publish a batch; the
+     * global is then only touched once per kCbBatch dispatches per thread, and
+     * a rate averaged over 10 s cannot tell the difference. */
+    /* 2026-09-25: NO `thread_local` IN THIS MODULE. The batch counter above
+     * was one, and it took every program down at start: implicit TLS in a PE
+     * DLL is reached through TEB->ThreadLocalStoragePointer, this function
+     * runs while the emulator initialises a thread -- before the loader has
+     * given that thread its TLS vector -- so the access was
+     * `ldr x9, [NULL, idx, lsl #3]`. A statistics counter does not need to be
+     * exact: a plain, unlocked increment of the shared word costs no bus lock,
+     * can at worst lose a count under contention, and a rate averaged over
+     * 10 s cannot tell. */
+    uint64_t total = g_cb_total + 1;
+    g_cb_total = total;
     if ((total - g_cb_last_summary_total) >= 16384) {
       g_cb_last_summary_total = total;
       uint64_t reals = g_cb_real_compiles;
@@ -1918,8 +2363,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
        * pointer), the emitted probe reads the iOS-emulated zero page and
        * silently misses every time — no crash, pure 60us tax per lookup. */
       auto* T = Frame ? Frame->Thread : nullptr;
+      if (CbCensus)
       LogMan::Msg::EFmt("[CB_SUMMARY] total={} real_compiles={} cache_hits={} "
-                        "hit_rate={}%  hottest_rip≈0x{:x} repeats~{} "
+                        "hit_rate={}%  hottest_rip≈0x{:x} hot_weight={} "
                         "L1ptr=0x{:x} L1mask=0x{:x} cacheL1=0x{:x}",
                         total, reals,
                         total - reals,
@@ -1928,6 +2374,111 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
                         Frame ? Frame->State.L1Pointer : 0,
                         Frame ? Frame->State.L1Mask : 0,
                         (T && T->LookupCache) ? T->LookupCache->GetL1Pointer() : 0);
+
+      /* ml900: [fex-stats] -- the JIT's own shape, on a ~10s wall clock rather than on the
+       * CompileBlock cadence, so two runs can be compared at equal elapsed time even when one
+       * of them compiles far more.
+       *
+       * What each number is for, and what moves it:
+       *   blocks/s + insts/blk : Multiblock and MaxInst. A low insts/blk with Multiblock on
+       *                          means the frontend keeps hitting terminators (or the guest is
+       *                          call-heavy), and raising MaxInst will not help.
+       *   host_b/inst          : how much ARM64 one x86 instruction costs. TSO emulation and
+       *                          X87ReducedPrecision both show up here, and it is the only
+       *                          figure that says whether a codegen setting did anything.
+       *   cpp_dispatch/s       : C++ CompileBlock entries per second. These are dispatcher
+       *                          round-trips that the emitted inline L1 probe failed to
+       *                          resolve; at a 99% hit rate they are pure overhead and their
+       *                          RATE (not the hit rate) is the number that matters.
+       * All three counters are process-wide and monotonic, so a reader can also difference two
+       * consecutive lines. */
+      {
+        static std::atomic<uint64_t> LastStatsNs {0};
+        static std::atomic<uint64_t> LastStatsBlocks {0};
+        static std::atomic<uint64_t> LastStatsTotal {0};
+        static std::atomic<uint64_t> LastStatsReals {0};
+        const uint64_t NowNs = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+        uint64_t Last = LastStatsNs.load(std::memory_order_relaxed);
+        // First arrival seeds the baseline instead of printing a rate measured against the epoch.
+        // The CAS makes exactly one thread own each window; losers simply skip this line.
+        const bool DueAndWon = Last != 0 && (NowNs - Last) >= 10'000'000'000ULL &&
+                               LastStatsNs.compare_exchange_strong(Last, NowNs, std::memory_order_relaxed);
+        if (Last == 0) {
+          LastStatsNs.compare_exchange_strong(Last, NowNs, std::memory_order_relaxed);
+          LastStatsBlocks.store(MadeiraStats::BlocksCompiled.load(std::memory_order_relaxed), std::memory_order_relaxed);
+          LastStatsTotal.store(total, std::memory_order_relaxed);
+          LastStatsReals.store(reals, std::memory_order_relaxed);
+        } else if (DueAndWon) {
+          const uint64_t ElapsedMs = (NowNs - Last) / 1'000'000ULL;
+          const uint64_t Blocks = MadeiraStats::BlocksCompiled.load(std::memory_order_relaxed);
+          const uint64_t Insts = MadeiraStats::GuestInstsCompiled.load(std::memory_order_relaxed);
+          const uint64_t HostBytes = MadeiraStats::HostCodeBytes.load(std::memory_order_relaxed);
+          const uint64_t BlockDelta = Blocks - LastStatsBlocks.exchange(Blocks, std::memory_order_relaxed);
+          const uint64_t DispatchDelta = total - LastStatsTotal.exchange(total, std::memory_order_relaxed);
+          const uint64_t RealDelta = reals - LastStatsReals.exchange(reals, std::memory_order_relaxed);
+          /* ml990: THE NUMBER THAT DECIDES WHETHER A BOUNDED L2 IS WORTH BUILDING.
+           *
+           * Every C++ dispatch is an inline-L1 miss (DisableL2Cache is on, so
+           * Dispatcher.cpp emits `b(&NoBlock)` where the L2 walk would be, and
+           * there is no second tier to catch it). Of those dispatches, the ones
+           * that did NOT end in a real compile are blocks the process had
+           * already compiled and that only the locked C++ L3 map could find --
+           * i.e. exactly the traffic an L2 would absorb, and exactly the
+           * traffic that pays SpillStaticRegs + a shared read lock + a
+           * robin_map probe for nothing.
+           *
+           * l1_miss_l3hit/s is therefore the upper bound on what restoring an
+           * L2 could recover, in units anyone can act on, and it is free: both
+           * inputs were already being counted. */
+          const uint64_t L3Only = (DispatchDelta > RealDelta) ? (DispatchDelta - RealDelta) : 0;
+          /* ml990: WHAT DID DynamicL1Cache ACTUALLY GROW TO?
+           *
+           * The growth heuristic doubles CurrentL1Entries on L2/L3 hit rate
+           * and halves it when the rate falls, capped at MAX_L1_ENTRIES
+           * (128 K on iOS), but nothing ever reported where it settled -- so
+           * "is the L1 the right size" had no data behind it. State.L1Mask is
+           * the value the emitted probe ANDs with, i.e. (sets-1) pre-scaled to
+           * a byte offset, so entries = (mask/set_bytes + 1) * ways. This is
+           * the reporting thread's own cache, which is representative but not
+           * a fleet number; a thread that has just started shows the 8 K
+           * minimum. */
+          const uint64_t L1MaskNow = Frame ? Frame->State.L1Mask : 0;
+          const uint64_t L1SetBytes = LookupCache::L1_SET_BYTES;
+          const uint64_t L1Entries = L1MaskNow ? ((L1MaskNow / L1SetBytes) + 1) * LookupCache::L1_WAYS : 0;
+          /* ml1100: THE NUMBER THAT EXPLAINS blocks/s, and the one this line was missing.
+           *
+           * A code-buffer rotation throws away every block in the outgoing buffer — the new
+           * buffer gets a brand-new empty GuestToHostMap — so the steady-state compile rate is
+           * not "how much new code the program reached", it is "buffer size / rotation period".
+           * A 32-minute device session makes that arithmetic exact: 4,911,610 blocks x 54 insts
+           * x 18 host bytes = 4.77 GB of emitted code, against ~298 rotations x 16 MB = 4.77 GB.
+           * Every byte the JIT emitted went into a buffer that was then discarded.
+           * gen=+N per window is therefore the cause and blocks/s the effect; reading them
+           * apart is what tells a later log whether a change made code SMALLER or made the
+           * buffer LAST LONGER. */
+#ifdef FEX_IOS_HOST
+          const uint64_t Gen = FEXCore::CPU::IosCodeBufferGeneration();
+#else
+          const uint64_t Gen = 0;
+#endif
+          static std::atomic<uint64_t> LastStatsGen {0};
+          const uint64_t GenDelta = Gen - LastStatsGen.exchange(Gen, std::memory_order_relaxed);
+          LogMan::Msg::EFmt("[fex-stats] rev=ml1100 window_ms={} blocks={} (+{}, {}/s) insts/blk={} "
+                            "host_b/inst={} cpp_dispatch=+{} ({}/s) hit_rate={}% "
+                            "l1_miss_l3hit=+{} ({}/s, {}% of dispatches) real_compile=+{} "
+                            "l1_entries={} ways={} gen={} (+{} rotations) "
+                            "ua_emu={} ua_patch={}",
+                            ElapsedMs, Blocks, BlockDelta, ElapsedMs ? (BlockDelta * 1000 / ElapsedMs) : 0, Blocks ? (Insts / Blocks) : 0,
+                            Insts ? (HostBytes / Insts) : 0, DispatchDelta, ElapsedMs ? (DispatchDelta * 1000 / ElapsedMs) : 0,
+                            (total > 0) ? (100 * (total - reals) / total) : 0,
+                            L3Only, ElapsedMs ? (L3Only * 1000 / ElapsedMs) : 0,
+                            DispatchDelta ? (100 * L3Only / DispatchDelta) : 0, RealDelta,
+                            L1Entries, static_cast<uint64_t>(LookupCache::L1_WAYS), Gen, GenDelta,
+                            MadeiraStats::UnalignedAtomicEmulated.load(std::memory_order_relaxed),
+                            MadeiraStats::UnalignedAtomicPatched.load(std::memory_order_relaxed));
+        }
+      }
 
       /* iOS-Madeira ml622: drain the rpmalloc remote-free CAS snapshot HERE —
        * outside rpmalloc, where formatting is safe. The allocator side only ever
@@ -1960,6 +2511,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
    * block dispatch, not just hot RIPs). 4-slot hash table keyed by Frame
    * pointer (unique per FEX thread). Identifies WHICH thread is leaking
    * callret entries vs healthy. */
+  /* MADEIRA: ARM64EC-only, together with the HOTRIP probe below that reports it - see the note on
+   * the g_madeira_* globals at the top of this file. */
+#ifdef ARCHITECTURE_arm64ec
   {
     uintptr_t fk = reinterpret_cast<uintptr_t>(Frame);
     int slot = (int)((fk >> 6) & 3);
@@ -1982,6 +2536,12 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
    * initialization, which appears to trip a stack-cookie check on
    * ARM64EC mingw. POD types only — no constructors. Atomicity isn't
    * critical for telemetry; occasional torn reads are fine. */
+  /* MADEIRA: ARM64EC-only. Two reasons, both hard:
+   *  - it is keyed on hardcoded 64-bit guest RIPs (0x140006fe6, fmod at 0xeaa1d0000), so it can
+   *    never match in 32-bit mode, and
+   *  - it dereferences guest register values (RBX/RCX below) directly as host pointers, which is
+   *    exactly what the 32-bit guest window forbids.
+   * It also pulls in time(), which the WoW64 module's -nostdlib link does not provide. */
   {
     /* RIPs depend on FMOD's mapped base (0xeaa1d0000 in current runs).
      * The two critsection wrappers GPT identified live at fmod+0xba27a
@@ -2079,6 +2639,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
       }
     }
   }
+#endif // ARCHITECTURE_arm64ec
 
   static_cast<ContextImpl*>(Thread->CTX)->SyscallHandler->PreCompile();
 
@@ -2412,7 +2973,9 @@ void ContextImpl::MonoBackpatcherWrite(FEXCore::Core::CpuStateFrame* Frame, uint
   {
     auto lk = GuardSignalDeferringSection(CTX->CodeInvalidationMutex, Thread);
 
-    uint64_t Dest = Address;
+    // MADEIRA: `Address` is a guest address - it is what InvalidateGuestCodeRange below is keyed on -
+    // so the window has to be applied for the dereference and only for the dereference.
+    uint64_t Dest = Address + CTX->Config.GuestBase;
 #ifdef FEX_IOS_HOST
     /* ml648: THE STORE MUST GO TO THE WRITABLE ALIAS.
      *
@@ -2423,12 +2986,27 @@ void ContextImpl::MonoBackpatcherWrite(FEXCore::Core::CpuStateFrame* Frame, uint
      * anonymous alias table (NOT IosAliasEntries) and write the RW view.
      *
      * A miss is counted and falls through to the direct store, which faults and
-     * is emulated as before: degraded, never wrong. */
-    const uint64_t RW = IosMonoResolveRW(Address, Size);
+     * is emulated as before: degraded, never wrong.
+     *
+     * ml2000: in host-data mode (IosCoreGuestRwxDataMode) anonymous RWX memory has
+     * no alias and is plain writable host memory once SMC trapping is disabled, so a
+     * miss is the normal direct store. It is counted as a helper call, not as an
+     * alias miss, and reported once. */
+    // The alias table is keyed by the address actually mapped in this process, i.e. the host
+    // address. Identical to `Address` for every identity-mapped configuration.
+    const uint64_t RW = IosMonoResolveRW(Dest, Size);
     if (RW) {
       Dest = RW;
     }
-    ios_fex_mono_count_helper(RW ? 0 : 1);
+    if (!RW && IosCoreGuestRwxDataMode()) {
+      static std::atomic<bool> Reported {false};
+      if (!Reported.exchange(true, std::memory_order_relaxed)) {
+        LogMan::Msg::EFmt("[mono-bridge] ml2000 backpatch store direct to host-data page {:#x} (no alias needed; normal)", Dest);
+      }
+      ios_fex_mono_count_helper(0);
+    } else {
+      ios_fex_mono_count_helper(RW ? 0 : 1);
+    }
 #endif
 
     if (Size == 8) {

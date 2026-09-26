@@ -110,6 +110,28 @@ namespace CPU {
   private:
     fextl::shared_ptr<CodeBuffer> Latest;
 
+#ifdef FEX_IOS_HOST
+    /* ml1020 (#86): the size we last ASKED for, which is NOT the size we got.
+     *
+     * On iOS every code buffer is carved from the finite JIT pool, and a refused
+     * carve is degraded rather than failed: CodeBuffer's ctor halves the request
+     * down (rev=ml364, "[code-buffer] exec alloc degraded"). StartLargerCodeBuffer
+     * used to compute the next size from Latest->AllocatedSize — the DEGRADED
+     * value — so one transient refusal ratcheted the whole process down a size
+     * ladder it could never climb back up. w50 shows it exactly: allocations #2
+     * through #15 are 32MB, then #16 is 16MB, #17 8MB, #28 4MB, #31 2MB, and from
+     * there the run alternates 1MB/2MB for 20+ more generations while 240MB of
+     * 16-32MB carves sit pinned. Small buffers rotate ~32x more often, each
+     * rotation is a ClearCodeCache that wipes every thread's L1/L2 (w50's
+     * real_compile spike of +72960 blocks in one 10s window), and the rotation
+     * storm is what eventually caught a moment with zero free carves.
+     *
+     * The ladder is kept here instead, monotonic up to MAX_CODE_SIZE, so a
+     * degraded grant costs ONE generation rather than the rest of the session.
+     * MADEIRA_FEX_RECYCLE=0 restores the pre-ml1020 "double the granted size". */
+    size_t DesiredSize {};
+#endif
+
     fextl::shared_ptr<CodeBuffer> AllocateNew(size_t Size);
   };
 
@@ -215,7 +237,45 @@ namespace CPU {
      * SignalHandlerCodeBuffers (self compile paths, exception-path queries,
      * the sweeper). Lock order where nested: LookupCache write lock, THEN
      * IosMigrateLock. LatestMutex is never held around either. */
-    mutable std::atomic<uint64_t> IosMigrateLock {0};   /* ml1035: holds the owner's TEB|1 */
+    mutable std::atomic<uint32_t> IosMigrateLock {0};
+    /* ml630 (#78 5-10 minute freeze): the lock above is a plain test-and-set
+     * spin with no owner and no bound, and IsAddressInCodeBuffer - the
+     * "is this host pc JIT code?" query that EVERY fault runs - used to take
+     * it. Any host fault taken inside a critical section (a pool commit
+     * fault, an RWX/SMC write fault, the JIT guard page, a Mach-side
+     * redirect) re-enters the query on the SAME thread and spins on a lock
+     * that thread already holds, forever; the sweeper then piles up behind it
+     * still holding a LookupCache write lock and the whole process parks.
+     *
+     * The query now reads this lock-free table instead and never blocks.
+     * Each live code buffer occupies ONE 64-bit slot encoding
+     *   (Base >> FEX_PAGE_SHIFT) << IosRangePageBits | UsablePageCount
+     * so a slot is a single atomic word: a reader observes either the old
+     * value or the new one, never a mixed {base,size} pair, and no sequence
+     * counter or retry loop is needed. 0 means "empty slot".
+     *
+     * Writers are the three mutators of CurrentCodeBuffer /
+     * SignalHandlerCodeBuffers and are still serialized by IosMigrateLock, so
+     * there is exactly one publisher at a time. Bases come from the iOS JIT
+     * pool (< 2^56) and buffers are capped at MAX_CODE_SIZE (32MB = 8192
+     * pages), so both fields always fit; IosRangesDegraded latches if that
+     * ever stops being true or more than IosMaxPublishedRanges buffers are
+     * live, and only then does the query fall back to the locked path. */
+    static constexpr size_t IosMaxPublishedRanges = 32;
+    static constexpr uint32_t IosRangePageBits = 20;
+    mutable std::atomic<uint64_t> IosPublishedRanges[IosMaxPublishedRanges] {};
+    mutable std::atomic<uint32_t> IosRangesDegraded {0};
+    // Owner TEB of the current IosMigrateLock holder, 0 when free. Makes the
+    // lock recursion-tolerant so that no path reachable from a fault taken
+    // inside a critical section can self-deadlock on it.
+    mutable std::atomic<uint64_t> IosMigrateOwner {0};
+    mutable uint32_t IosMigrateDepth {0};
+    // Republishes IosPublishedRanges from CurrentCodeBuffer +
+    // SignalHandlerCodeBuffers. Caller must hold IosMigrateLock.
+    void IosPublishCodeBufferRanges();
+    // Same, but takes IosMigrateLock itself. For the one assignment that
+    // happens outside any critical section (the Arm64JITCore constructor).
+    void IosPublishCodeBufferRangesLocked();
     // Returns 1 = migrated, 0 = nothing to do, -1 = skipped (signal frames
     // in flight), -2 = raced out. Caller must have established via the sweep
     // gate that this thread is outside emitted code (InSimulation == 0).
