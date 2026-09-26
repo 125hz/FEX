@@ -75,7 +75,24 @@ DLLEXPORT_FUNC(void*, VirtualAlloc2,
                 MEM_EXTENDED_PARAMETER* ExtendedParameters, ULONG ParameterCount)) {
   NTSTATUS Status;
 #ifndef _M_ARM64EC
-  if (!BaseAddress) {
+  // MADEIRA: only add our own address requirement if the caller did not bring one.
+  //
+  // NtAllocateVirtualMemoryEx rejects a parameter list that names the same type twice
+  // (STATUS_INVALID_PARAMETER, before any placement is attempted), so appending unconditionally
+  // failed every call that already carried a MEM_ADDRESS_REQUIREMENTS - which on the iOS host is
+  // every deliberate placement FEX makes: the host-band steering in AllocatorHooks.h and the
+  // call-ret stacks in CallRetStack.h, neither of which has a fallback by design. The caller's
+  // requirement is always the stricter one (a specific host band, versus "above the 32-bit user
+  // address space"), so honouring it is also the correct answer, not just the working one.
+  bool CallerHasAddressRequirements = false;
+  for (ULONG i = 0; ExtendedParameters && i < ParameterCount; ++i) {
+    if (ExtendedParameters[i].Type == MemExtendedParameterAddressRequirements) {
+      CallerHasAddressRequirements = true;
+      break;
+    }
+  }
+
+  if (!BaseAddress && !CallerHasAddressRequirements) {
     // Add address requirements for WOW64 to limit allocations to outside the 32-bit user address space
     auto* NewExtParams = reinterpret_cast<MEM_EXTENDED_PARAMETER*>(alloca((ParameterCount + 1) * sizeof(MEM_EXTENDED_PARAMETER)));
     if (ExtendedParameters && ParameterCount > 0) {

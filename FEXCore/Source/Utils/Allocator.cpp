@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: MIT
 #include "Utils/Allocator/HostAllocator.h"
+// MADEIRA: AssignHookOverrides below calls FEXCore::Allocator::InitializeAllocator, which is
+// declared here and nowhere else. Without this include the file only compiles when some other
+// header happens to drag the declaration in, which is not the case for an x86-host
+// (ENABLE_X86_HOST_DEBUG) build.
+#include "Utils/Allocator.h"
 #include <FEXCore/Utils/Allocator.h>
 #include <FEXCore/Utils/CompilerDefs.h>
 #include <FEXCore/Utils/LogManager.h>
