@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include <atomic>
+#include <iterator> // ml760: std::size for the HandleImageMap stack batch
 #include <cstdlib>  // ml623: getenv/strtoull for the IR-capture target
 #include <cstring>  // ml623: strlen
 #include <FEXCore/Utils/LogManager.h>
@@ -25,9 +26,357 @@ extern "C" void ios_fex_mono_arm(uint64_t Base, uint64_t End);
 #endif
 
 namespace FEX::Windows {
-InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX, const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads)
+
+/* iOS-Madeira ml760: RE-ENTRANCY GUARD FOR IntervalsLock / CodeInvalidationMutex.
+ *
+ * THE DEADLOCK. IntervalsLock is a plain std::shared_mutex (InvalidationTracker.h) and is
+ * therefore NOT recursive. Every write path in this file allocates while holding it:
+ * IntervalList::Insert/Remove call fextl::vector::insert/erase, and LogMan::Msg::EFmt formats
+ * into fextl storage. When FEX's allocator has to grow it issues NtAllocateVirtualMemory, wine
+ * calls back into NotifyMemoryAlloc, and that lands in HandleMemoryProtectionNotification ->
+ * std::unique_lock(IntervalsLock) ON THE SAME THREAD. A non-recursive mutex parks forever.
+ *
+ * Observed (main-process launch, module #29 of the ml710 NotifyImageMap path): the FIRST
+ * [iOS-xins] line of a two-executable-section module printed, the second never did, and the
+ * initial thread sat in __ulock_wait2 (x16=0x220, x0=0x1000001 = UL_COMPARE_AND_WAIT) with
+ * [alert-ring] pinned at zero for the rest of the run. FEX's own tree already documents the
+ * identical signature for the ImageTracker/CodeInvalidationMutex variant of this bug
+ * (ARM64EC/Module.cpp:1326-1330) -- same shape, different lock.
+ *
+ * THE GUARD. A PER-THREAD depth counter is raised for exactly as long as this object holds one
+ * of its locks. Every notification entry point tests it first and, when it is non-zero, logs
+ * and RETURNS WITHOUT TOUCHING A LOCK.
+ *
+ * ⛔ IT IS DELIBERATELY NOT A `thread_local`. ml412 (ARM64EC/Module.cpp:1452) records that
+ * mingw TLS access loads TEB->ThreadLocalStoragePointer ([x18+0x58]), which is still NULL when
+ * the loader issues its first callbacks -- it crashed BTCpu64NotifyReadFile at addr=0. This
+ * guard runs on exactly those early loader paths (NotifyImageMap, the constructor's
+ * VirtualQuery sweep), so a thread_local here would be a launch crash rather than a fix.
+ * Instead the thread is keyed by its TEB POINTER (x18, no TLS indirection) into a small
+ * lock-free slot table. Nothing is written into the TEB itself: Instrumentation[9] is already
+ * claimed by ml412 and [10] by wine's EC ntdll pump beacon, and guessing a free slot across
+ * three components is how those collisions happen in the first place.
+ *
+ * WHY THIS CANNOT DEADLOCK: the re-entrant call performs no lock acquisition at all, so there
+ * is no wait to be blocked on; and the counter is per-thread, so a genuinely concurrent
+ * thread's notification is unaffected and still blocks normally on the mutex.
+ *
+ * FAIL-OPEN, NOT FAIL-SILENT: if the slot table is exhausted the thread is simply untracked,
+ * the check returns false and behaviour is exactly what it was before this change (including
+ * the deadlock risk). That is reported once rather than pretended away.
+ *
+ * WHAT IS SKIPPED, precisely. A re-entrant notification can only describe memory that some
+ * call already inside this tracker caused the OS to change:
+ *   - allocator growth for our own interval vectors / log buffers (FEX host heap -- never
+ *     guest code, and the guest never has a mapping for it);
+ *   - the NtProtectVirtualMemory calls this class itself issues to trap/untrap RWX intervals
+ *     (ProtectRWXIntervalsInternal, DisableSMCDetection, HandleRWXAccessViolation), whose
+ *     effect is already recorded in the interval lists by the very code making the call.
+ * In both cases re-applying it would be a no-op at best. It is NOT free of risk in principle
+ * -- if some future caller ever allocates guest-visible executable memory from inside a
+ * tracker lock, that range would go unregistered -- so every skip is counted and logged
+ * rather than silently dropped.
+ *
+ * The log itself allocates, so re-entry from inside the re-entry report is suppressed by a
+ * per-slot flag; without it the report could recurse until the stack is gone. */
+namespace {
+/* iOS-Madeira ml2000: 64 -> 512 slots (the size of the thread registry), and stale-slot reclaim.
+ *
+ * Device logs show "[xins] ml760 re-entrancy slot table EXHAUSTED (64 threads)" at process start,
+ * i.e. long before 64 threads can be inside a tracker lock at once. A slot is freed only when its
+ * depth returns to zero; a thread that dies (or whose frames are abandoned by a context switch out
+ * of an exception) while inside a TrackerLockScope leaks its slot for the rest of the session, and
+ * the table is shared by everything that loads this module. Worse, a NEW thread whose TEB lands on
+ * a leaked slot's address inherited depth > 0 and had every notification skipped as "re-entry".
+ *
+ * So each slot also records the owning thread id (TEB->ClientId.UniqueThread, read via the TEB
+ * pointer -- no TLS). A TEB match with a different id is a dead owner's slot: the current thread
+ * owns that TEB now, nobody else can touch the slot, and it is reset to depth 0 before use.
+ * Lookups scan only up to the highest slot ever claimed, so the common case stays short.
+ *
+ * MADEIRA_FEX_TRACKER_WIDE=0 restores the 64-slot table without reclaim (read once in the
+ * InvalidationTracker constructor; never from inside a lock). */
+constexpr unsigned TrackerSlotCount = 512;
+constexpr unsigned TrackerSlotCountLegacy = 64;
+std::atomic<uint32_t> TrackerSlotLimit {TrackerSlotCount};
+std::atomic<uint8_t> TrackerStaleReclaim {1};
+std::atomic<uint32_t> TrackerSlotHigh {0};     // one past the highest slot ever claimed
+std::atomic<uint32_t> TrackerStaleReclaimed {0};
+
+// Key: the thread's TEB pointer (x18). nullptr = free slot.
+std::atomic<void*> TrackerSlotTeb[TrackerSlotCount] {};
+// Depth and report flag are only ever touched by the thread that owns the slot, so they need
+// no atomicity of their own -- publication is handled by the TEB pointer's release store.
+uint32_t TrackerSlotDepth[TrackerSlotCount] {};
+uint8_t TrackerSlotReporting[TrackerSlotCount] {};
+uint64_t TrackerSlotTid[TrackerSlotCount] {};  // ml2000: owner's thread id, owner-written
+std::atomic<uint32_t> TrackerSlotOverflow {0};
+
+uint64_t TrackerTebTid(void* Teb) {
+  // __TEB is the full Wine layout from Source/Windows/include/winternl.h (mingw's TEB hides ClientId).
+  return reinterpret_cast<uint64_t>(reinterpret_cast<__TEB*>(Teb)->ClientId.UniqueThread);
+}
+
+int TrackerFindSlot(void* Teb) {
+  if (!Teb) {
+    return -1;
+  }
+  const uint32_t High = std::min(TrackerSlotHigh.load(std::memory_order_acquire), TrackerSlotCount);
+  for (unsigned i = 0; i < High; i++) {
+    if (TrackerSlotTeb[i].load(std::memory_order_acquire) == Teb) {
+      if (TrackerStaleReclaim.load(std::memory_order_relaxed)) {
+        const uint64_t Tid = TrackerTebTid(Teb);
+        if (TrackerSlotTid[i] != Tid) {
+          // A dead thread's leaked slot on a TEB this thread now owns: start it clean.
+          TrackerSlotDepth[i] = 0;
+          TrackerSlotReporting[i] = 0;
+          TrackerSlotTid[i] = Tid;
+          const auto N = TrackerStaleReclaimed.fetch_add(1, std::memory_order_relaxed) + 1;
+          if (N <= 8) {
+            LogMan::Msg::EFmt("[xins] ml2000 reclaimed stale re-entrancy slot #{} (TEB reused by a new thread; "
+                              "the previous owner leaked it) total={}",
+                              i, N);
+          }
+        }
+      }
+      return static_cast<int>(i);
+    }
+  }
+  return -1;
+}
+
+int TrackerClaimSlot(void* Teb) {
+  const int Existing = TrackerFindSlot(Teb);
+  if (Existing >= 0 || !Teb) {
+    return Existing;
+  }
+  const uint32_t Limit = std::min(TrackerSlotLimit.load(std::memory_order_relaxed), TrackerSlotCount);
+  for (unsigned i = 0; i < Limit; i++) {
+    void* Expected = nullptr;
+    if (TrackerSlotTeb[i].compare_exchange_strong(Expected, Teb, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+      TrackerSlotDepth[i] = 0;
+      TrackerSlotReporting[i] = 0;
+      TrackerSlotTid[i] = TrackerTebTid(Teb);
+      uint32_t High = TrackerSlotHigh.load(std::memory_order_relaxed);
+      while (High < i + 1 && !TrackerSlotHigh.compare_exchange_weak(High, i + 1, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+      }
+      return static_cast<int>(i);
+    }
+  }
+  return -1;
+}
+
+/// Raised for exactly the scope in which an InvalidationTracker lock is held.
+struct TrackerLockScope {
+  int Slot;
+  TrackerLockScope()
+    : Slot {TrackerClaimSlot(NtCurrentTeb())} {
+    if (Slot >= 0) {
+      ++TrackerSlotDepth[Slot];
+    } else {
+      const auto N = TrackerSlotOverflow.fetch_add(1) + 1;
+      if (N == 1) {
+        LogMan::Msg::EFmt("[xins] ml760 re-entrancy slot table EXHAUSTED ({} threads, ml2000 reclaimed={}) — this thread is "
+                          "UNTRACKED and reverts to the pre-ml760 (deadlock-capable) behaviour",
+                          TrackerSlotLimit.load(std::memory_order_relaxed), TrackerStaleReclaimed.load(std::memory_order_relaxed));
+      }
+    }
+  }
+  ~TrackerLockScope() {
+    if (Slot < 0) {
+      return;
+    }
+    if (--TrackerSlotDepth[Slot] == 0) {
+      TrackerSlotTeb[Slot].store(nullptr, std::memory_order_release);
+    }
+  }
+  TrackerLockScope(const TrackerLockScope&) = delete;
+  TrackerLockScope& operator=(const TrackerLockScope&) = delete;
+};
+
+/* iOS-Madeira ml630 (#78): the unmap/free invalidation filter.
+ *
+ * A 20-minute 32-bit session logged 72,072 via=section invalidations over the SAME ~880
+ * half-to-one-megabyte ranges (a 6-line map/unmap cycle repeating verbatim) plus ~2.9M
+ * via=aligned guest frees. Every one of them takes CodeInvalidationMutex EXCLUSIVELY and
+ * walks every thread's lookup cache, and the block census shows the result: a steady state
+ * of 324,278 blocks at +0/s collapsing into +125,112 real compiles in 12 s, with
+ * real_compile == the block delta (nothing was reused - the cache was wiped, not missed).
+ * That recompile storm is what exhausted the JIT pool's tail partition, and pool exhaustion
+ * is what fired the deliberate 0xdead fault that wedged the process.
+ *
+ * The filter rests on this class's own documented invariant (see the QueryExecutableRange
+ * note below): the ONLY thing that decides whether a guest address may be executed is
+ * XIntervals - an address not in XIntervals decodes as NOEXEC. So no guest page outside
+ * XIntervals can ever have been translated, and invalidating a range that does not
+ * intersect XIntervals cannot remove any block. It is pure cost.
+ *
+ * Removal from XIntervals always invalidates first (HandleMemoryProtectionNotification
+ * removes then calls InvalidateIntervalInternal; the unmap/free paths below invalidate then
+ * remove), so "not in XIntervals now" also means "already invalidated if it ever mattered".
+ *
+ * MADEIRA_FEX_SKIP_EMPTY_INVALIDATE=0 restores the unconditional behaviour. */
+std::atomic<int8_t> SkipEmptyInvalidateCached {-1};
+bool SkipEmptyInvalidate() {
+  int8_t V = SkipEmptyInvalidateCached.load(std::memory_order_relaxed);
+  if (V < 0) {
+    const char* E = getenv("MADEIRA_FEX_SKIP_EMPTY_INVALIDATE");
+    V = (E && E[0] == '0') ? 0 : 1;
+    SkipEmptyInvalidateCached.store(V, std::memory_order_relaxed);
+  }
+  return V != 0;
+}
+
+/* iOS-Madeira ml1100: the SECOND half of the same filter — the exclusive removal.
+ *
+ * ml630 stopped the invalidation itself, and a 32-minute device session proves it works:
+ * `[inval-filter] ml630 ... aligned: skipped=4090441 kept=0` — not one guest free in four
+ * million removed a single translated block. What that session ALSO shows is that the
+ * removal underneath it kept running: every one of those frees still took IntervalsLock
+ * EXCLUSIVELY to ask two sorted lists to remove a range neither of them contains.
+ *
+ * That is not a cheap no-op. IntervalsLock is the lock QueryExecutableRange takes SHARED on
+ * the JIT's decode path, so a writer arriving ~3400 times a second (the measured guest
+ * free rate for that title) parks every compiling thread behind it — on a shared_mutex a
+ * waiting writer also blocks arriving readers, which is exactly the "compiles stall while
+ * the heap churns" shape.
+ *
+ * The skip is exact rather than heuristic, and it is decided inside the SAME shared-lock
+ * scope that ml630's MayHoldCode already needed: if the range intersects neither XIntervals
+ * nor RWXIntervals, Remove() on both is a provable no-op, so not taking the exclusive lock
+ * cannot change any observable state. Nothing happens between the two decisions, so this
+ * adds no window that ml630 did not already have.
+ *
+ * MADEIRA_FEX_SKIP_EMPTY_REMOVE=0 restores the unconditional removal. */
+std::atomic<int8_t> SkipEmptyRemoveCached {-1};
+bool SkipEmptyRemove() {
+  int8_t V = SkipEmptyRemoveCached.load(std::memory_order_relaxed);
+  if (V < 0) {
+    const char* E = getenv("MADEIRA_FEX_SKIP_EMPTY_REMOVE");
+    V = (E && E[0] == '0') ? 0 : 1;
+    SkipEmptyRemoveCached.store(V, std::memory_order_relaxed);
+  }
+  return V != 0;
+}
+
+// Quantifies the filter: how many invalidations were skipped vs performed, by path.
+std::atomic<uint64_t> InvalSkippedSection {0};
+std::atomic<uint64_t> InvalKeptSection {0};
+std::atomic<uint64_t> InvalSkippedAligned {0};
+std::atomic<uint64_t> InvalKeptAligned {0};
+// ml1100: exclusive IntervalsLock acquisitions avoided / taken on the removal half.
+std::atomic<uint64_t> RemoveSkipped {0};
+std::atomic<uint64_t> RemoveTaken {0};
+
+void ReportInvalidationFilter() {
+  static std::atomic<uint64_t> Next {8192};
+  const uint64_t Total = InvalSkippedSection.load(std::memory_order_relaxed) + InvalKeptSection.load(std::memory_order_relaxed) +
+                         InvalSkippedAligned.load(std::memory_order_relaxed) + InvalKeptAligned.load(std::memory_order_relaxed);
+  uint64_t Want = Next.load(std::memory_order_relaxed);
+  if (Total < Want || !Next.compare_exchange_strong(Want, Want * 2, std::memory_order_relaxed)) {
+    return;
+  }
+  LogMan::Msg::EFmt("[inval-filter] ml630 section: skipped={} kept={} | aligned: skipped={} kept={} "
+                    "| ml1100 xlock: skipped={} taken={} "
+                    "(skipped = range held no translated code; each kept one takes CodeInvalidationMutex exclusively; "
+                    "xlock skipped = an IntervalsLock WRITE the JIT's decode path no longer waits behind)",
+                    InvalSkippedSection.load(std::memory_order_relaxed), InvalKeptSection.load(std::memory_order_relaxed),
+                    InvalSkippedAligned.load(std::memory_order_relaxed), InvalKeptAligned.load(std::memory_order_relaxed),
+                    RemoveSkipped.load(std::memory_order_relaxed), RemoveTaken.load(std::memory_order_relaxed));
+}
+
+/// Returns true when this thread is already inside a tracker lock, i.e. the caller must bail
+/// out instead of locking. Rate-capped so a storm cannot drown the log.
+bool TrackerReentered(const char* Site, uint64_t Address, uint64_t Size) {
+  const int Slot = TrackerFindSlot(NtCurrentTeb());
+  if (Slot < 0 || TrackerSlotDepth[Slot] == 0) {
+    return false;
+  }
+  if (TrackerSlotReporting[Slot]) {
+    return true;
+  }
+  static std::atomic<uint32_t> ReentryCount;
+  const auto N = ReentryCount.fetch_add(1) + 1;
+  if (N <= 32 || !(N & 0xFF)) {
+    TrackerSlotReporting[Slot] = 1;
+    LogMan::Msg::EFmt("[xins] RE-ENTRY #{} depth={} from {} addr={:#x} size={:#x} — SKIPPED, no lock taken "
+                      "(a nested notification raised while this thread holds IntervalsLock would self-deadlock; "
+                      "the range is allocator/tracker-owned, not guest code)",
+                      N, TrackerSlotDepth[Slot], Site, Address, Size);
+    TrackerSlotReporting[Slot] = 0;
+  }
+  return true;
+}
+} // namespace
+
+/* iOS-Madeira ml2000: see the declaration in InvalidationTracker.h. */
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+bool IosGuestRwxDataMode() {
+  static std::atomic<int8_t> Cached {-1};
+  int8_t V = Cached.load(std::memory_order_relaxed);
+  if (V < 0) {
+    const char* E = getenv("MADEIRA_GUEST_RWX_DATA");
+    V = (E && E[0] == '0') ? 0 : 1;
+    int8_t Expected = -1;
+    if (Cached.compare_exchange_strong(Expected, V, std::memory_order_relaxed)) {
+      LogMan::Msg::EFmt("[rwx-data] ml2000 FEX MADEIRA_GUEST_RWX_DATA={} -> {}", E ? E : "(unset)",
+                        V ? "host-data mode: SMC trap/untrap at 16 KB host pages, upstream retry for non-alias SMC "
+                            "writes, upstream Mono DisableSMCDetection" :
+                            "legacy (JIT-pool alias) handling");
+    }
+  }
+  return V != 0;
+}
+#else
+bool IosGuestRwxDataMode() {
+  return false;
+}
+#endif
+
+namespace {
+/* ml2000: the iOS host page is 16 KB and Wine applies the UNION of the four 4 KB sub-page
+ * protections to it (get_host_page_vprot / mprotect_range). Trapping or untrapping a single
+ * 4 KB sub-page therefore either does nothing (a writable neighbour keeps the host page
+ * writable, so a write to freshly compiled code never faults) or opens the whole host page
+ * (three sub-pages become writable without their code being invalidated). In host-data mode
+ * every SMC protect/unprotect/invalidate covers whole host pages, clipped to the RWX interval. */
+constexpr uint64_t IosHostPageSize = 0x4000;
+
+struct IosRange {
+  uint64_t Begin, End;
+};
+
+// Round [Address, Address+Size) out to host pages. Identity when host-data mode is off.
+IosRange IosHostPageRound(uint64_t Address, uint64_t Size) {
+  if (!IosGuestRwxDataMode()) {
+    return {Address, Address + Size};
+  }
+  const uint64_t Begin = Address & ~(IosHostPageSize - 1);
+  const uint64_t End = (Address + Size + IosHostPageSize - 1) & ~(IosHostPageSize - 1);
+  return {Begin, End < Begin ? Address + Size : End};
+}
+
+std::atomic<uint64_t> IosHostPageUntraps {0};
+} // namespace
+
+InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX,
+                                         const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads, uint64_t GuestBase)
   : CTX {CTX}
-  , Threads {Threads} {
+  , Threads {Threads}
+  , GuestBase {GuestBase} {
+  // ml2000: read both switches here, in a normal context, before any lock or fault path needs them.
+  IosGuestRwxDataMode();
+  {
+    const char* E = getenv("MADEIRA_FEX_TRACKER_WIDE");
+    const bool Wide = !(E && E[0] == '0');
+    TrackerSlotLimit.store(Wide ? TrackerSlotCount : TrackerSlotCountLegacy, std::memory_order_relaxed);
+    TrackerStaleReclaim.store(Wide ? 1 : 0, std::memory_order_relaxed);
+    static std::atomic<bool> Logged {false};
+    if (!Logged.exchange(true)) {
+      LogMan::Msg::EFmt("[xins] ml2000 re-entrancy slots={} stale-reclaim={} (MADEIRA_FEX_TRACKER_WIDE={})",
+                        Wide ? TrackerSlotCount : TrackerSlotCountLegacy, Wide ? 1 : 0, E ? E : "(unset)");
+    }
+  }
   FEX_CONFIG_OPT(SMCChecks, SMCCHECKS);
   SMCDetectionDisabled = (SMCChecks == FEXCore::Config::CONFIG_SMC_NONE);
 
@@ -58,26 +407,57 @@ static bool ProtIsWritable(ULONG Prot) {
 }
 
 void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, uint64_t Size, ULONG Prot) {
+  // ml760: this is the re-entry point the allocator reaches via NotifyMemoryAlloc. See the
+  // guard's comment at the top of this file.
+  if (TrackerReentered("HandleMemoryProtectionNotification", Address, Size)) {
+    return;
+  }
+
   const auto AlignedBase = Address & FEXCore::Utils::FEX_PAGE_MASK;
   const auto AlignedSize = (Address - AlignedBase + Size + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK;
 
   const bool NeedsInvalidate = [&]() {
+    TrackerLockScope Reentry;
     std::unique_lock Lock(IntervalsLock);
 
     FEXCore::IntervalList<uint64_t>::Interval ProtInterval {AlignedBase, AlignedBase + AlignedSize};
 
+    /* MADEIRA: DEP-off does NOT promote here.
+     *
+     * An earlier revision treated "DEP off + readable" as executable on this path, so every
+     * guest NtAllocateVirtualMemory / NtProtectVirtualMemory of ordinary PAGE_READWRITE memory
+     * inserted an X *and* an RWX interval. In a non-NX-compat game that allocates or reprotects
+     * per frame that is a write-trap armed on plain data, at render-thread rate: one device run
+     * produced ~100 "Add SMC interval" lines a second, a 77 MB / 1.6 M-line log, and
+     * unixcall_wine_dbg_write at 3.2% of all CPU — while the title never executed from data at
+     * all, so every one of those traps was pure cost.
+     *
+     * The only correct trigger for DEP-off promotion is an ACTUAL EXECUTE ATTEMPT, and the
+     * decoder asks about one before it emits anything: see the lazy path in
+     * QueryExecutableRange. So this notification means exactly what it meant before DEP existed
+     * — the protection the guest asked for — and a program that never runs code out of its own
+     * data pays nothing.
+     *
+     * Removal is deliberately still DEP-aware (the branch below): a region promoted lazily and
+     * later reprotected or freed must leave DEPPromotedIntervals with the rest. */
     const bool HasExec = ProtHasExec(Prot);
-    const bool EffectiveExec = HasExec || (DEPDisabled && ProtIsReadable(Prot));
-    const bool EffectiveRWX = EffectiveExec && ProtIsWritable(Prot);
+    const bool EffectiveRWX = HasExec && ProtIsWritable(Prot);
 
-    if (EffectiveExec) {
+    if (HasExec) {
       XIntervals.Insert(ProtInterval);
       if (EffectiveRWX) {
-        LogMan::Msg::DFmt("Add SMC interval: {:X} - {:X}", AlignedBase, AlignedBase + AlignedSize);
+        /* Capped. This fires once per genuinely RWX range, which is rare and interesting - but
+         * "rare" is a property of the guest, not a guarantee, and an uncapped log on a path a
+         * guest can drive is how the storm above happened. 64 is enough to characterise a
+         * process; the running totals live in the periodic [dep-off] summary. */
+        static std::atomic<uint32_t> SMCLogCount {0};
+        const auto N = SMCLogCount.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (N <= 64) {
+          LogMan::Msg::DFmt("Add SMC interval: {:X} - {:X}", AlignedBase, AlignedBase + AlignedSize);
+        } else if (N == 65) {
+          LogMan::Msg::DFmt("Add SMC interval: 64 reported — further ones suppressed for this session");
+        }
         RWXIntervals.Insert(ProtInterval);
-      }
-      if (DEPDisabled && !HasExec) {
-        DEPPromotedIntervals.Insert(ProtInterval);
       }
       return true;
     } else if (XIntervals.Intersect(ProtInterval)) {
@@ -122,9 +502,121 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
   }
 }
 
+/* MADEIRA: DEP-OFF PROMOTION, in this port's terms.
+ *
+ * On Windows a 32-bit image WITHOUT IMAGE_DLLCHARACTERISTICS_NX_COMPAT runs with DEP disabled:
+ * executing from any committed readable page is legal, which is what every 2000s-era
+ * copy-protection wrapper, unpacker and runtime thunk relies on. Upstream Wine models that with
+ * force_exec_prot (wine/dlls/ntdll/unix/virtual.c:virtual_set_force_exec): every PROT_READ mmap
+ * also gets PROT_EXEC.
+ *
+ * That mechanism cannot work here and does not need to. iOS TXM refuses PROT_EXEC on every VA
+ * outside the JIT pool, so virtual_ios.c's mprotect_exec deliberately ignores the force (its
+ * [force-exec] note says why); and nothing host-executes a guest page anyway - guest code is
+ * decoded by the frontend and RUN FROM THE POOL. The only thing that decides whether a guest
+ * address may be executed is THIS class's XIntervals, consulted through QueryExecutableRange ->
+ * WowSyscallHandler::QueryGuestExecutableRange -> Decoder::CheckRangeExecutable. A range that is
+ * not in XIntervals decodes as NOEXEC, Core.cpp raises NoExecOp, and the JIT branches to the
+ * GuestSignal_SIGSEGV trampoline (`mov w1,#0 ; ldr x1,[x1]`) - the "no pool copy for this
+ * address" death seen on a retail 32-bit title at guest RIP 0x01B4380F, a VirtualAlloc'd page the
+ * program had written code into.
+ *
+ * So "promote the page to executable" means exactly one thing here: put it in XIntervals, and -
+ * because unpackers write, execute, rewrite and execute again - in RWXIntervals too, so the SMC
+ * write-trap is armed on it. DEPPromotedIntervals then makes GetTrapProt/GetUntrapProt trap with
+ * PAGE_READONLY/PAGE_READWRITE instead of the PAGE_EXECUTE_* pair, since the host page is (and
+ * must stay) non-executable.
+ *
+ * Two entry points feed it: this function, on the NtSetInformationProcess(ProcessExecuteFlags)
+ * that the 32-bit loader issues for a non-NX-compat image (and that SetProcessDEPPolicy issues at
+ * runtime), which sweeps what is already mapped; and PromoteDEPRegionLocked below, called lazily
+ * from QueryExecutableRange for anything that appears afterwards. */
+FEXCore::IntervalList<uint64_t>::Interval InvalidationTracker::PromoteDEPRegionLocked(uint64_t Address) {
+  // A host address outside the guest window is FEX's own heap, the JIT pool or a host module.
+  // DEP is a property of the GUEST process's memory; promoting host memory would both be
+  // meaningless and arm SMC write-traps on FEX's own allocations.
+  if (GuestBase && (Address < GuestBase || (Address - GuestBase) >= (1ULL << 32))) {
+    return {};
+  }
+
+  MEMORY_BASIC_INFORMATION Info;
+  if (!VirtualQuery(reinterpret_cast<LPCVOID>(Address), &Info, sizeof(Info))) {
+    return {};
+  }
+  // PAGE_GUARD is OR'd into the protection, so a stack guard page reads as "readable" to
+  // ProtIsReadable. Promoting one would arm an SMC write-trap on a page whose entire job is to
+  // fault once and be re-armed by the kernel; PAGE_NOACCESS is excluded for the same reason
+  // ProtIsReadable already excludes it, stated here so the guard case is visibly deliberate.
+  if (Info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) {
+    DEPDeclined.fetch_add(1, std::memory_order_relaxed);
+    return {};
+  }
+  if (Info.State != MEM_COMMIT || !ProtIsReadable(Info.Protect) || ProtHasExec(Info.Protect)) {
+    // Not a committed readable page: a wild branch into free/reserved/no-access memory, which is
+    // an access violation even with DEP off. Leave it to fault.
+    DEPDeclined.fetch_add(1, std::memory_order_relaxed);
+    return {};
+  }
+
+  const auto BaseAddress = reinterpret_cast<uint64_t>(Info.BaseAddress);
+  const auto AlignedBase = BaseAddress & FEXCore::Utils::FEX_PAGE_MASK;
+  const auto AlignedSize = (BaseAddress - AlignedBase + Info.RegionSize + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK;
+  FEXCore::IntervalList<uint64_t>::Interval ProtInterval {AlignedBase, AlignedBase + AlignedSize};
+
+  if (DEPPromotedIntervals.Query(Address).Enclosed) {
+    // Already promoted (a second thread raced us here); report the interval without re-logging.
+    return ProtInterval;
+  }
+
+  XIntervals.Insert(ProtInterval);
+  if (ProtIsWritable(Info.Protect)) {
+    // Writable AND executable now, so the SMC write-trap must cover it: a self-decrypting
+    // unpacker writes the next stage into the same page it is about to jump into.
+    RWXIntervals.Insert(ProtInterval);
+  }
+  DEPPromotedIntervals.Insert(ProtInterval);
+
+  DEPPromotedRegions.fetch_add(1, std::memory_order_relaxed);
+  DEPPromotedBytes.fetch_add(AlignedSize, std::memory_order_relaxed);
+
+  // Once per region, by construction: the DEPPromotedIntervals check above is the gate. Capped
+  // all the same - a program that churns scratch buffers and jumps into each one promotes a
+  // region per buffer, and no log line a guest can drive may be uncapped.
+  // The running totals are in the periodic [dep-off] summary either way.
+  {
+    static std::atomic<uint32_t> PromoteLogCount {0};
+    const auto N = PromoteLogCount.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (N <= 64) {
+      LogMan::Msg::EFmt("[dep-off] promoting {:#x}+{:#x} to executable for a non-NX-compat image (guest rip {:#x}) "
+                        "prot={:#x} rwx={}",
+                        GuestBase ? AlignedBase - GuestBase : AlignedBase, AlignedSize, GuestBase ? Address - GuestBase : Address,
+                        Info.Protect, ProtIsWritable(Info.Protect) ? "yes" : "no");
+    } else if (N == 65) {
+      LogMan::Msg::EFmt("[dep-off] 64 regions promoted — per-region lines suppressed from here on; "
+                        "see the periodic [dep-off] summary for the running totals");
+    }
+  }
+  return ProtInterval;
+}
+
+InvalidationTracker::DEPStats InvalidationTracker::GetDEPStats() const {
+  return {
+    DEPDisabled,
+    DEPPromotedRegions.load(std::memory_order_relaxed),
+    DEPPromotedBytes.load(std::memory_order_relaxed),
+    DEPDeclined.load(std::memory_order_relaxed),
+  };
+}
+
 void InvalidationTracker::HandleProcessExecuteFlagsChange(ULONG Flags) {
   const bool DisableDEP = (Flags & MEM_EXECUTE_OPTION_ENABLE) != 0;
 
+  // ml760: this whole body runs under BOTH locks and inserts/removes intervals (allocating)
+  // while it does, so it is a re-entry source as well as a victim.
+  if (TrackerReentered("HandleProcessExecuteFlagsChange", Flags, 0)) {
+    return;
+  }
+  TrackerLockScope Reentry;
   std::scoped_lock CodeLock(CTX.GetCodeInvalidationMutex());
   std::unique_lock Lock(IntervalsLock);
 
@@ -137,33 +629,70 @@ void InvalidationTracker::HandleProcessExecuteFlagsChange(ULONG Flags) {
   if (DisableDEP) {
     DEPPromotedIntervals.Clear();
 
-    MEMORY_BASIC_INFORMATION Info;
-    uint64_t Address = 0;
-
-    while (VirtualQuery(reinterpret_cast<LPCVOID>(Address), &Info, sizeof(Info))) {
-      uint64_t BaseAddress = reinterpret_cast<uint64_t>(Info.BaseAddress);
-      if (Info.State == MEM_COMMIT && ProtIsReadable(Info.Protect) && !ProtHasExec(Info.Protect)) {
-        const auto AlignedBase = BaseAddress & FEXCore::Utils::FEX_PAGE_MASK;
-        const auto AlignedSize = (BaseAddress - AlignedBase + Info.RegionSize + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK;
-        FEXCore::IntervalList<uint64_t>::Interval ProtInterval {AlignedBase, AlignedBase + AlignedSize};
-
-        XIntervals.Insert(ProtInterval);
-        if (ProtIsWritable(Info.Protect)) {
-          RWXIntervals.Insert(ProtInterval);
-        }
-        DEPPromotedIntervals.Insert(ProtInterval);
-      }
-
-      Address = BaseAddress + Info.RegionSize;
-    }
+    /* MADEIRA: NOTHING IS PROMOTED HERE. DEP-off promotion is entirely lazy.
+     *
+     * Upstream sweeps the whole address space and marks every committed readable region
+     * executable up front. That is cheap where "executable" is only a bit in an interval list
+     * consulted on decode - but here a writable promoted region ALSO enters RWXIntervals, and
+     * RWXIntervals arm a real host write-trap (NtProtectVirtualMemory to PAGE_READONLY) on any
+     * page a block is compiled in. Sweeping therefore taxed every data page of a non-NX-compat
+     * image whether or not the program ever executed from one. Measured on device: 38 regions /
+     * 25 MB promoted at startup for a title that never ran a byte out of its data, and the
+     * resulting SMC bookkeeping produced ~100 log lines a second for the whole session.
+     *
+     * An execute attempt is both the correct trigger and a cheap one to detect: the frontend
+     * asks QueryExecutableRange before emitting anything, and the lazy branch there promotes on
+     * the miss. A program that never executes from writable memory pays nothing at all; one
+     * that does pays a VirtualQuery and one interval insert, once, per region it jumps into.
+     *
+     * (The scan that used to be here also had to be bounded to [GuestBase, GuestBase+4GiB):
+     * this host address space is 64-bit and full of FEX's own heap and the JIT pool's RW alias,
+     * and sweeping those would have marked FEX's allocations as guest code and armed write
+     * traps on them. Deleting the sweep removes that hazard as well.) */
+    LogMan::Msg::EFmt("[dep-off] DEP DISABLED for this process (non-NX-compat image or SetProcessDEPPolicy): "
+                      "no eager promotion — a committed readable page becomes executable only when "
+                      "the guest actually branches into it");
   } else {
+    // ml760: this loop logs and removes (both allocate) with IntervalsLock held exclusively.
+    // It cannot self-deadlock any more -- TrackerLockScope above makes every nested
+    // notification bail out -- but the log is now rate-capped so a module-heavy process
+    // cannot spend an unbounded time inside the exclusive hold.
+    uint32_t DepRemoveCount = 0;
     for (const auto& Interval : DEPPromotedIntervals) {
-      LogMan::Msg::EFmt("[iOS-xrem] via=depflags tracker={} {:#x}-{:#x}", static_cast<void*>(this),
-                        Interval.Offset, Interval.End);
+      if (++DepRemoveCount <= 16 || !(DepRemoveCount & 63)) {
+        LogMan::Msg::EFmt("[iOS-xrem] via=depflags #{} tracker={} {:#x}-{:#x}", DepRemoveCount, static_cast<void*>(this),
+                          Interval.Offset, Interval.End);
+      }
+      /* MADEIRA: UNTRAP BEFORE FORGETTING.
+       *
+       * A DEP-promoted region that carried compiled code has had write access stripped from
+       * those pages by ProtectRWXIntervalsInternal (GetTrapProt -> PAGE_READONLY for a
+       * DEP-promoted range). Removing the interval here without restoring write would leave the
+       * guest's own data pages permanently read-only: the next store faults,
+       * HandleRWXAccessViolation no longer recognises the address, and the guest receives a
+       * write access violation on memory it legitimately owns. The DEP-off half of
+       * build/x86-tests/execrw-x86.c walks straight into this in its runtime-opt-in phase - it
+       * enables DEP with SetProcessDEPPolicy and then writes to the buffer it had been
+       * executing from.
+       *
+       * PAGE_READWRITE, not GetUntrapProt: DEPDisabled is already false above, so GetUntrapProt
+       * would hand back PAGE_EXECUTE_READWRITE - a protection the host page cannot hold and
+       * never had. Only intervals that reached RWXIntervals were ever trapped, and a region
+       * only reaches RWXIntervals through the DEP path when the whole region was writable, so
+       * restoring the whole interval to PAGE_READWRITE restores exactly what was taken. */
+      if (RWXIntervals.Query(Interval.Offset).Enclosed) {
+        void* TmpAddress = reinterpret_cast<void*>(Interval.Offset);
+        SIZE_T TmpSize = static_cast<SIZE_T>(Interval.End - Interval.Offset);
+        ULONG TmpProt;
+        NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, PAGE_READWRITE, &TmpProt);
+      }
       XIntervals.Remove(Interval);
       RWXIntervals.Remove(Interval);
     }
     DEPPromotedIntervals.Clear();
+    LogMan::Msg::EFmt("[dep-off] DEP RE-ENABLED for this process: withdrew {} promoted regions, "
+                      "restoring write access to any that had been write-trapped for SMC",
+                      DepRemoveCount);
   }
 
   // Invalidate all cached code: previously-compiled blocks may contain NoExec stubs for addresses
@@ -172,30 +701,80 @@ void InvalidationTracker::HandleProcessExecuteFlagsChange(ULONG Flags) {
 }
 
 void InvalidationTracker::HandleImageMap(std::string_view Name, uint64_t Address) {
+  // ml760: reachable from NotifyMapViewOfSection AND from wine's loader via NotifyImageMap,
+  // so it must be safe on a thread that is already inside this tracker.
+  if (TrackerReentered("HandleImageMap", Address, 0)) {
+    return;
+  }
+
   auto* Nt = RtlImageNtHeader(reinterpret_cast<HMODULE>(Address));
   auto* SectionsBegin = IMAGE_FIRST_SECTION(Nt);
   auto* SectionsEnd = SectionsBegin + Nt->FileHeader.NumberOfSections;
   uint64_t LastExecutableSectionEnd = 0;
 
-  for (auto* Section = SectionsBegin; Section != SectionsEnd; Section++) {
-    if (Section->Characteristics & IMAGE_SCN_MEM_EXECUTE) {
-      std::unique_lock Lock(IntervalsLock);
+  /* iOS-Madeira ml760: ONE LOCK FOR THE WHOLE IMAGE, AND NO LOGGING UNDER IT.
+   *
+   * The previous shape took std::unique_lock(IntervalsLock) INSIDE the per-section loop and
+   * ran both XIntervals.Insert and the [iOS-xins] EFmt with it held. Both allocate, and an
+   * allocator growth re-enters HandleMemoryProtectionNotification, which takes the same
+   * non-recursive shared_mutex -- the hang described at the top of this file.
+   *
+   * Three changes, in order of importance:
+   *   1. the re-entrancy guard (TrackerLockScope) makes a nested notification bail out;
+   *   2. the section ranges are collected into a FIXED-SIZE STACK array first, so nothing
+   *      inside the locked region allocates except the interval vectors themselves;
+   *   3. the log lines are emitted AFTER the lock is released, so formatting allocations can
+   *      never happen under it at all.
+   * Sections are processed in batches of the array size, so an image with more executable
+   * sections than the array holds simply takes more than one lock/log round -- nothing is
+   * dropped and the stack cost stays bounded (PE NumberOfSections is a uint16). */
+  struct ExecSection {
+    uint64_t Base;
+    uint64_t End;
+    bool Writable;
+  };
 
-      uint64_t SectionBase = Address + Section->VirtualAddress;
-      uint64_t SectionEnd = SectionBase + Section->Misc.VirtualSize;
-      XIntervals.Insert({SectionBase, SectionEnd});
-      /* iOS-Madeira ml200: FEX reports NOEXEC for libcef code addresses even though the
-       * ntdll side proves the map notification arrives and nothing ever removes the
-       * interval. So log the actual inserts (with `this`, since each pseudo-process runs
-       * its own xtajit64 copy and its own tracker) and pair it with the query-side log in
-       * QueryGuestExecutableRange. If the insert and the failing query name different
-       * `this`, the registration is landing in a different process's tracker. */
-      LogMan::Msg::EFmt("[iOS-xins] tracker={} {} sec={:#x}-{:#x}", static_cast<void*>(this), Name,
-                        SectionBase, SectionEnd);
+  for (auto* Section = SectionsBegin; Section != SectionsEnd;) {
+    ExecSection Batch[32];
+    unsigned Count = 0;
+
+    for (; Section != SectionsEnd && Count < std::size(Batch); Section++) {
+      if (!(Section->Characteristics & IMAGE_SCN_MEM_EXECUTE)) {
+        continue;
+      }
+      const uint64_t SectionBase = Address + Section->VirtualAddress;
+      const uint64_t SectionEnd = SectionBase + Section->Misc.VirtualSize;
       LastExecutableSectionEnd = std::max(LastExecutableSectionEnd, SectionEnd);
-      if (Section->Characteristics & IMAGE_SCN_MEM_WRITE) {
-        LogMan::Msg::DFmt("Add image SMC interval: {:X} - {:X}", SectionBase, SectionBase + Section->Misc.VirtualSize);
-        RWXIntervals.Insert({SectionBase, SectionBase + Section->Misc.VirtualSize});
+      Batch[Count++] = {SectionBase, SectionEnd, (Section->Characteristics & IMAGE_SCN_MEM_WRITE) != 0};
+    }
+
+    if (!Count) {
+      continue;
+    }
+
+    {
+      TrackerLockScope Reentry;
+      std::unique_lock Lock(IntervalsLock);
+      for (unsigned i = 0; i < Count; i++) {
+        XIntervals.Insert({Batch[i].Base, Batch[i].End});
+        if (Batch[i].Writable) {
+          RWXIntervals.Insert({Batch[i].Base, Batch[i].End});
+        }
+      }
+    }
+
+    /* iOS-Madeira ml200: FEX reports NOEXEC for code addresses even though the ntdll side
+     * proves the map notification arrives and nothing ever removes the interval. So log the
+     * actual inserts (with `this`, since each pseudo-process runs its own xtajit64 copy and
+     * its own tracker) and pair it with the query-side log in QueryGuestExecutableRange. If
+     * the insert and the failing query name different `this`, the registration is landing in
+     * a different process's tracker.
+     * ml760: printed after the lock is dropped -- the insert has already happened, so the
+     * line still means "this range IS registered". */
+    for (unsigned i = 0; i < Count; i++) {
+      LogMan::Msg::EFmt("[iOS-xins] tracker={} {} sec={:#x}-{:#x}", static_cast<void*>(this), Name, Batch[i].Base, Batch[i].End);
+      if (Batch[i].Writable) {
+        LogMan::Msg::DFmt("Add image SMC interval: {:X} - {:X}", Batch[i].Base, Batch[i].End);
       }
     }
   }
@@ -328,6 +907,11 @@ void InvalidationTracker::HandleImageMap(std::string_view Name, uint64_t Address
 }
 
 InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::InvalidateContainingSection(uint64_t Address, bool Free) {
+  // ml760: reached from NotifyUnmapViewOfSection; takes both locks below.
+  if (TrackerReentered("InvalidateContainingSection", Address, 0)) {
+    return {Address, 0};
+  }
+
   MEMORY_BASIC_INFORMATION Info;
   if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Address), MemoryBasicInformation, &Info, sizeof(Info), nullptr)) {
     return {Address, 0};
@@ -342,20 +926,60 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
     SectionSize += Info.RegionSize;
   }
 
-  InvalidateIntervalInternal(SectionBase, SectionSize);
+  /* ml630 (#78): skip the exclusive-locked invalidation when this section provably holds no
+   * translated code. See the SkipEmptyInvalidate note above for why XIntervals is the exact
+   * discriminator. Section bounds are still computed and returned, so HandleImageUnmap is
+   * unaffected. */
+  bool MayHoldCode = true;
+  // ml1100: decided in the same shared-lock scope; see SkipEmptyRemove.
+  bool MayNeedRemove = true;
+  if (SkipEmptyInvalidate()) {
+    TrackerLockScope Reentry;
+    std::shared_lock Lock(IntervalsLock);
+    MayHoldCode = XIntervals.Intersect({SectionBase, SectionBase + SectionSize});
+    MayNeedRemove = MayHoldCode || RWXIntervals.Intersect({SectionBase, SectionBase + SectionSize});
+  }
+
+  if (MayHoldCode) {
+    InvalKeptSection.fetch_add(1, std::memory_order_relaxed);
+    InvalidateIntervalInternal(SectionBase, SectionSize);
+  } else {
+    InvalSkippedSection.fetch_add(1, std::memory_order_relaxed);
+  }
+  ReportInvalidationFilter();
 
   if (Free) {
-    std::unique_lock Lock(IntervalsLock);
-    LogMan::Msg::EFmt("[iOS-xrem] via=section tracker={} {:#x}-{:#x}", static_cast<void*>(this),
-                      SectionBase, SectionBase + SectionSize);
-    XIntervals.Remove({SectionBase, SectionBase + SectionSize});
-    RWXIntervals.Remove({SectionBase, SectionBase + SectionSize});
+    if (MayNeedRemove || !SkipEmptyRemove()) {
+      // ml760: remove under the lock, log after releasing it -- EFmt allocates.
+      RemoveTaken.fetch_add(1, std::memory_order_relaxed);
+      TrackerLockScope Reentry;
+      std::unique_lock Lock(IntervalsLock);
+      XIntervals.Remove({SectionBase, SectionBase + SectionSize});
+      RWXIntervals.Remove({SectionBase, SectionBase + SectionSize});
+    } else {
+      RemoveSkipped.fetch_add(1, std::memory_order_relaxed);
+    }
+    /* ml630 (#78): this was 72,072 of the 137,368 lines in a 20-minute session - 55% of the
+     * whole log, one dprintf syscall each, for ~880 ranges repeating a fixed cycle. Sample it
+     * exactly as via=aligned is sampled (first 32, then 1-in-1024): the signal is WHICH range
+     * a section removal covers, which a sample carries, not the rate. */
+    static std::atomic<uint32_t> SectionRemoveCount;
+    const auto N = SectionRemoveCount.fetch_add(1) + 1;
+    if (N <= 32 || !(N & 1023)) {
+      LogMan::Msg::EFmt("[iOS-xrem] via=section #{} tracker={} {:#x}-{:#x}", N, static_cast<void*>(this),
+                        SectionBase, SectionBase + SectionSize);
+    }
   }
 
   return {SectionBase, SectionSize};
 }
 
 void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t Size, bool Free) {
+  // ml760: reached from NotifyMemoryFree; takes CodeInvalidationMutex and IntervalsLock below.
+  if (TrackerReentered("InvalidateAlignedInterval", Address, Size)) {
+    return;
+  }
+
   if (!Address) {
     // Match the Windows behaviour when passed a NULL base address.
     Size = std::numeric_limits<uint64_t>::max();
@@ -364,23 +988,60 @@ void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t S
   const auto AlignedBase = Address & FEXCore::Utils::FEX_PAGE_MASK;
   const auto AlignedSize = std::max(Size, (Address - AlignedBase + Size + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK);
 
-  InvalidateIntervalInternal(AlignedBase, AlignedSize);
+  /* ml630 (#78): same filter as InvalidateContainingSection, and this is the higher-volume
+   * path by far - ~2.9M guest frees in a 20-minute session, each one an exclusive
+   * CodeInvalidationMutex acquisition plus a walk of every thread's lookup cache. The
+   * Address==0 ("everything") case is left unfiltered on purpose: it is rare and the
+   * clamped end would overflow. */
+  bool MayHoldCode = true;
+  // ml1100: decided in the same shared-lock scope; see SkipEmptyRemove.
+  bool MayNeedRemove = true;
+  if (Address && SkipEmptyInvalidate()) {
+    TrackerLockScope Reentry;
+    std::shared_lock Lock(IntervalsLock);
+    MayHoldCode = XIntervals.Intersect({AlignedBase, AlignedBase + AlignedSize});
+    MayNeedRemove = MayHoldCode || RWXIntervals.Intersect({AlignedBase, AlignedBase + AlignedSize});
+  }
+
+  if (MayHoldCode) {
+    InvalKeptAligned.fetch_add(1, std::memory_order_relaxed);
+    InvalidateIntervalInternal(AlignedBase, AlignedSize);
+  } else {
+    InvalSkippedAligned.fetch_add(1, std::memory_order_relaxed);
+  }
+  ReportInvalidationFilter();
 
   if (Free) {
-    std::unique_lock Lock(IntervalsLock);
+    if (MayNeedRemove || !SkipEmptyRemove()) {
+      // ml760: remove under the lock, report after releasing it.
+      RemoveTaken.fetch_add(1, std::memory_order_relaxed);
+      TrackerLockScope Reentry;
+      std::unique_lock Lock(IntervalsLock);
+      XIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
+      RWXIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
+    } else {
+      RemoveSkipped.fetch_add(1, std::memory_order_relaxed);
+    }
     // ml437 (#74): this fires on EVERY guest free/decommit (the ml201 probe is
     // unconditional) — ml436 logged 4,234 lines of ordinary heap decommit
     // churn, drowning the log and costing a dprintf syscall per free. The
     // signal (which path removes a tracked range) is preserved by the first 40
     // plus a 1-in-64 sample.
+    //
+    // ml998: 1-in-64 was measured against ml436's 4,234 events. A real play
+    // session runs 3.8 M of them (qp4.txt, 934 s: 4,000 guest frees a second),
+    // so the "sampled" line was still the second largest thing in the log —
+    // 58,854 lines. The sample is what carries the signal here, not the rate,
+    // so widen it to 1-in-1024 and keep a first-32 prefix for the boot-time
+    // sequence, where every removal is worth seeing. 3.8 M events then cost
+    // ~3.7 k lines instead of 59 k, and the decision the sample informs (which
+    // path removes a tracked range, and how big) is unchanged.
     static std::atomic<uint32_t> AlignedRemoveCount;
     const auto N = AlignedRemoveCount.fetch_add(1) + 1;
-    if (N <= 40 || !(N & 63)) {
+    if (N <= 32 || !(N & 1023)) {
       LogMan::Msg::EFmt("[iOS-xrem] via=aligned #{} tracker={} {:#x}-{:#x}", N, static_cast<void*>(this),
                         AlignedBase, AlignedBase + AlignedSize);
     }
-    XIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
-    RWXIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
   }
 }
 
@@ -389,10 +1050,28 @@ void InvalidationTracker::ReprotectRWXIntervals(uint64_t Address, uint64_t Size)
 }
 
 bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPc, uint64_t FaultAddress) {
+  // ml760: a fault taken while this thread is already inside the tracker cannot be serviced
+  // here without re-locking. Decline it -- the caller then treats it as an ordinary AV --
+  // rather than park the thread forever.
+  if (TrackerReentered("HandleRWXAccessViolation", FaultAddress, 0)) {
+    return false;
+  }
+
+  // ml2000: in host-data mode the untrap covers the whole 16 KB host page, clipped to the RWX
+  // interval that contains the fault (see IosHostPageRound). Otherwise exactly one FEX page.
+  uint64_t UntrapBegin = FaultAddress & FEXCore::Utils::FEX_PAGE_MASK;
+  uint64_t UntrapEnd = UntrapBegin + FEXCore::Utils::FEX_PAGE_SIZE;
   const auto [NeedsInvalidate, UntrapProt] = [&](uint64_t Address) -> std::pair<bool, ULONG> {
+    TrackerLockScope Reentry;
     std::shared_lock Lock(IntervalsLock);
-    if (!RWXIntervals.Query(Address).Enclosed) {
+    const auto Query = RWXIntervals.Query(Address);
+    if (!Query.Enclosed) {
       return {false, 0};
+    }
+    if (IosGuestRwxDataMode()) {
+      const auto Host = IosHostPageRound(Address, 1);
+      UntrapBegin = std::max(Host.Begin, Query.Interval.Offset);
+      UntrapEnd = std::min(Host.End, Query.Interval.End);
     }
     return {true, GetUntrapProt(Address)};
   }(FaultAddress);
@@ -400,14 +1079,30 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
   if (NeedsInvalidate) {
     // IntervalsLock cannot be held during invalidation
     {
+      // ml760: NtProtectVirtualMemory below re-enters NotifyMemoryProtect ->
+      // HandleMemoryProtectionNotification, which would take CodeInvalidationMutex again
+      // (via InvalidateIntervalInternal) on this very thread. The guard makes that
+      // notification bail out; what it skips is the untrap this code just performed and
+      // has already accounted for.
+      TrackerLockScope Reentry;
       std::scoped_lock Lock(CTX.GetCodeInvalidationMutex());
 
-      InvalidateIntervalInternalLocked(FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE);
+      InvalidateIntervalInternalLocked(UntrapBegin, UntrapEnd - UntrapBegin);
 
       // Invalidate, then unprotect the faulting page with the compilation lock held to ensure that any racing invalidations are not dropped.
       ULONG TmpProt;
       void* TmpAddress = reinterpret_cast<void*>(FaultAddress);
       SIZE_T TmpSize = 1;
+      if (IosGuestRwxDataMode()) {
+        TmpAddress = reinterpret_cast<void*>(UntrapBegin);
+        TmpSize = static_cast<SIZE_T>(UntrapEnd - UntrapBegin);
+        const auto N = IosHostPageUntraps.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (N <= 8 || !(N & 0xFFFF)) {
+          LogMan::Msg::EFmt("[rwx-data] ml2000 SMC untrap #{} fault={:#x} -> [{:#x},{:#x}) invalidated+unprotected "
+                            "(whole host page, clipped to the RWX interval)",
+                            N, FaultAddress, UntrapBegin, UntrapEnd);
+        }
+      }
       NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, UntrapProt, &TmpProt);
     }
     DetectMonoBackpatcherBlock(Thread, HostPc);
@@ -431,7 +1126,54 @@ bool InvalidationTracker::BeginUntrackedWriteLocked(uint64_t Address, uint64_t S
  * NotifyMemoryFree), neither of which was instrumented. Tag each site so the culprit
  * path names itself. */
 FEXCore::HLE::ExecutableRangeInfo InvalidationTracker::QueryExecutableRange(uint64_t Address) {
-  std::shared_lock Lock(IntervalsLock);
+  {
+    // The hot path: one interval query under a shared lock, exactly as before. A zero Size means
+    // "not executable", which only has a second chance to be answered when DEP is off.
+    std::shared_lock Lock(IntervalsLock);
+    const auto Info = QueryExecutableRangeLocked(Address);
+    if (Info.Size || !DEPDisabled) {
+      return Info;
+    }
+  }
+
+  /* MADEIRA: LAZY DEP PROMOTION - the decode-time half of DEP-off.
+   *
+   * The sweep in HandleProcessExecuteFlagsChange only sees what is mapped at the moment DEP is
+   * switched off. Everything a copy-protection layer does afterwards - VirtualAlloc a scratch
+   * buffer, decrypt the next stage into it, jump in - arrives later, and while
+   * BTCpuNotifyMemoryAlloc/Protect do cover the ordinary paths, they cannot cover a page that
+   * became executable without any guest syscall at all (a section view committed on demand, a
+   * page some other pseudo-process wrote, a range whose notification was dropped by the ml760
+   * re-entrancy guard).
+   *
+   * This is the port's equivalent of upstream's "execute fault on a committed page in a
+   * non-DEP process grants execute" (which upstream spells as force_exec_prot, applied at
+   * mprotect time). Doing it HERE rather than on the fault is what makes it usable: the
+   * decoder asks before it emits anything, so the block is compiled correctly the first time.
+   * Promoting after the NoExec trap has been emitted would mean unwinding an already-running
+   * block and re-entering the JIT at the same RIP from a signal handler.
+   *
+   * Only IntervalsLock is taken. In particular NO invalidation is performed - nothing can have
+   * been compiled for a range the decoder is only now asking about - which matters because this
+   * runs with CodeInvalidationMutex already held SHARED by the compiling thread, and that mutex
+   * has no shared->exclusive upgrade.
+   *
+   * A decode miss that is NOT a committed readable page falls through to a zero-size result, so
+   * a genuine wild branch still raises NoExecOp and still faults. DEP off does not mean "every
+   * address is code". */
+  if (TrackerReentered("QueryExecutableRange", Address, 0)) {
+    return {};
+  }
+  TrackerLockScope Reentry;
+  std::unique_lock Lock(IntervalsLock);
+  if (!XIntervals.Query(Address).Enclosed && !PromoteDEPRegionLocked(Address).End) {
+    return {};
+  }
+  return QueryExecutableRangeLocked(Address);
+}
+
+// NOTE: IntervalsLock must be held (shared or exclusive) by the caller.
+FEXCore::HLE::ExecutableRangeInfo InvalidationTracker::QueryExecutableRangeLocked(uint64_t Address) {
   const auto XResult = XIntervals.Query(Address);
   if (!XResult.Enclosed) {
     return {};
@@ -454,7 +1196,12 @@ void InvalidationTracker::DetectMonoBackpatcherBlock(FEXCore::Core::InternalThre
     return;
   }
 
-  uint64_t RIP = CTX.RestoreRIPFromHostPC(Thread, HostPc);
+  // MADEIRA: RestoreRIPFromHostPC returns a GUEST rip, while MonoBase/MonoEnd come from
+  // HandleImageMap and are therefore HOST addresses (see the namespace note in the header). Lift
+  // the RIP into the host namespace for the module-range test and for the code reads below; the
+  // BlockEntry used further down stays guest, because it is a FEXCore invalidation key.
+  const uint64_t GuestRIP = CTX.RestoreRIPFromHostPC(Thread, HostPc);
+  const uint64_t RIP = GuestRIP ? GuestRIP + GuestBase : 0;
   if (!RIP || RIP < MonoBase || RIP >= MonoEnd) {
     return;
   }
@@ -481,10 +1228,11 @@ void InvalidationTracker::DetectMonoBackpatcherBlock(FEXCore::Core::InternalThre
     if (!Reported) {
       Reported = true;
       const auto* Bytes = reinterpret_cast<const uint8_t*>(RIP);
+      // MADEIRA: BlockEntry is guest, MonoBase is host, so lift the block entry for the RVA.
       LogMan::Msg::EFmt("[mono-site] ml712 FIRST detect rip={:#x} (mono+{:#x}) block={:#x} (mono+{:#x}) "
                         "bytes={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
-                        RIP, RIP - MonoBase, BlockEntry, BlockEntry - MonoBase, Bytes[0], Bytes[1], Bytes[2], Bytes[3],
-                        Bytes[4], Bytes[5], Bytes[6], Bytes[7]);
+                        RIP, RIP - MonoBase, BlockEntry, BlockEntry + GuestBase - MonoBase, Bytes[0], Bytes[1], Bytes[2],
+                        Bytes[3], Bytes[4], Bytes[5], Bytes[6], Bytes[7]);
     }
   }
 #ifndef FEX_IOS_HOST
@@ -494,15 +1242,33 @@ void InvalidationTracker::DetectMonoBackpatcherBlock(FEXCore::Core::InternalThre
    * that cannot change. The win here comes purely from MarkMonoBackpatcherBlock
    * plus the alias-directed MonoBackpatcherWrite. */
   DisableSMCDetection();
+#else
+  /* ml2000: in host-data mode the guest VA of anonymous RWX memory IS plain host RW memory, so
+   * upstream's reasoning applies again: once the runtime is known to flush the instruction cache
+   * after emitting code (Mono does), stop trapping and let FlushInstructionCache +
+   * MonoBackpatcherWrite provide coherence. This also guarantees that MonoBackpatcherWrite's
+   * direct store (no alias) never targets a trapped page while CodeInvalidationMutex is held. */
+  if (IosGuestRwxDataMode()) {
+    static std::atomic<uint32_t> DisableLogCount {0};
+    if (DisableLogCount.fetch_add(1, std::memory_order_relaxed) < 4) {
+      LogMan::Msg::EFmt("[rwx-data] ml2000 Mono backpatcher detected: SMC write-trapping DISABLED for this process "
+                        "(upstream behaviour; code coherence now via FlushInstructionCache)");
+    }
+    DisableSMCDetection();
+  }
 #endif
   {
     std::scoped_lock CodeLock(CTX.GetCodeInvalidationMutex());
     CTX.MarkMonoBackpatcherBlock(BlockEntry);
   }
-  InvalidateAlignedInterval(BlockEntry, FEXCore::Utils::FEX_PAGE_SIZE, false);
+  // MADEIRA: InvalidateAlignedInterval takes host addresses like the rest of this class.
+  InvalidateAlignedInterval(BlockEntry + GuestBase, FEXCore::Utils::FEX_PAGE_SIZE, false);
 }
 
 void InvalidationTracker::DisableSMCDetection() {
+  // ml760: NtProtectVirtualMemory is called inside this exclusive hold, and its
+  // NotifyMemoryProtect callback lands back in HandleMemoryProtectionNotification.
+  TrackerLockScope Reentry;
   std::unique_lock Lock(IntervalsLock);
   SMCDetectionDisabled = true;
   uint64_t Address = 0;
@@ -536,12 +1302,29 @@ ULONG InvalidationTracker::GetUntrapProt(uint64_t Address) const {
 }
 
 void InvalidationTracker::InvalidateIntervalInternal(uint64_t Address, uint64_t Size) {
+  // ml760: CodeInvalidationMutex is a WritePriorityMutex and is no more recursive than
+  // IntervalsLock. Invalidation allocates (code buffers, per-thread caches), so the same
+  // allocator re-entry that deadlocks IntervalsLock deadlocks this one too.
+  TrackerLockScope Reentry;
   std::scoped_lock CodeLock(CTX.GetCodeInvalidationMutex());
   InvalidateIntervalInternalLocked(Address, Size);
 }
 
 void InvalidationTracker::InvalidateIntervalInternalLocked(uint64_t Address, uint64_t Size) {
   // NOTE: This assumes CodeInvalidationMutex is locked by the caller
+  //
+  // MADEIRA: this is the boundary. `Address` is a host address (see the namespace note in the
+  // header); FEXCore's code buffers and per-thread lookup caches are keyed on guest addresses, so
+  // convert here. A host address outside the window has no guest counterpart and cannot name guest
+  // code, so there is nothing to invalidate - this is how the FEX code pool's own addresses, which
+  // also flow through the BTCpuNotifyMemory* callbacks, get filtered out.
+  if (GuestBase) {
+    if (Address < GuestBase || (Address - GuestBase) >= (1ULL << 32)) {
+      return;
+    }
+    Address -= GuestBase;
+  }
+
   CTX.InvalidateCodeBuffersCodeRange(Address, Size);
   for (auto Thread : Threads) {
     CTX.InvalidateThreadCachedCodeRange(Thread.second, Address, Size);
@@ -549,7 +1332,18 @@ void InvalidationTracker::InvalidateIntervalInternalLocked(uint64_t Address, uin
 }
 
 bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t Size, bool ForWriteLocked) {
+  // ml2000: host-data mode traps/untraps whole 16 KB host pages; the loop below already clips each
+  // protection to the RWX interval it hits. Identity when the mode is off.
+  {
+    const auto Host = IosHostPageRound(Address, Size);
+    Address = Host.Begin;
+    Size = Host.End - Host.Begin;
+  }
   const auto End = Address + Size;
+  // ml760: NtProtectVirtualMemory runs inside this SHARED hold. Its NotifyMemoryProtect
+  // callback wants IntervalsLock EXCLUSIVELY on this same thread, and std::shared_mutex has
+  // no shared->exclusive upgrade, so without the guard this is a self-deadlock too.
+  TrackerLockScope Reentry;
   std::shared_lock Lock(IntervalsLock);
 
   if (SMCDetectionDisabled) {
