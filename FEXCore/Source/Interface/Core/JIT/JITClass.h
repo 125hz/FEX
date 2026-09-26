@@ -315,9 +315,72 @@ private:
     return IsFPR(IR::PhysicalRegister(Wrap).AsRegClass());
   }
 
+  // MADEIRA: Guest window support. See Arm64Emitter.h (REG_GUEST_BASE) and Context.h
+  // (Config.GuestBase) for the contract.
+  //
+  // Every IR op that dereferences a guest address must convert it to a host address exactly once,
+  // and the conversion must be applied to the *completed* effective address - never to one component
+  // of it. Adding a displacement on top of an already-converted address is wrong two ways: an x86
+  // effective address wraps modulo 2^32 (so `Base + zext32(EA) + disp` can leave the window at the
+  // top) and a negative displacement can take the access *below* the window base, into whatever
+  // another pseudo-process owns. GuestMemAddr therefore folds any offset into the guest address
+  // first, at 32-bit width, and only then adds the base.
+  struct GuestMemAddr {
+    // Host address base register for the access.
+    ARMEmitter::Register Base;
+    // Offset still to be encoded into the memory operand. Always invalid when a guest window is
+    // active, because the offset has already been folded into Base.
+    IR::OrderedNodeWrapper Offset;
+    IR::MemOffsetType OffsetType;
+    uint8_t OffsetScale;
+
+    // MADEIRA ml920: set when the window add was folded into the addressing mode itself, i.e. the
+    // access is `[REG_GUEST_BASE, IndexReg, UXTW #0]` with IndexReg holding the completed *guest*
+    // effective address. Base is REG_GUEST_BASE in that case and Offset is invalid. Only ever set
+    // for ops that asked for it (AllowRegOffsetFold) and that lower to a plain ldr/str, which is
+    // the only family with a register-offset form: the acquire/release and atomic encodings have
+    // none, and the unaligned back-patcher must keep seeing them in the `[Xn]` shape.
+    bool RegOffsetFold {false};
+    ARMEmitter::Register IndexReg {ARMEmitter::Reg::zr};
+  };
+
+  // Converts a guest address operand (plus its offset) into a host addressing description.
+  // Without a guest window this is the identity and emits nothing, so identity-mapped builds are
+  // unchanged. `Tmp` defaults to the reserved REG_GUEST_ADDR_TMP, which is never register
+  // allocated; pass a different scratch only when an op needs two converted addresses live at once
+  // (MemCpy is the only such op).
+  //
+  // `HostAddr` says the operand is already a host pointer (IROp_LoadMem/IROp_StoreMem::HostAddr,
+  // set only for FEXCore's own context-relative storage) and must be dereferenced as-is.
+  //
+  // MADEIRA ml920: `AllowRegOffsetFold` says the caller will consume the result through the
+  // GuestMemAddr overload of GenerateMemOperand and lowers to a plain ldr/str, so the `add Tmp,
+  // REG_GUEST_BASE, wEA, uxtw` may be folded into the addressing mode instead of emitted. Pass it
+  // only from such sites: it is wrong for ldar/stlr/ldapr/ldapur/stlur (no register-offset
+  // encoding, and the unaligned back-patcher decodes them), for anything that re-derives working
+  // pointers from GuestMemAddr::Base, and for the SVE forms, whose operand has no extend field.
+  [[nodiscard]]
+  GuestMemAddr GetGuestMemAddr(IR::OpSize AccessSize, IR::OrderedNodeWrapper Addr, IR::OrderedNodeWrapper Offset,
+                               IR::MemOffsetType OffsetType, uint8_t OffsetScale, ARMEmitter::Register Tmp = REG_GUEST_ADDR_TMP.R(),
+                               bool HostAddr = false, bool AllowRegOffsetFold = false);
+
+  // Shorthand for the (common) case of an address with no separate offset operand.
+  [[nodiscard]]
+  ARMEmitter::Register GetGuestMemReg(IR::OrderedNodeWrapper Addr, ARMEmitter::Register Tmp = REG_GUEST_ADDR_TMP.R());
+
+  // Converts an already-materialised guest address held in `GuestReg` into a host address in `Tmp`.
+  // Used by ops that compute a guest pointer themselves (MemSet/MemCpy working pointers, gather
+  // bases) rather than taking one straight out of an IR operand.
+  [[nodiscard]]
+  ARMEmitter::Register ApplyGuestBase(ARMEmitter::Register GuestReg, ARMEmitter::Register Tmp = REG_GUEST_ADDR_TMP.R());
+
   [[nodiscard]]
   ARMEmitter::ExtendedMemOperand GenerateMemOperand(IR::OpSize AccessSize, ARMEmitter::Register Base, IR::OrderedNodeWrapper Offset,
                                                     IR::MemOffsetType OffsetType, uint8_t OffsetScale);
+
+  // MADEIRA ml920: the GuestMemAddr form, which is the only one that can honour RegOffsetFold.
+  [[nodiscard]]
+  ARMEmitter::ExtendedMemOperand GenerateMemOperand(IR::OpSize AccessSize, const GuestMemAddr& Guest);
 
   [[nodiscard]]
   ARMEmitter::Register ApplyMemOperand(IR::OpSize AccessSize, ARMEmitter::Register Base, ARMEmitter::Register Tmp,

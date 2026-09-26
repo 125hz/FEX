@@ -110,7 +110,10 @@ void OpDispatchBuilder::SyscallOp(OpcodeArgs, bool IsSyscallInst) {
 
 void OpDispatchBuilder::ThunkOp(OpcodeArgs) {
   const auto GPRSize = GetGPROpSize();
-  uint8_t* sha256 = (uint8_t*)(Op->PC + 2);
+  // MADEIRA: Op->PC is a guest RIP and the SHA256 literal lives in guest code immediately after the
+  // thunk opcode, so reading it is a guest read and needs the window. CTX->Config.GuestBase is 0 for
+  // every identity-mapped configuration, including all 64-bit modes.
+  uint8_t* sha256 = (uint8_t*)(CTX->Config.GuestBase + Op->PC + 2);
 
   if (Is64BitMode) {
     // x86-64 ABI puts the function argument in RDI
@@ -4216,7 +4219,13 @@ void OpDispatchBuilder::UpdatePrefixFromSegment(Ref Segment, uint32_t SegmentReg
   // Fun quirk, if we mask the selector then it is premultiplied by 8 which we need to do for accessing anyway.
   auto SegmentOffset = _And(OpSize::i32Bit, Segment, _Constant(0xfff8));
   Ref SegmentBase = _LoadContextGPRIndexed(GDT, OpSize::i64Bit, offsetof(FEXCore::Core::CPUState, segment_arrays[0]), 8);
-  Ref NewSegment = _LoadMemGPR(OpSize::i64Bit, SegmentBase, SegmentOffset, OpSize::i8Bit, MemOffsetType::UXTW, 1);
+  // MADEIRA: `segment_arrays` holds HOST pointers to FEXCore's own descriptor tables (see
+  // CoreState.h; the WOW64 module allocates them with `new[]`, Module.cpp), so the descriptor read
+  // must not have the 32-bit guest window base applied to it. Only the descriptor's *contents* - the
+  // segment base written into `*_cached` below - are guest values. This op is reached from every
+  // 32-bit segment-register write (mov Sreg / pop Sreg / iret / far jmp / far call / retf), which is
+  // precisely where a guest window is active.
+  Ref NewSegment = _LoadMemHostGPR(OpSize::i64Bit, SegmentBase, SegmentOffset, OpSize::i8Bit, MemOffsetType::UXTW, 1);
   CheckLegacySegmentWrite(NewSegment, SegmentReg);
 
   // Extract the 32-bit base from the GDT segment.

@@ -131,10 +131,12 @@ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCo
   // regressed by ~388MB of `fex` band at a matched cycle and still died of
   // jetsam. Two reasons, both checkable in source:
   //
-  //   (a) Dispatcher.cpp's JITCallback sentinel push tests only
-  //       (sp - base) >> 24 — the WHOLE 16MB — so the callback path is not
-  //       bounded by this window at all. (What fraction of the 16MB it really
-  //       touches is measured by [dc-census] in wine's decommit_pages().)
+  //   (a) Dispatcher.cpp's JITCallback sentinel push USED to test only
+  //       (sp - base) >> 24 — the WHOLE 16MB — so the callback path was not
+  //       bounded by this window at all. ml708 moved it onto the shared
+  //       Arm64Emitter::EmitCallRetStackGuard, so every push/pop site now
+  //       enforces exactly this window. (What fraction of the 16MB is really
+  //       touched is measured by [dc-census] in wine's decommit_pages().)
   //
   //   (b) The clear RECLAIMS rather than dirties. VirtualDontNeed() is
   //       MEM_DECOMMIT + MEM_COMMIT, and on this (non-pool-aliased) range wine's

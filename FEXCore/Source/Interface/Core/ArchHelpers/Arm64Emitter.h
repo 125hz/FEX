@@ -112,6 +112,59 @@ extern "C" uint32_t IosTebTsdOffset;
 constexpr uint64_t EC_CODE_BITMAP_MAX_ADDRESS = 1ULL << 47;
 #endif
 
+// MADEIRA: Guest window registers ("the base register"). These are reserved *only* in 32-bit mode
+// and *only* when a non-zero GUEST32BASE has been configured (ContextImpl::Config.GuestBase). In
+// every other configuration - all 64-bit modes, ARM64EC, and identity-mapped 32-bit Linux - they
+// stay in the 32-bit dynamic register-allocation pool (x32::RA), nothing below changes, and the
+// emitted code is byte-identical to upstream.
+//
+// REG_GUEST_BASE holds the host address of guest address 0 for the lifetime of a JIT entry.
+// REG_GUEST_ADDR_TMP receives `REG_GUEST_BASE + zext32(EA)` immediately before a guest memory
+// access; see Arm64JITCore::GetGuestMemReg. It is never register-allocated, so no emitter site has
+// to reason about whether it collides with TMP1-TMP4 or with a live IR value.
+//
+// Both are taken from the *tail* of x32::RA:
+//  - x19 and x24 are AAPCS64 callee-saved, so they survive every host call the JIT makes
+//    (including `preserve_all` calls, which clobber only X0-X8/X16-X18/X30) and every OS callback.
+//    Neither needs spilling or filling around calls.
+//  - Neither is inside x32::RA's leading pair-allocatable range (x32::RAPairs == 10, covering
+//    r20,r21,r22,r23,r12,r13,r14,r15,r16,r17), so removing them does not disturb pair allocation.
+//  - Neither appears in x32::NotPreserved_Dynamic or x32::PreserveAll_Dynamic.
+// x18 is the only register genuinely unused by 32-bit mode, but it is the platform register on both
+// Windows (TEB) and iOS, so it cannot be used.
+//
+// Declared unconditionally because namespace x32 in Arm64Emitter.cpp is compiled for ARM64EC too;
+// GuestBase is always zero there so neither register is ever actually reserved.
+constexpr auto REG_GUEST_BASE = ARMEmitter::XReg::x19;
+constexpr auto REG_GUEST_ADDR_TMP = ARMEmitter::XReg::x24;
+
+// MADEIRA ml920: on the iOS WoW64 CPU module the call-ret shadow stack is WRITE-ONLY.
+//
+// The stack is a pure return-address PREDICTOR: a CALL pushes {guest_ret_rip, host_label} and a RET
+// pops it and takes a direct `br` to the host label when the guest half matches. Both readers of
+// that pair are already compiled out on this host:
+//   - JIT/BranchOps.cpp, the `cbz` shortcut after the pop  (ml305: stale entries could branch into
+//     the middle of an unrelated block, because the guard-page SEGV that upstream relies on to bound
+//     an unbalanced stack never fires under Wine-on-iOS),
+//   - Dispatcher/Dispatcher.cpp, the EnterEC opportunistic return (ARM64EC only, and also disabled).
+// Nothing else ever reads the data. What remains is 11 host instructions per guest CALL (a
+// 9-instruction EmitCallRetStackGuard, an `adr` and an `stp`) and 11 per guest RET (guard, `ldp`,
+// and a `sub` feeding the removed `cbz`) spent maintaining a structure with no consumer.
+//
+// The gate is deliberately `FEX_IOS_HOST && !ARCHITECTURE_arm64ec`: the ARM64EC module keeps every
+// byte of its current sequence (it threads State.callret_sp through EnterEC/ExitFunctionEC, so the
+// removal there is a separate question), and every non-iOS build is untouched, shadow stack and all.
+//
+// One thing survives the removal: the lone `adr TMP1, <after the bl>` at a linked CALL. It is not
+// the push any more, it is the KNOWN-CALL MARKER that Arm64JITCore::ExitFunctionLink sniffs to
+// decide whether to backpatch the callsite as `bl` or `b` (JIT.cpp). Keeping it keeps calls linked
+// as `bl`, which is what pairs with the `ret Xn` at the guest RET and keeps the hardware
+// return-address stack balanced. Its immediate and the offset the linker reads it from both shrink
+// by one instruction; JIT.cpp derives them from this macro so the two can never drift.
+#if defined(FEX_IOS_HOST) && !defined(ARCHITECTURE_arm64ec)
+#define FEX_CALLRET_STACK_UNUSED 1
+#endif
+
 // Will force one single instruction block to be generated first if set when entering the JIT filling SRA.
 // FillStaticRegs must preserve this
 constexpr auto ENTRY_FILL_SRA_SINGLE_INST_REG = TMP2;
@@ -144,6 +197,23 @@ public:
 
 protected:
   FEXCore::Context::ContextImpl* EmitterCTX;
+
+  // MADEIRA: Host address of guest address 0, or 0 for the usual identity mapping.
+  // Mirrors ContextImpl::Config.GuestBase and is only ever non-zero in 32-bit mode.
+  uint64_t GuestBase {};
+
+  // Emits the load of REG_GUEST_BASE. No-op unless a guest window is configured.
+  void LoadGuestBaseReg();
+
+#ifdef FEX_IOS_HOST
+  /* MADEIRA: emits the inline call-ret shadow-stack bounds guard + reset.
+   *
+   * Must be emitted before every `stp ..., [REG_CALLRET_SP, #-0x10]!` push and every
+   * `ldp ..., [REG_CALLRET_SP], #0x10` pop. Clobbers only `Scratch`, which must be a
+   * caller-chosen dead temporary at the emission site. See Arm64Emitter.cpp for the
+   * window arithmetic and why a reset is semantically free. */
+  void EmitCallRetStackGuard(ARMEmitter::XRegister Scratch);
+#endif
 
   std::span<const ARMEmitter::Register> StaticRegisters {};
   std::span<const ARMEmitter::Register> GeneralRegisters {};

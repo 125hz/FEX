@@ -216,8 +216,35 @@ namespace {
 /* Set by Core.cpp's decode loop when the block being compiled CONTAINS the
  * target instruction. Containment, NOT entry RIP: with multiblock the block
  * routinely starts hundreds of bytes earlier, so an entry-range gate (which is
- * what I first proposed) would have missed this block entirely. */
-thread_local uint64_t IRCapRIP = 0;
+ * what I first proposed) would have missed this block entirely.
+ *
+ * ⛔ NOT `thread_local`. `thread_local` IS BANNED IN THE WINDOWS PE BUILDS OF
+ * FEXCORE (xtajit64.dll / xtajit.dll) — see the same note at Core.cpp's
+ * [iOS-noexec] counters. EIGHTH DEVICE RUN of the 32-bit path died on the
+ * FIRST block compile because this one variable was thread_local:
+ *
+ *     FEX_MadeiraIRCapClear:
+ *       adrp x8, _tls_index
+ *       ldr  x9, [x18, #0x58]      ; TEB->ThreadLocalStoragePointer
+ *       ldr  w8, [x8, #:lo12:_tls_index]
+ *       ldr  x8, [x9, x8, lsl #3]  ; <-- fault, x9 == 0
+ *
+ * that is the compiler's native-Windows TLS sequence, and it reads the TEB
+ * through x18. On an iOS host x18 is the platform register: the kernel wipes it
+ * on return to EL0, which is precisely why every hand-written TEB read in the
+ * Windows modules goes through TPIDRRO_EL0 + a pthread TSD slot
+ * (Source/Windows/WOW64/IosTeb.h, ARM64EC/Module.cpp). No source-level policy
+ * can redirect a compiler-generated TLS access, so the only way to keep that
+ * invariant is for the module to contain no thread-local storage at all — this
+ * was the ONLY `.tls` variable in libwow64fex.dll, and removing it removes the
+ * section.
+ *
+ * Consequence of being process-global: two threads compiling at once share the
+ * mark, so a capture can be missed or attributed to the wrong compile. That is
+ * the correct trade for a diagnostic — it can lose a capture, it can never
+ * fault the emulator. Everything else here was already process-global
+ * (IRCapTaken, FEX_MadeiraIRCapTarget). */
+std::atomic<uint64_t> IRCapRIP {0};
 std::atomic<uint32_t> IRCapTaken {0};
 
 constexpr uint32_t IRCapMaxCaptures = 4; // a LATER generation may be the faulty one
@@ -412,14 +439,31 @@ void IRCapEmit(IREmitter* IREmit, const char* Stage, uint64_t GuestRIP, uint32_t
 
 } // namespace
 
+/* All three entry points are called unconditionally from the hot compile path
+ * (Core.cpp GenerateIR / CompileCode), so they must be inert AND touch nothing
+ * when the facility is disarmed, which is its state in every shipping build:
+ * FEX_MadeiraIRCapTarget is only ever written by InvalidationTracker when
+ * MADEIRA_IRCAP_RVA names a module that has just been mapped. A diagnostic must
+ * never be able to fault the emulator, so the target gate comes first and the
+ * storage below it is plain process-global atomics — no TLS, no allocation, no
+ * pointer to dereference. */
 extern "C" void FEX_MadeiraIRCapMark(uint64_t GuestRIP) {
-  IRCapRIP = GuestRIP;
+  if (!FEX_MadeiraIRCapTarget) {
+    return;
+  }
+  IRCapRIP.store(GuestRIP, std::memory_order_relaxed);
 }
 extern "C" void FEX_MadeiraIRCapClear() {
-  IRCapRIP = 0;
+  if (!FEX_MadeiraIRCapTarget) {
+    return;
+  }
+  IRCapRIP.store(0, std::memory_order_relaxed);
 }
 extern "C" uint64_t FEX_MadeiraIRCapCurrentRIP() {
-  return IRCapRIP;
+  if (!FEX_MadeiraIRCapTarget) {
+    return 0;
+  }
+  return IRCapRIP.load(std::memory_order_relaxed);
 }
 
 void PassManager::Run(IREmitter* IREmit) {

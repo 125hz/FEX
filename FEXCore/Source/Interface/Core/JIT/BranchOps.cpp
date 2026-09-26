@@ -166,41 +166,27 @@ DEF_OP(ExitFunction) {
         // previous BLR returns from native ARM64EC code (DXMT vtable methods,
         // ARM64EC entry thunks). Reload from State.callret_sp before pushing
         // the call-return frame so we don't stp to wherever x17 was left.
+        // Not needed off ARM64EC: REG_CALLRET_SP is x25 there, callee-saved and
+        // spilled/filled by Spill/FillStaticRegs, so the register is authoritative.
         ldr(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
-        // iOS-Madeira 2026-05-18: inline bounds-guard (Tier-2). iOS doesn't
-        // honor PAGE_NOACCESS on the callret stack's guard pages, so the
-        // SEH-driven HandleAccessViolation never resets the stack on
-        // underflow. Detect-and-reset inline before the `stp` to keep stack
-        // pointer in-range. Uses TMP1 as scratch; adr below re-initializes it.
-        {
-          ARMEmitter::ForwardLabel l_callret_ok;
-          /* iOS-Madeira ml263: the >>24 test only fires when the pointer leaves the
-           * ENTIRE 16MB region, so a large-but-in-range leak sails straight through.
-           * Measured on the CEF webhelper thread:
-           *   tid 0098 sp-base=0x2c8c40 -> 1.1MB pushed  (~36,000 nested calls)
-           *   tid 0078 sp-base=0x132900 -> 2.75MB pushed (~90,000 nested calls)
-           * while those threads' GUEST stacks had used only 2,264 and 10,008 bytes. 36,000
-           * nested calls cannot exist in 2.2KB of stack (every x86 CALL pushes >=8 bytes),
-           * so entries are pushed and never popped -- non-local exits (SEH unwind, C++
-           * throw) skip the guest RETs, and CEF init throws constantly.
-           *
-           * Bound it to a 4MB window CENTRED on DefaultLocation (base + 4MB): test
-           * (sp - (base + 2MB)) >> 22, so sp-base must stay in [2MB, 6MB). Caps pushes at
-           * ~131,072 entries (~65,536 nested calls), far beyond any real program.
-           *
-           * Resetting is SAFE, not a papering-over: this stack is purely a return-address
-           * PREDICTOR. A stale or missing entry fails the `sub TMP1, TMP1, RipReg` compare
-           * and falls through to the L1 lookup, which is always correct. A reset costs
-           * mispredictions, nothing else. */
-          ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp_base));
-          add(ARMEmitter::Size::i64Bit, TMP1, TMP1, 0x200000);
-          sub(ARMEmitter::Size::i64Bit, TMP1, REG_CALLRET_SP, TMP1);
-          lsr(ARMEmitter::Size::i64Bit, TMP1, TMP1, 22);
-          (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &l_callret_ok);
-          ldr(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp_base));
-          add(ARMEmitter::Size::i64Bit, REG_CALLRET_SP, REG_CALLRET_SP, 0x400000);
-          (void)Bind(&l_callret_ok);
+#endif
+#ifdef FEX_CALLRET_STACK_UNUSED
+        /* MADEIRA ml920: nothing reads this shadow stack on this host -- see FEX_CALLRET_STACK_UNUSED
+         * in Arm64Emitter.h. The guard and the `stp` push are gone; the `adr` stays as the
+         * known-call marker ExitFunctionLink sniffs at KnownCallMarkerDisp before the callsite,
+         * so a linked call is still backpatched to `bl` and stays paired with the `ret Xn` that the
+         * guest RET emits. TMP1 is dead immediately afterwards. 11 instructions -> 1. */
+        if (!Op->CallReturnBlock.IsInvalid()) {
+          PendingCallReturnTargetLabel = &CallReturnTargets.try_emplace(Op->CallReturnBlock.ID()).first->second;
+          (void)adr(TMP1, &l_CallReturn);
         }
+#else
+#ifdef FEX_IOS_HOST
+        /* MADEIRA ml708: inline bounds-guard before the `stp` push. Gated on the HOST, not on
+         * ARCHITECTURE_arm64ec -- the WoW64 module runs on the same iOS host with the same
+         * unenforced PAGE_NOACCESS guard pages. See Arm64Emitter::EmitCallRetStackGuard.
+         * Clobbers TMP1; the adr below re-initialises it. */
+        EmitCallRetStackGuard(TMP1);
 #endif
         if (!Op->CallReturnBlock.IsInvalid()) {
           auto CallReturnAddressReg = GetReg(Op->CallReturnAddress).X();
@@ -210,6 +196,7 @@ DEF_OP(ExitFunction) {
         } else {
           stp<ARMEmitter::IndexType::PRE>(ARMEmitter::XReg::zr, ARMEmitter::XReg::zr, REG_CALLRET_SP, -0x10);
         }
+#endif
 #ifdef ARCHITECTURE_arm64ec
         /* Write back post-push x17 so dispatcher LoopTop's reload picks
          * up the new top. Without this, in-register PUSH changes get
@@ -236,6 +223,12 @@ DEF_OP(ExitFunction) {
     ARMEmitter::ForwardLabel SkipFullLookup;
     auto RipReg = GetReg(Op->NewRIP);
 
+    /* MADEIRA ml920: the pop side of the dead shadow stack is compiled out under
+     * FEX_CALLRET_STACK_UNUSED. The CALL side no longer pushes, so the `ldp` would pop entries that
+     * were never written; the `sub` under it only ever fed the `cbz` that ml305 disabled. Both go,
+     * together with the guard, and a guest RET falls straight into the L1 probe -- which is exactly
+     * what it already did, minus 11 instructions. */
+#ifndef FEX_CALLRET_STACK_UNUSED
     if (Op->Hint == IR::BranchHint::Return) {
       // First try to pop from the call-ret stack, otherwise follow the normal path (but ending in a ret)
 #ifdef ARCHITECTURE_arm64ec
@@ -247,20 +240,11 @@ DEF_OP(ExitFunction) {
       // pop changes are lost on next dispatcher iteration — quantified
       // as ~1 leaked callret entry per block dispatch on Thumper FMOD.
       ldr(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
-      // iOS-Madeira 2026-05-18: inline bounds-guard (Tier-2) — see CALL push
-      // site for rationale. Reset to DefaultLocation if OOB before ldp.
-      {
-        ARMEmitter::ForwardLabel l_callret_ok;
-        /* iOS-Madeira ml263: tightened to a 4MB window -- see the first CALL push site. */
-        ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp_base));
-        add(ARMEmitter::Size::i64Bit, TMP1, TMP1, 0x200000);
-        sub(ARMEmitter::Size::i64Bit, TMP1, REG_CALLRET_SP, TMP1);
-        lsr(ARMEmitter::Size::i64Bit, TMP1, TMP1, 22);
-        (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &l_callret_ok);
-        ldr(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp_base));
-        add(ARMEmitter::Size::i64Bit, REG_CALLRET_SP, REG_CALLRET_SP, 0x400000);
-        (void)Bind(&l_callret_ok);
-      }
+#endif
+#ifdef FEX_IOS_HOST
+      /* MADEIRA ml708: inline bounds-guard before the `ldp` pop -- see the CALL push site.
+       * Host-gated, so the WoW64 module gets it too. Clobbers TMP1, which the ldp overwrites. */
+      EmitCallRetStackGuard(TMP1);
 #endif
       ldp<ARMEmitter::IndexType::POST>(TMP1, TMP2, REG_CALLRET_SP, 0x10);
 #ifdef ARCHITECTURE_arm64ec
@@ -302,20 +286,41 @@ DEF_OP(ExitFunction) {
       (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &SkipFullLookup);
 #endif
     }
+#endif // !FEX_CALLRET_STACK_UNUSED
 
     // L1 Cache
-    ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
+    if constexpr (LookupCache::L1_WAYS == 1) {
+      ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
 
-    // Calculate (tmp1 + ((ripreg & L1_ENTRIES_MASK) << 4)) for the address
-    // L1Mask is pre-shifted.
-    and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
-    add(TMP1, TMP1, TMP2);
+      // Calculate (tmp1 + ((ripreg & L1_ENTRIES_MASK) << 4)) for the address
+      // L1Mask is pre-shifted.
+      and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+      add(TMP1, TMP1, TMP2);
 
-    ldp<ARMEmitter::IndexType::OFFSET>(TMP2, TMP1, TMP1, 0);
+      ldp<ARMEmitter::IndexType::OFFSET>(TMP2, TMP1, TMP1, 0);
 
-    // Note: sub+cbnz used over cmp+br to preserve flags.
-    sub(TMP1, TMP1, RipReg.X());
-    (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &SkipFullLookup);
+      // Note: sub+cbnz used over cmp+br to preserve flags.
+      sub(TMP1, TMP1, RipReg.X());
+      (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &SkipFullLookup);
+    } else {
+      /* MADEIRA ml920: set-associative probe. The direct-mapped form above consumes the set pointer
+       * with its own ldp (TMP1 is both the address and the loaded GuestCode), so a second way needs
+       * the pointer kept somewhere: TMP3, which is emitter scratch and dead at a block exit.
+       *
+       * Cost model: a way-0 hit is the same six instructions as the direct-mapped probe; each
+       * further way adds ldp/sub/cbz and is only reached on a miss that would otherwise have gone
+       * straight to the C++ CompileBlock round trip. Flags are preserved throughout (sub without S,
+       * cbz), which this site requires. */
+      ldp<ARMEmitter::IndexType::OFFSET>(TMP3, TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
+      and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(LookupCache::L1_SET_BYTES));
+      add(TMP3, TMP3, TMP2);
+
+      for (size_t Way = 0; Way < LookupCache::L1_WAYS; ++Way) {
+        ldp<ARMEmitter::IndexType::OFFSET>(TMP2, TMP1, TMP3, Way * sizeof(LookupCache::LookupCacheEntry));
+        sub(TMP1, TMP1, RipReg.X());
+        (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &SkipFullLookup);
+      }
+    }
     ldr(TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.DispatcherLoopTop));
     str(RipReg.X(), STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
 
@@ -327,20 +332,22 @@ DEF_OP(ExitFunction) {
       // from State.callret_sp before pushing the call-return frame, since
       // native ARM64EC returns leave x17 pointing at an arbitrary RX page.
       ldr(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
-      // iOS-Madeira 2026-05-18: inline bounds-guard (Tier-2). Same as
-      // linked-path CALL push.
-      {
-        ARMEmitter::ForwardLabel l_callret_ok;
-        /* iOS-Madeira ml263: tightened to a 4MB window -- see the first CALL push site. */
-        ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp_base));
-        add(ARMEmitter::Size::i64Bit, TMP1, TMP1, 0x200000);
-        sub(ARMEmitter::Size::i64Bit, TMP1, REG_CALLRET_SP, TMP1);
-        lsr(ARMEmitter::Size::i64Bit, TMP1, TMP1, 22);
-        (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &l_callret_ok);
-        ldr(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp_base));
-        add(ARMEmitter::Size::i64Bit, REG_CALLRET_SP, REG_CALLRET_SP, 0x400000);
-        (void)Bind(&l_callret_ok);
+#endif
+#ifdef FEX_CALLRET_STACK_UNUSED
+      /* MADEIRA ml920: dead shadow stack, and unlike the linked CALL above there is no marker to
+       * keep here -- this callsite is a register `blr`, never backpatched, so ExitFunctionLink never
+       * looks at it. The whole push disappears: 11 instructions -> 0. `l_CallReturn` is left bound
+       * but unreferenced, which Emitter::Bind handles as a no-op, and PendingCallReturnTargetLabel
+       * still drives JIT.cpp's block layout exactly as before. */
+      if (!Op->CallReturnBlock.IsInvalid()) {
+        PendingCallReturnTargetLabel = &CallReturnTargets.try_emplace(Op->CallReturnBlock.ID()).first->second;
       }
+#else
+#ifdef FEX_IOS_HOST
+      /* MADEIRA ml708: inline bounds-guard before the `stp` push -- see the linked CALL push site.
+       * Host-gated. TMP1 is dead here (the lookup compare finished at SkipFullLookup) and TMP2,
+       * which carries the branch target for the `blr` below, is deliberately not touched. */
+      EmitCallRetStackGuard(TMP1);
 #endif
       if (!Op->CallReturnBlock.IsInvalid()) {
         auto CallReturnAddressReg = GetReg(Op->CallReturnAddress).X();
@@ -354,6 +361,7 @@ DEF_OP(ExitFunction) {
       /* Write back post-push x17 so dispatcher LoopTop reload sees it. */
       str(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
 #endif
+#endif // FEX_CALLRET_STACK_UNUSED
       blr(TMP2);
       (void)Bind(&l_CallReturn);
     } else if (Op->Hint == IR::BranchHint::Return) {
@@ -511,7 +519,11 @@ DEF_OP(Thunk) {
 DEF_OP(ValidateCode) {
   auto Op = IROp->C<IR::IROp_ValidateCode>();
   auto OldCode = Op->CodeOriginal.data();
-  auto Base = GetReg(Op->Header.Args[0]).X();
+  // MADEIRA: this reads guest code bytes to compare against the recorded originals, so it is a
+  // guest load like any other and needs the window applied. TMP1/TMP2 are consumed by the
+  // comparison below and Base has to stay live across the whole unrolled check, which the reserved
+  // REG_GUEST_ADDR_TMP guarantees.
+  auto Base = GetGuestMemReg(Op->Header.Args[0]).X();
   int len = Op->CodeLength;
   int Offset = 0;
   ARMEmitter::ForwardLabel Fail;

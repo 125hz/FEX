@@ -325,6 +325,19 @@ public:
     uint64_t VirtualMemSize {1ULL << 36};
     uint64_t TSCScale = 0;
 
+    // MADEIRA: Host address that guest address 0 lives at ("the guest window"), 32-bit mode only.
+    //
+    // Resolved once in the ContextImpl constructor from the GUEST32BASE config option, and forced
+    // to 0 whenever Is64BitMode() is set. Zero means the guest address space is identity mapped,
+    // which is what every non-Madeira configuration uses and what keeps the 64-bit/ARM64EC path
+    // bit-for-bit unchanged.
+    //
+    // When non-zero the JIT pins REG_GUEST_BASE to this value and forms host addresses as
+    // `GuestBase + zext32(EA)`. Everything that is *not* a dereferenced pointer - guest RIP,
+    // LookupCache keys, VirtualMemSize, segment bases, AddCustomIREntrypoint, and
+    // InvalidateGuestCodeRange - stays in the guest namespace.
+    uint64_t GuestBase {0};
+
     // Used if the JIT needs to have its interrupt fault code emitted.
     bool NeedsPendingInterruptFaultCheck {false};
 
@@ -332,7 +345,11 @@ public:
     FEX_CONFIG_OPT(SingleStepConfig, SINGLESTEP);
     FEX_CONFIG_OPT(GdbServer, GDBSERVER);
     FEX_CONFIG_OPT(Is64BitMode, IS64BIT_MODE);
+    FEX_CONFIG_OPT(Guest32BaseOption, GUEST32BASE);
     FEX_CONFIG_OPT(TSOEnabled, TSOENABLED);
+    // MADEIRA ml920: read by the JIT so the placeholder `nop` next to every TSO GPR access is only
+    // emitted when something can back-patch it into a half-barrier. See IsHalfBarrierTSOEnabled().
+    FEX_CONFIG_OPT(HalfBarrierTSOEnabled, HALFBARRIERTSOENABLED);
     FEX_CONFIG_OPT(VectorTSOEnabled, VECTORTSOENABLED);
     FEX_CONFIG_OPT(MemcpySetTSOEnabled, MEMCPYSETTSOENABLED);
     FEX_CONFIG_OPT(SMCChecks, SMCCHECKS);
@@ -419,6 +436,22 @@ public:
   // If atomic-based TSO emulation is enabled for memcpy operations.
   bool IsMemcpyAtomicTSOEnabled() const {
     return MemcpyAtomicTSOEmulationEnabled;
+  }
+
+  /* MADEIRA ml920: whether the unaligned back-patcher will turn the placeholder `nop` beside a
+   * ldar/ldapr/ldapur/stlr/stlur into a half-barrier.
+   *
+   * The JIT emits that nop unconditionally today, but its only consumer --
+   * ArchHelpers::Arm64::HandleUnalignedAccess -- writes over it only when the installed
+   * UnalignedHandlerType is not NonAtomic, and both frontends pick the type from this one option
+   * (Windows/Common/TSOHandlerConfig.h, LinuxSyscalls/SignalDelegator.h). With the option off the
+   * nop is dead weight: 4 bytes on every 16/32/64-bit TSO GPR load and store.
+   *
+   * The two readings must agree or the back-patcher writes a DMB over a real instruction, so both
+   * sides read this same process-wide option and nothing may consult it per-block. Default is true,
+   * so every build's emitted code is unchanged unless the option is explicitly turned off. */
+  bool IsHalfBarrierTSOEnabled() const {
+    return Config.HalfBarrierTSOEnabled;
   }
 
   void SetHardwareTSOSupport(bool HardwareTSOSupported) override {

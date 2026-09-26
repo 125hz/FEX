@@ -529,9 +529,20 @@
         "DestSize": "OpSize::i64Bit"
       },
 
-      "SSA = LoadMem RegisterClass:$Class, OpSize:#Size, GPR:$Addr, GPR:$Offset, OpSize:$Align, MemOffsetType:$OffsetType, u8:$OffsetScale": {
+      "SSA = LoadMem RegisterClass:$Class, OpSize:#Size, GPR:$Addr, GPR:$Offset, OpSize:$Align, MemOffsetType:$OffsetType, u8:$OffsetScale, i1:$HostAddr{false}": {
+        "Desc": ["Loads a value from memory.",
+                 "$Addr is a GUEST address unless $HostAddr is set. MADEIRA: with a 32-bit guest window",
+                 "active the backend turns a guest address into `GuestBase + zext32(EA + offset)`;",
+                 "$HostAddr marks the (rare) case where $Addr is already a host pointer - a context /",
+                 "thread-state relative address - and must be dereferenced as-is.",
+                 "$HostAddr is false everywhere except the x87 stack slow path, and is a no-op when no",
+                 "guest window is configured (all 64-bit and ARM64EC configurations)."
+                ],
         "Inline": ["", "Mem"],
-        "DestSize": "Size"
+        "DestSize": "Size",
+        "EmitValidation": [
+          "$HostAddr || !IsContextRelativeAddress($Addr)"
+        ]
       },
 
       "SSA:$Value1, SSA:$Value2 = LoadMemPair RegisterClass:$Class, OpSize:#Size, GPR:$Addr, u32:$Offset": {
@@ -540,14 +551,18 @@
         "HasSideEffects": true
       },
 
-      "StoreMem RegisterClass:$Class, OpSize:#Size, SSA:$Value, GPR:$Addr, GPR:$Offset, OpSize:$Align, MemOffsetType:$OffsetType, u8:$OffsetScale": {
+      "StoreMem RegisterClass:$Class, OpSize:#Size, SSA:$Value, GPR:$Addr, GPR:$Offset, OpSize:$Align, MemOffsetType:$OffsetType, u8:$OffsetScale, i1:$HostAddr{false}": {
         "Desc": [ "Stores a value to memory.",
                   "Zero Extends if value's type is too small",
-                  "Truncates if value's type is too large"
+                  "Truncates if value's type is too large",
+                  "$Addr is a GUEST address unless $HostAddr is set. See LoadMem for what $HostAddr means."
                 ],
         "Inline": ["Zero", "", "Mem"],
         "HasSideEffects": true,
-        "DestSize": "Size"
+        "DestSize": "Size",
+        "EmitValidation": [
+          "$HostAddr || !IsContextRelativeAddress($Addr)"
+        ]
       },
 
       "StoreMemPair RegisterClass:$Class, OpSize:#Size, SSA:$Value1, SSA:$Value2, GPR:$Addr, u32:$Offset": {

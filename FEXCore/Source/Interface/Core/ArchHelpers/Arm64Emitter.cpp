@@ -5,6 +5,7 @@
 
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Core/X86Enums.h>
+#include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/MathUtils.h>
 
@@ -20,6 +21,7 @@
 #endif
 
 #include <array>
+#include <cstdlib>   /* ml1050: getenv for FEX_X32_RECLAIM_CALLRET */
 #include <tuple>
 #include <utility>
 
@@ -291,12 +293,104 @@ namespace x32 {
     ARMEmitter::Reg::r19,
   };
 
+  // MADEIRA: RA with the two guest-window registers removed. Selected instead of RA only when a
+  // non-zero GUEST32BASE is configured, so identity-mapped 32-bit builds keep the full 14-register
+  // pool and produce byte-identical code.
+  //
+  // Derived from RA by dropping its last two entries rather than being written out by hand, so the
+  // two lists cannot drift: reordering or extending RA automatically reshapes this one, and the
+  // static_asserts below fail the build if the tail stops being exactly the guest-window pair.
+  // RAPairs only covers RA's first 10 entries, so dropping from the tail leaves pairing untouched.
+  // ARMEmitter::Register has no default constructor, so the array is built by pack expansion over
+  // an index sequence rather than filled in a loop.
+  constexpr auto RA_GuestBase = []<size_t... I>(std::index_sequence<I...>) {
+    return std::array<ARMEmitter::Register, sizeof...(I)> {RA[I]...};
+  }(std::make_index_sequence<RA.size() - 2> {});
+
+  // MADEIRA ml1050: x25 (REG_CALLRET_SP) IS A RESERVED REGISTER WITH NO READER, AND 32-BIT CODE IS
+  // SHORT OF REGISTERS.
+  //
+  // ml920 compiled the call-ret shadow stack out on this host (FEX_CALLRET_STACK_UNUSED, see
+  // Arm64Emitter.h): the pushes, the pops, the bounds guard, the dispatcher's opportunistic return
+  // and the spill/fill of REG_CALLRET_SP in Spill/FillStaticRegs are all gone, and under
+  // ARCHITECTURE_arm64 (which is what xtajit.dll is) the only remaining mentions of x25 are inside
+  // `#ifdef ARCHITECTURE_arm64ec` blocks where it is x17 instead. So on the WoW64 module x25 is
+  // written by nothing, read by nothing, and reserved out of both register pools.
+  //
+  // Meanwhile 32-bit mode allocates from 14 dynamic registers, and a guest window takes two of them
+  // (x19 and x24) leaving TWELVE for a workload that the profiler puts at 42 % of all CPU inside one
+  // 32-bit module. Returning x25 takes that to thirteen -- an 8 % larger pool, which is spills
+  // removed from the hottest code in the process.
+  //
+  // It is safe by the same three properties that made x19/x24 safe as reservations, read the other
+  // way round:
+  //  - x25 is AAPCS64 callee-saved, so it survives every host call the JIT makes and every
+  //    `preserve_all` call, and it is already saved and restored across the whole JIT entry by
+  //    PushCalleeSavedRegisters/PopCalleeSavedRegisters (they cover x19-x30). It therefore does NOT
+  //    belong in NotPreserved_Dynamic or PreserveAll_Dynamic, which is why neither list changes.
+  //  - it is appended past RAPairs (== 10), so pair allocation is untouched.
+  //  - nothing in the emitter names it outside the arm64ec paths.
+  //
+  // Both pools gain it: RA_CallRet is the no-window pool, RA_GuestBase_CallRet the windowed one.
+  // Runtime selectable (FEX_X32_RECLAIM_CALLRET=0) because it is a codegen change and a codegen
+  // change needs a way off that does not need a rebuild.
+  //
+  // Guarded on the same macro that removes the readers, and NOT merely on FEX_IOS_HOST: namespace
+  // x32 is compiled for ARM64EC as well, and there REG_CALLRET_SP is x17 -- which is already in
+  // x32::RA. Defining these pools there would hand the same register out twice.
+#ifdef FEX_CALLRET_STACK_UNUSED
+  constexpr auto RA_GuestBase_CallRet = []<size_t... I>(std::index_sequence<I...>) {
+    return std::array<ARMEmitter::Register, sizeof...(I) + 1> {RA[I]..., REG_CALLRET_SP.R()};
+  }(std::make_index_sequence<RA.size() - 2> {});
+
+  constexpr auto RA_CallRet = []<size_t... I>(std::index_sequence<I...>) {
+    return std::array<ARMEmitter::Register, sizeof...(I) + 3> {RA[I]..., REG_CALLRET_SP.R(), REG_GUEST_ADDR_TMP.R(),
+                                                               REG_GUEST_BASE.R()};
+  }(std::make_index_sequence<RA.size() - 2> {});
+
+  static_assert(RA_CallRet.size() == RA.size() + 1, "Reclaiming x25 must add exactly one register");
+  static_assert(RA_GuestBase_CallRet.size() == RA_GuestBase.size() + 1,
+                "Reclaiming x25 must add exactly one register to the windowed pool too");
+  // The reclaimed register must not already be in either pool, or it would be handed out twice.
+  static_assert(
+    []() {
+      for (auto Reg : RA) {
+        if (Reg == REG_CALLRET_SP.R()) {
+          return false;
+        }
+      }
+      return true;
+    }(),
+    "x25 is already in x32::RA -- reclaiming it would alias two IR values onto one register");
+#endif // FEX_CALLRET_STACK_UNUSED
+
+  // The two dropped registers must be exactly REG_GUEST_ADDR_TMP and REG_GUEST_BASE, in that order.
+  static_assert(RA[RA.size() - 2] == REG_GUEST_ADDR_TMP.R() && RA[RA.size() - 1] == REG_GUEST_BASE.R(),
+                "x32::RA's last two entries must be the guest-window registers, since RA_GuestBase "
+                "is RA with its tail dropped");
+  static_assert(RA.size() == RA_GuestBase.size() + 2, "RA_GuestBase must drop exactly two registers");
+  // Nothing that survived the filter may alias either reserved register.
+  static_assert(
+    []() {
+      for (auto Reg : RA_GuestBase) {
+        if (Reg == REG_GUEST_BASE.R() || Reg == REG_GUEST_ADDR_TMP.R()) {
+          return false;
+        }
+      }
+      return true;
+    }(),
+    "RA_GuestBase still contains a reserved guest-window register");
+
   constexpr std::array<ARMEmitter::Register, 7> NotPreserved_Dynamic = {
     ARMEmitter::Reg::r12, ARMEmitter::Reg::r13, ARMEmitter::Reg::r14, ARMEmitter::Reg::r15,
     ARMEmitter::Reg::r16, ARMEmitter::Reg::r17, ARMEmitter::Reg::r30,
   };
 
   constexpr unsigned RAPairs = 10;
+
+  // MADEIRA: pair allocation indexes the leading RAPairs entries of whichever RA span is selected,
+  // so dropping the guest-window registers from the tail must not reach into that prefix.
+  static_assert(RAPairs <= RA_GuestBase.size(), "Reserving the guest-window registers ate into the pair-allocatable prefix");
 
   // All are caller saved
   constexpr std::array<ARMEmitter::VRegister, 8> SRAFPR = {
@@ -407,6 +501,9 @@ Arm64Emitter::Arm64Emitter(FEXCore::Context::ContextImpl* ctx, void* EmissionPtr
   }
 #endif
 
+  // MADEIRA: resolved once by ContextImpl's constructor, and forced to 0 in 64-bit mode.
+  GuestBase = EmitterCTX->Config.GuestBase;
+
   // Number of register available is dependent on what operating mode the proccess is in.
   if (EmitterCTX->Config.Is64BitMode()) {
     StaticRegisters = x64::SRA;
@@ -419,13 +516,128 @@ Arm64Emitter::Arm64Emitter(FEXCore::Context::ContextImpl* ctx, void* EmissionPtr
     PairRegisters = x32::RAPairs;
 
     StaticRegisters = x32::SRA;
-    GeneralRegisters = x32::RA;
+    // MADEIRA: reserve REG_GUEST_BASE and REG_GUEST_ADDR_TMP out of the dynamic pool, but only when
+    // a guest window is actually configured - with no window the full pool is used and codegen is
+    // identical to upstream.
+#ifdef FEX_CALLRET_STACK_UNUSED
+    // MADEIRA ml1050: and give x25 back, since the shadow stack it was reserved for is compiled
+    // out on this host. See the RA_CallRet block in namespace x32 above. Read once: this runs in
+    // the emitter's constructor, which is per-thread, and the answer cannot change within a run.
+    //
+    // DEFAULT OFF, and that is a statement about EVIDENCE, not about confidence. This is a
+    // register-allocation change to the hottest code in the process and the rule in this tree is
+    // that codegen changes ship validated. The validation exists and is cheap -- FEX's own
+    // InstructionCountCI harness, which only EMITS and disassembles and therefore runs on an
+    // x86_64 host (FEX-host-build is already configured with ENABLE_X86_HOST_DEBUG and
+    // ENABLE_VIXL_DISASSEMBLER, and Bin/CodeSizeValidation is already built) -- but it needs
+    // `nasm` to assemble the test snippets, and nasm is not installed on the machine this was
+    // written on. Until a run of
+    //     cmake -S FEX-host-src -B FEX-host-build -DBUILD_TESTING=True \
+    //           -DCMAKE_CXX_FLAGS=-DFEX_IOS_HOST -DENABLE_VIXL_DISASSEMBLER=True \
+    //           -DENABLE_X86_HOST_DEBUG=True
+    //     cmake --build FEX-host-build --target CodeSizeValidation instcountci_test_files
+    //     FEX_GUEST32BASE=0x7c00000000 FEX_X32_RECLAIM_CALLRET=1 \
+    //       ./Bin/CodeSizeValidation .../MultiInst_TSO_32bit.json.instcountci
+    // shows the 32-bit expectations getting SHORTER (fewer spill/fill pairs) and never wrong,
+    // this is an opt-in.
+    static const bool ReclaimCallRetReg = [] {
+      const char* Env = getenv("FEX_X32_RECLAIM_CALLRET");
+      return Env && Env[0] != '0';
+    }();
+    GeneralRegisters = GuestBase ? (ReclaimCallRetReg ? std::span<const ARMEmitter::Register> {x32::RA_GuestBase_CallRet} :
+                                                        std::span<const ARMEmitter::Register> {x32::RA_GuestBase}) :
+                                   (ReclaimCallRetReg ? std::span<const ARMEmitter::Register> {x32::RA_CallRet} :
+                                                        std::span<const ARMEmitter::Register> {x32::RA});
+#else
+    GeneralRegisters = GuestBase ? std::span<const ARMEmitter::Register> {x32::RA_GuestBase} :
+                                   std::span<const ARMEmitter::Register> {x32::RA};
+#endif
     GeneralRegistersNotPreserved = x32::NotPreserved_Dynamic;
 
     StaticFPRegisters = x32::SRAFPR;
     GeneralFPRegisters = x32::RAFPR;
   }
 }
+
+// MADEIRA: Materialise REG_GUEST_BASE. Called from FillStaticRegs, which every JIT entry and
+// re-entry path goes through - including AbsoluteLoopTopAddressFillSRA, which is where the Windows
+// exception path resumes the JIT from a CONTEXT that may predate the register being set up.
+//
+// x19 is callee-saved, so this is redundant after an ordinary host call and costs at most four
+// instructions on a path that is already spilling the whole register file. A window that is 4GiB
+// aligned (which is what Madeira reserves) encodes as a single movz.
+void Arm64Emitter::LoadGuestBaseReg() {
+  if (!GuestBase) {
+    return;
+  }
+
+  LoadConstant(ARMEmitter::Size::i64Bit, REG_GUEST_BASE.R(), GuestBase);
+}
+
+#ifdef FEX_IOS_HOST
+/* MADEIRA ml708: inline call-ret shadow-stack bounds guard + reset.
+ *
+ * WHY THIS EXISTS AT ALL
+ * ----------------------
+ * The call-ret stack is pushed on every guest CALL and popped only on a FEX-lowered guest RET.
+ * Guests do not balance those: SEH dispatch/RtlUnwind, longjmp and C++ throw abandon frames with
+ * no RET, so entries leak. Upstream bounds the leak with PAGE_NOACCESS guard pages either side of
+ * the allocation - a push that walks off the end faults, and CallRetStack::HandleAccessViolation
+ * resets the pointer to DefaultLocation. On iOS that fault NEVER happens: Wine's
+ * VirtualAlloc(MEM_RESERVE, PAGE_NOACCESS) does not enforce NOACCESS here (CallRetStack.h), so the
+ * pointer just keeps walking, out of its own 16MB allocation and into whatever is mapped below it.
+ *
+ * WHY IT IS GATED ON FEX_IOS_HOST AND NOT ON ARCHITECTURE_arm64ec
+ * --------------------------------------------------------------
+ * This guard used to be emitted only under `#ifdef ARCHITECTURE_arm64ec`, so the WoW64 CPU module
+ * (xtajit.dll, an ordinary aarch64 PE -> ARCHITECTURE_arm64, FEX_IOS_HOST) got no guard at all,
+ * while running on the same iOS host with the same unenforced guard pages. That is the identical
+ * mis-gating already documented in AllocatorHooks.h's VirtualAlloc comment. The observed result
+ * was a thread whose callret_sp ran 1,310,569 entries (~20MB) below its base, straight through the
+ * next region down - its own CpuStateFrame - so `stp {guest_ret, host_label}` pairs overwrote
+ * CpuStateFrame::Pointers. The JIT then loaded a fallback handler out of
+ * Pointers.FallbackHandlerPointers[..].Func and executed `blr x3` on a *guest* return address.
+ * The condition is a property of the host (iOS), not of the guest ABI, so the gate is the host.
+ *
+ * THE WINDOW
+ * ----------
+ * Bound the pointer to a window of CALLRET_STACK_SIZE/4 centred on DefaultLocation
+ * (= base + CALLRET_STACK_SIZE/4), i.e. [base + SIZE/8, base + 3*SIZE/8). The test is a single
+ * `sub` + `lsr` by log2(window) - zero means in-window. A whole-allocation test is not enough: a
+ * large-but-in-range leak sails straight through it, and by the time it leaves the 16MB region it
+ * has already scribbled over the neighbouring mapping.
+ *
+ * RESETTING IS SAFE, NOT A PAPERING-OVER
+ * --------------------------------------
+ * This stack is purely a return-address PREDICTOR. A stale or missing entry fails the
+ * `sub TMP, popped_guest_rip, RipReg` compare in BranchOps and falls through to the L1 lookup,
+ * which is always correct. A reset costs mispredictions and nothing else. */
+void Arm64Emitter::EmitCallRetStackGuard(ARMEmitter::XRegister Scratch) {
+  // Named in InternalThreadState.h so every site that bounds this pointer shares one definition.
+  constexpr uint64_t DefaultOffset = FEXCore::Core::InternalThreadState::CALLRET_DEFAULT_OFFSET;
+  constexpr uint64_t WindowLow = FEXCore::Core::InternalThreadState::CALLRET_LIVE_OFFSET;
+  constexpr uint64_t WindowSize = FEXCore::Core::InternalThreadState::CALLRET_LIVE_SIZE;
+  static_assert((WindowSize & (WindowSize - 1)) == 0, "Guard window must be a power of two for the lsr test");
+  static_assert(WindowLow + WindowSize / 2 == DefaultOffset, "Guard window must be centred on DefaultLocation");
+  const uint32_t WindowLog2 = FEXCore::ilog2(WindowSize);
+
+  ARMEmitter::ForwardLabel l_callret_ok;
+  ldr(Scratch, STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp_base));
+  add(ARMEmitter::Size::i64Bit, Scratch, Scratch, WindowLow);
+  sub(ARMEmitter::Size::i64Bit, Scratch, REG_CALLRET_SP, Scratch);
+  lsr(ARMEmitter::Size::i64Bit, Scratch, Scratch, WindowLog2);
+  (void)cbz(ARMEmitter::Size::i64Bit, Scratch, &l_callret_ok);
+  ldr(REG_CALLRET_SP, STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp_base));
+  add(ARMEmitter::Size::i64Bit, REG_CALLRET_SP, REG_CALLRET_SP, DefaultOffset);
+  /* A reset abandons every entry below the new top. Those abandoned 16-byte frames are
+   * {guest_rip, host_label} pairs and the host half is a raw branch target, so publish the reset
+   * to State.callret_sp *and* zero the frame at the new top: a subsequent pop then reads
+   * {0, 0}, which can never satisfy the guest-rip compare and can never be branched to. */
+  stp<ARMEmitter::IndexType::OFFSET>(ARMEmitter::XReg::zr, ARMEmitter::XReg::zr, REG_CALLRET_SP, 0);
+  str(REG_CALLRET_SP, STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
+  (void)Bind(&l_callret_ok);
+}
+#endif
 
 FEXCore::X86State::X86Reg Arm64Emitter::GetX86RegRelationToARMReg(ARMEmitter::Register Reg) {
   for (size_t i = 0; i < StaticRegisters.size(); ++i) {
@@ -737,7 +949,13 @@ void Arm64Emitter::SpillStaticRegs(ARMEmitter::Register TmpReg, SpillStaticRegOp
   unsigned PFAFSpillMask = Options.GPRSpillMask & PFAFMask;
   Options.GPRSpillMask &= ~PFAFSpillMask;
 
+  /* MADEIRA ml920: REG_CALLRET_SP is not a live register any more under FEX_CALLRET_STACK_UNUSED --
+   * nothing pushes, pops or reads the shadow stack -- so there is nothing to spill. One store off
+   * every spill (and the matching load off every fill in FillStaticRegs), on the dispatcher
+   * round-trip path this round is trying to make cheaper. */
+#ifndef FEX_CALLRET_STACK_UNUSED
   str(REG_CALLRET_SP, STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
+#endif
 
   for (size_t i = 0; i < StaticRegisters.size(); i += 2) {
     auto Reg1 = StaticRegisters[i];
@@ -842,7 +1060,13 @@ void Arm64Emitter::FillStaticRegs(FillStaticRegOptions Options) {
   ldr(STATE, TmpReg, CPU_AREA_EMULATOR_DATA_OFFSET);
 #endif
 
+  // MADEIRA ml920: see SpillStaticRegs -- REG_CALLRET_SP is dead under FEX_CALLRET_STACK_UNUSED.
+#ifndef FEX_CALLRET_STACK_UNUSED
   ldr(REG_CALLRET_SP, STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
+#endif
+
+  // MADEIRA: no-op unless a guest window is configured.
+  LoadGuestBaseReg();
 
   if (Options.NZCV) {
     // Regardless of what GPRs/FPRs we're filling, we need to fill NZCV since it

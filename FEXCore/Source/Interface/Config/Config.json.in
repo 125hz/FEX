@@ -385,6 +385,25 @@
           "Useful as a debugging feature."
         ]
       },
+      "Guest32Base": {
+        "Type": "uint64",
+        "Default": "0",
+        "Desc": [
+          "MADEIRA: host address that guest address 0 maps to, for 32-bit mode only ('the guest window').",
+          "0 (the default) means the guest address space is identity mapped, which is the behaviour of",
+          "every FEX configuration other than Madeira's iOS WoW64 host.",
+          "When non-zero, the JIT reserves REG_GUEST_BASE (x19) and REG_GUEST_ADDR_TMP (x24) out of the",
+          "32-bit dynamic register pool and forms host addresses as `Base + zext32(EA)`. Guest RIP,",
+          "LookupCache keys, VirtualMemSize, segment bases and code-invalidation ranges all stay in the",
+          "guest namespace.",
+          "Forced to 0 when IS64BIT_MODE is set: the 64-bit and ARM64EC paths are always identity mapped.",
+          "Must be page aligned, and the host must have the window [Base, Base + 4GiB) reserved before any",
+          "guest code runs.",
+          "In production this is set programmatically by the WoW64 module from",
+          "NtQueryInformationProcess(ProcessWineIosWowGuestBase); it is exposed as a normal option only so",
+          "that codegen can be exercised from the instruction-count harness without a device."
+        ]
+      },
       "DisableTelemetry": {
         "Type": "bool",
         "Default": "false",

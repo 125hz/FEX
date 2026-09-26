@@ -47,6 +47,38 @@ public:
 
   RegClass WalkFindRegClass(Ref Node);
 
+  // MADEIRA: true when `ssa` is a HOST pointer into FEXCore's own thread context rather than a guest
+  // address. Exactly two IR values can be one:
+  //
+  //  1. _FormContextAddress, which is `STATE + Index * Stride`.
+  //  2. a context load of CPUState::segment_arrays, the only pointer-valued field in CPUState -
+  //     FEXCore's own GDT/LDT descriptor tables, allocated on the host heap.
+  //
+  // Feeding either to a memory op that takes a *guest* address is silent under an identity mapping
+  // and a wild access inside a 32-bit guest window, so LoadMem/StoreMem validate it at emission
+  // time: such an address is only legal with HostAddr set. This has to be checked here rather than
+  // in the backend because register allocation rewrites source operands to physical registers, at
+  // which point the producing op is no longer recoverable.
+  bool IsContextRelativeAddress(OrderedNodeWrapper ssa) {
+    constexpr auto SegmentArraysBegin = offsetof(FEXCore::Core::CPUState, segment_arrays);
+    constexpr auto SegmentArraysEnd = SegmentArraysBegin + sizeof(FEXCore::Core::CPUState::segment_arrays);
+    const auto InSegmentArrays = [](uint32_t Offset) {
+      return Offset >= SegmentArraysBegin && Offset < SegmentArraysEnd;
+    };
+
+    const auto* IROp = GetOpHeader(ssa);
+    switch (IROp->Op) {
+    case OP_FORMCONTEXTADDRESS: return true;
+    case OP_LOADCONTEXT: return InSegmentArrays(IROp->C<IR::IROp_LoadContext>()->Offset);
+    case OP_LOADCONTEXTINDEXED: return InSegmentArrays(IROp->C<IR::IROp_LoadContextIndexed>()->BaseOffset);
+    default: return false;
+    }
+  }
+
+  bool IsContextRelativeAddress(Ref Node) {
+    return IsContextRelativeAddress(WrapNode(Node));
+  }
+
   // These inlining helpers are used by IRDefines.inc so define first.
   Ref InlineMem(OpSize Size, Ref Offset, MemOffsetType OffsetType, uint8_t& OffsetScale, bool TSO = false) {
     uint64_t Imm {};
@@ -169,6 +201,24 @@ public:
   }
   IRPair<IROp_StoreMem> _StoreMemFPR(OpSize Size, Ref Value, Ref Addr, Ref Offset, OpSize Align, MemOffsetType OffsetType, uint8_t OffsetScale) {
     return _StoreMem(RegClass::FPR, Size, Value, Addr, Offset, Align, OffsetType, OffsetScale);
+  }
+
+  // MADEIRA: host-addressed load/store. `Addr` is already a host pointer - a context/thread-state
+  // relative address formed by _FormContextAddress, not a guest effective address - so the backend
+  // must NOT add the 32-bit guest window base to it. Identical to the guest forms in every
+  // configuration where no guest window is active, which is all 64-bit and ARM64EC builds.
+  //
+  // These are for addressing FEXCore's own CPUState storage through a load/store op. Everything that
+  // an x86 instruction can name as a memory operand is a guest address and must use the plain forms
+  // above.
+  IRPair<IROp_LoadMem> _LoadMemHostGPR(OpSize Size, Ref Addr, Ref Offset, OpSize Align, MemOffsetType OffsetType, uint8_t OffsetScale) {
+    return _LoadMem(RegClass::GPR, Size, Addr, Offset, Align, OffsetType, OffsetScale, true);
+  }
+  IRPair<IROp_LoadMem> _LoadMemHostFPR(OpSize Size, Ref Addr, Ref Offset, OpSize Align, MemOffsetType OffsetType, uint8_t OffsetScale) {
+    return _LoadMem(RegClass::FPR, Size, Addr, Offset, Align, OffsetType, OffsetScale, true);
+  }
+  IRPair<IROp_StoreMem> _StoreMemHostFPR(OpSize Size, Ref Value, Ref Addr, Ref Offset, OpSize Align, MemOffsetType OffsetType, uint8_t OffsetScale) {
+    return _StoreMem(RegClass::FPR, Size, Value, Addr, Offset, Align, OffsetType, OffsetScale, true);
   }
 
   IRPair<IROp_StoreMemPair> _StoreMemPairGPR(OpSize Size, Ref Value1, Ref Value2, Ref Addr, uint32_t Offset) {
