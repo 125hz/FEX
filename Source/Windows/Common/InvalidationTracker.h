@@ -18,6 +18,14 @@ class Context;
 }
 
 namespace FEX::Windows {
+/* iOS-Madeira ml2000: true in the ARM64EC module on the iOS host unless MADEIRA_GUEST_RWX_DATA=0.
+ * Wine then keeps anonymous x64-guest RWX memory as plain host RW/R data (no JIT-pool alias), so
+ * this tracker's protect-on-compile / unprotect-on-write-fault SMC tracking is what keeps code
+ * coherent there, at the host's 16 KB page granularity. Always false in the WoW64 module and on
+ * non-iOS builds. First call reads the environment and logs once; call it from a normal context
+ * first (the constructor does). */
+bool IosGuestRwxDataMode();
+
 /**
  * @brief Handles SMC and regular code invalidation
  */

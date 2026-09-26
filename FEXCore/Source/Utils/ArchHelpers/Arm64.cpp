@@ -182,6 +182,49 @@ static bool StoreCAS8(uint8_t& Expected, uint8_t Val, uint64_t Addr) {
   return Atom.compare_exchange_strong(Expected, Val);
 }
 
+// MADEIRA ml2000: split-CAS tear repair.
+//
+// The dual-CAS paths below store the UPPER half first. When that succeeds and
+// the LOWER CAS then fails (another thread changed the lower half in between),
+// upstream leaves the upper half holding our desired bits and reports the
+// operation as failed (CAS) or returns half-applied (atomic memory ops, "XXX:
+// Resolve with TME"). A guest lock word crossing a 16-byte boundary is then
+// left torn: part new value, part old, which no guest thread will ever release.
+// Instead, CAS the upper half back from what we stored to what was there; if
+// that succeeds memory is exactly as before the attempt and the caller retries
+// the whole operation from a fresh load. If the rollback CAS fails too (a third
+// writer already consumed the torn value) the upstream behaviour is kept.
+// Pure helper, no allocation, no locks, no TLS: safe in the fault handler.
+// MADEIRA_SPLITLOCK_ROLLBACK=0 restores the upstream behaviour.
+static bool SplitCASRollbackEnabled() {
+  static std::atomic<int> State {-1};
+  int S = State.load(std::memory_order_relaxed);
+  if (S < 0) {
+    const char* E = getenv("MADEIRA_SPLITLOCK_ROLLBACK");
+    S = (E && E[0] == '0' && E[1] == '\0') ? 0 : 1;
+    State.store(S, std::memory_order_relaxed);
+    LogMan::Msg::IFmt("[splitlock] ml2000 split-CAS tear rollback {} (MADEIRA_SPLITLOCK_ROLLBACK=0 disables)", S ? "ON" : "OFF");
+  }
+  return S != 0;
+}
+
+template<typename T>
+static bool SplitCASRollback(T Stored, T Original, uint64_t AddrUpper, uint32_t Bits) {
+  if (!SplitCASRollbackEnabled()) {
+    return false;
+  }
+  auto Atom = std::atomic_ref<T>(*reinterpret_cast<T*>(AddrUpper));
+  T Current = Stored;
+  const bool Restored = Atom.compare_exchange_strong(Current, Original);
+  static std::atomic<uint32_t> Count {0};
+  const uint32_t N = Count.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (N <= 8 || (N % 4096) == 0) {
+    LogMan::Msg::IFmt("[splitlock] ml2000 torn {}-bit split CAS #{} upper={:#x}: rollback {}", Bits, N, AddrUpper,
+                      Restored ? "restored, retrying" : "FAILED (upper changed again), upstream tear path");
+  }
+  return Restored;
+}
+
 static uint16_t DoLoad16(uint64_t Addr) {
   uint64_t AlignmentMask = 0b1111;
   if ((Addr & AlignmentMask) == 15) {
@@ -530,6 +573,9 @@ static bool RunCASPAL(uint64_t* GPRs, uint32_t Size, uint32_t DesiredReg1, uint3
             if (StoreCAS64(TmpExpectedLower, TmpDesiredLower, Addr)) {
               // Stored successfully
               return true;
+            } else if (SplitCASRollback<uint64_t>(TmpDesiredUpper, TmpExpectedUpper, AddrUpper, 64)) {
+              // MADEIRA ml2000: upper half restored; nothing was stored, retry from a fresh load
+              continue;
             } else {
               // CAS managed to tear, we can't really solve this
               // Continue down the path to let the guest know values weren't expected
@@ -875,6 +921,9 @@ static uint16_t DoCAS16(uint16_t DesiredSrc, uint16_t ExpectedSrc, uint64_t Addr
           if (StoreCAS8(ExpectedLower, DesiredLower, Addr)) {
             // Stored successfully
             return Expected;
+          } else if (SplitCASRollback<uint8_t>(DesiredUpper, ExpectedUpper, AddrUpper, 16)) {
+            // MADEIRA ml2000: upper byte restored; nothing was stored, retry from a fresh load
+            continue;
           } else {
             // CAS managed to tear, we can't really solve this
             // Continue down the path to let the guest know values weren't expected
@@ -1161,6 +1210,9 @@ static uint32_t DoCAS32(uint32_t DesiredSrc, uint32_t ExpectedSrc, uint64_t Addr
           if (StoreCAS32(TmpExpectedLower, TmpDesiredLower, Addr)) {
             // Stored successfully
             return Expected;
+          } else if (SplitCASRollback<uint32_t>(TmpDesiredUpper, TmpExpectedUpper, AddrUpper, 32)) {
+            // MADEIRA ml2000: upper word restored; nothing was stored, retry from a fresh load
+            continue;
           } else {
             // CAS managed to tear, we can't really solve this
             // Continue down the path to let the guest know values weren't expected
@@ -1395,6 +1447,9 @@ static uint64_t DoCAS64(uint64_t DesiredSrc, uint64_t ExpectedSrc, uint64_t Addr
           if (StoreCAS64(TmpExpectedLower, TmpDesiredLower, Addr)) {
             // Stored successfully
             return Expected;
+          } else if (SplitCASRollback<uint64_t>(TmpDesiredUpper, TmpExpectedUpper, AddrUpper, 64)) {
+            // MADEIRA ml2000: upper doubleword restored; nothing was stored, retry from a fresh load
+            continue;
           } else {
             // CAS managed to tear, we can't really solve this
             // Continue down the path to let the guest know values weren't expected

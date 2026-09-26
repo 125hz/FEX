@@ -1207,6 +1207,29 @@ void BTCpuProcessInit() {
     FEXCore::Config::Set(FEXCore::Config::CONFIG_X87REDUCEDPRECISION, "1");
   }
 
+  /* MADEIRA ml2000: StrictInProcessSplitLocks defaults ON for 32-bit guests.
+   *
+   * An x86 LOCK op on a word that crosses a 16-byte boundary faults on this host and FEX emulates it
+   * as two separate half-width CASes. Without the strict mode two threads doing that on the same
+   * word interleave freely, and a failed second half leaves the word torn (see the ml2000 rollback
+   * in FEXCore ArchHelpers/Arm64.cpp). The strict mode serializes every split-lock emulation in the
+   * process behind one lock, which is what x86 split-lock semantics require; split locks are rare
+   * and each one already costs a fault, so the extra lock is noise. Same Exists() rule as the x87
+   * default above: FEX_STRICTINPROCESSSPLITLOCKS / madeira-fex.txt still wins.
+   * MADEIRA_STRICT_SPLITLOCK=0 leaves the compiled default (off). */
+  bool MadeiraStrictSplitDefaultApplied = false;
+  {
+    const char* Switch = getenv("MADEIRA_STRICT_SPLITLOCK");
+    const bool Disabled = Switch && Switch[0] == '0' && Switch[1] == '\0';
+    const bool UserSet = FEXCore::Config::Exists(FEXCore::Config::CONFIG_STRICTINPROCESSSPLITLOCKS);
+    if (!Disabled && !UserSet) {
+      FEXCore::Config::Set(FEXCore::Config::CONFIG_STRICTINPROCESSSPLITLOCKS, "1");
+      MadeiraStrictSplitDefaultApplied = true;
+    }
+    LogMan::Msg::EFmt("[splitlock] ml2000 StrictInProcessSplitLocks {} (MADEIRA_STRICT_SPLITLOCK=0 keeps the compiled default)",
+                      MadeiraStrictSplitDefaultApplied ? "=1 (madeira-32bit-default)" : (UserSet ? "user-set, kept" : "default kept (disabled)"));
+  }
+
   // ml1470: see IosOrderedProfileReason. Applied before CreateNewContext reads the options.
   fextl::string MadeiraOrderedApplied;
   {

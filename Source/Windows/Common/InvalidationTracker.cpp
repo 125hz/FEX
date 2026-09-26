@@ -80,7 +80,28 @@ namespace FEX::Windows {
  * The log itself allocates, so re-entry from inside the re-entry report is suppressed by a
  * per-slot flag; without it the report could recurse until the stack is gone. */
 namespace {
-constexpr unsigned TrackerSlotCount = 64;
+/* iOS-Madeira ml2000: 64 -> 512 slots (the size of the thread registry), and stale-slot reclaim.
+ *
+ * Device logs show "[xins] ml760 re-entrancy slot table EXHAUSTED (64 threads)" at process start,
+ * i.e. long before 64 threads can be inside a tracker lock at once. A slot is freed only when its
+ * depth returns to zero; a thread that dies (or whose frames are abandoned by a context switch out
+ * of an exception) while inside a TrackerLockScope leaks its slot for the rest of the session, and
+ * the table is shared by everything that loads this module. Worse, a NEW thread whose TEB lands on
+ * a leaked slot's address inherited depth > 0 and had every notification skipped as "re-entry".
+ *
+ * So each slot also records the owning thread id (TEB->ClientId.UniqueThread, read via the TEB
+ * pointer -- no TLS). A TEB match with a different id is a dead owner's slot: the current thread
+ * owns that TEB now, nobody else can touch the slot, and it is reset to depth 0 before use.
+ * Lookups scan only up to the highest slot ever claimed, so the common case stays short.
+ *
+ * MADEIRA_FEX_TRACKER_WIDE=0 restores the 64-slot table without reclaim (read once in the
+ * InvalidationTracker constructor; never from inside a lock). */
+constexpr unsigned TrackerSlotCount = 512;
+constexpr unsigned TrackerSlotCountLegacy = 64;
+std::atomic<uint32_t> TrackerSlotLimit {TrackerSlotCount};
+std::atomic<uint8_t> TrackerStaleReclaim {1};
+std::atomic<uint32_t> TrackerSlotHigh {0};     // one past the highest slot ever claimed
+std::atomic<uint32_t> TrackerStaleReclaimed {0};
 
 // Key: the thread's TEB pointer (x18). nullptr = free slot.
 std::atomic<void*> TrackerSlotTeb[TrackerSlotCount] {};
@@ -88,14 +109,36 @@ std::atomic<void*> TrackerSlotTeb[TrackerSlotCount] {};
 // no atomicity of their own -- publication is handled by the TEB pointer's release store.
 uint32_t TrackerSlotDepth[TrackerSlotCount] {};
 uint8_t TrackerSlotReporting[TrackerSlotCount] {};
+uint64_t TrackerSlotTid[TrackerSlotCount] {};  // ml2000: owner's thread id, owner-written
 std::atomic<uint32_t> TrackerSlotOverflow {0};
+
+uint64_t TrackerTebTid(void* Teb) {
+  // __TEB is the full Wine layout from Source/Windows/include/winternl.h (mingw's TEB hides ClientId).
+  return reinterpret_cast<uint64_t>(reinterpret_cast<__TEB*>(Teb)->ClientId.UniqueThread);
+}
 
 int TrackerFindSlot(void* Teb) {
   if (!Teb) {
     return -1;
   }
-  for (unsigned i = 0; i < TrackerSlotCount; i++) {
+  const uint32_t High = std::min(TrackerSlotHigh.load(std::memory_order_acquire), TrackerSlotCount);
+  for (unsigned i = 0; i < High; i++) {
     if (TrackerSlotTeb[i].load(std::memory_order_acquire) == Teb) {
+      if (TrackerStaleReclaim.load(std::memory_order_relaxed)) {
+        const uint64_t Tid = TrackerTebTid(Teb);
+        if (TrackerSlotTid[i] != Tid) {
+          // A dead thread's leaked slot on a TEB this thread now owns: start it clean.
+          TrackerSlotDepth[i] = 0;
+          TrackerSlotReporting[i] = 0;
+          TrackerSlotTid[i] = Tid;
+          const auto N = TrackerStaleReclaimed.fetch_add(1, std::memory_order_relaxed) + 1;
+          if (N <= 8) {
+            LogMan::Msg::EFmt("[xins] ml2000 reclaimed stale re-entrancy slot #{} (TEB reused by a new thread; "
+                              "the previous owner leaked it) total={}",
+                              i, N);
+          }
+        }
+      }
       return static_cast<int>(i);
     }
   }
@@ -107,11 +150,16 @@ int TrackerClaimSlot(void* Teb) {
   if (Existing >= 0 || !Teb) {
     return Existing;
   }
-  for (unsigned i = 0; i < TrackerSlotCount; i++) {
+  const uint32_t Limit = std::min(TrackerSlotLimit.load(std::memory_order_relaxed), TrackerSlotCount);
+  for (unsigned i = 0; i < Limit; i++) {
     void* Expected = nullptr;
     if (TrackerSlotTeb[i].compare_exchange_strong(Expected, Teb, std::memory_order_acq_rel, std::memory_order_relaxed)) {
       TrackerSlotDepth[i] = 0;
       TrackerSlotReporting[i] = 0;
+      TrackerSlotTid[i] = TrackerTebTid(Teb);
+      uint32_t High = TrackerSlotHigh.load(std::memory_order_relaxed);
+      while (High < i + 1 && !TrackerSlotHigh.compare_exchange_weak(High, i + 1, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+      }
       return static_cast<int>(i);
     }
   }
@@ -128,9 +176,9 @@ struct TrackerLockScope {
     } else {
       const auto N = TrackerSlotOverflow.fetch_add(1) + 1;
       if (N == 1) {
-        LogMan::Msg::EFmt("[xins] ml760 re-entrancy slot table EXHAUSTED ({} threads) — this thread is "
+        LogMan::Msg::EFmt("[xins] ml760 re-entrancy slot table EXHAUSTED ({} threads, ml2000 reclaimed={}) — this thread is "
                           "UNTRACKED and reverts to the pre-ml760 (deadlock-capable) behaviour",
-                          TrackerSlotCount);
+                          TrackerSlotLimit.load(std::memory_order_relaxed), TrackerStaleReclaimed.load(std::memory_order_relaxed));
       }
     }
   }
@@ -261,11 +309,74 @@ bool TrackerReentered(const char* Site, uint64_t Address, uint64_t Size) {
 }
 } // namespace
 
+/* iOS-Madeira ml2000: see the declaration in InvalidationTracker.h. */
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+bool IosGuestRwxDataMode() {
+  static std::atomic<int8_t> Cached {-1};
+  int8_t V = Cached.load(std::memory_order_relaxed);
+  if (V < 0) {
+    const char* E = getenv("MADEIRA_GUEST_RWX_DATA");
+    V = (E && E[0] == '0') ? 0 : 1;
+    int8_t Expected = -1;
+    if (Cached.compare_exchange_strong(Expected, V, std::memory_order_relaxed)) {
+      LogMan::Msg::EFmt("[rwx-data] ml2000 FEX MADEIRA_GUEST_RWX_DATA={} -> {}", E ? E : "(unset)",
+                        V ? "host-data mode: SMC trap/untrap at 16 KB host pages, upstream retry for non-alias SMC "
+                            "writes, upstream Mono DisableSMCDetection" :
+                            "legacy (JIT-pool alias) handling");
+    }
+  }
+  return V != 0;
+}
+#else
+bool IosGuestRwxDataMode() {
+  return false;
+}
+#endif
+
+namespace {
+/* ml2000: the iOS host page is 16 KB and Wine applies the UNION of the four 4 KB sub-page
+ * protections to it (get_host_page_vprot / mprotect_range). Trapping or untrapping a single
+ * 4 KB sub-page therefore either does nothing (a writable neighbour keeps the host page
+ * writable, so a write to freshly compiled code never faults) or opens the whole host page
+ * (three sub-pages become writable without their code being invalidated). In host-data mode
+ * every SMC protect/unprotect/invalidate covers whole host pages, clipped to the RWX interval. */
+constexpr uint64_t IosHostPageSize = 0x4000;
+
+struct IosRange {
+  uint64_t Begin, End;
+};
+
+// Round [Address, Address+Size) out to host pages. Identity when host-data mode is off.
+IosRange IosHostPageRound(uint64_t Address, uint64_t Size) {
+  if (!IosGuestRwxDataMode()) {
+    return {Address, Address + Size};
+  }
+  const uint64_t Begin = Address & ~(IosHostPageSize - 1);
+  const uint64_t End = (Address + Size + IosHostPageSize - 1) & ~(IosHostPageSize - 1);
+  return {Begin, End < Begin ? Address + Size : End};
+}
+
+std::atomic<uint64_t> IosHostPageUntraps {0};
+} // namespace
+
 InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX,
                                          const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads, uint64_t GuestBase)
   : CTX {CTX}
   , Threads {Threads}
   , GuestBase {GuestBase} {
+  // ml2000: read both switches here, in a normal context, before any lock or fault path needs them.
+  IosGuestRwxDataMode();
+  {
+    const char* E = getenv("MADEIRA_FEX_TRACKER_WIDE");
+    const bool Wide = !(E && E[0] == '0');
+    TrackerSlotLimit.store(Wide ? TrackerSlotCount : TrackerSlotCountLegacy, std::memory_order_relaxed);
+    TrackerStaleReclaim.store(Wide ? 1 : 0, std::memory_order_relaxed);
+    static std::atomic<bool> Logged {false};
+    if (!Logged.exchange(true)) {
+      LogMan::Msg::EFmt("[xins] ml2000 re-entrancy slots={} stale-reclaim={} (MADEIRA_FEX_TRACKER_WIDE={})",
+                        Wide ? TrackerSlotCount : TrackerSlotCountLegacy, Wide ? 1 : 0, E ? E : "(unset)");
+    }
+  }
   FEX_CONFIG_OPT(SMCChecks, SMCCHECKS);
   SMCDetectionDisabled = (SMCChecks == FEXCore::Config::CONFIG_SMC_NONE);
 
@@ -946,11 +1057,21 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
     return false;
   }
 
+  // ml2000: in host-data mode the untrap covers the whole 16 KB host page, clipped to the RWX
+  // interval that contains the fault (see IosHostPageRound). Otherwise exactly one FEX page.
+  uint64_t UntrapBegin = FaultAddress & FEXCore::Utils::FEX_PAGE_MASK;
+  uint64_t UntrapEnd = UntrapBegin + FEXCore::Utils::FEX_PAGE_SIZE;
   const auto [NeedsInvalidate, UntrapProt] = [&](uint64_t Address) -> std::pair<bool, ULONG> {
     TrackerLockScope Reentry;
     std::shared_lock Lock(IntervalsLock);
-    if (!RWXIntervals.Query(Address).Enclosed) {
+    const auto Query = RWXIntervals.Query(Address);
+    if (!Query.Enclosed) {
       return {false, 0};
+    }
+    if (IosGuestRwxDataMode()) {
+      const auto Host = IosHostPageRound(Address, 1);
+      UntrapBegin = std::max(Host.Begin, Query.Interval.Offset);
+      UntrapEnd = std::min(Host.End, Query.Interval.End);
     }
     return {true, GetUntrapProt(Address)};
   }(FaultAddress);
@@ -966,12 +1087,22 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
       TrackerLockScope Reentry;
       std::scoped_lock Lock(CTX.GetCodeInvalidationMutex());
 
-      InvalidateIntervalInternalLocked(FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE);
+      InvalidateIntervalInternalLocked(UntrapBegin, UntrapEnd - UntrapBegin);
 
       // Invalidate, then unprotect the faulting page with the compilation lock held to ensure that any racing invalidations are not dropped.
       ULONG TmpProt;
       void* TmpAddress = reinterpret_cast<void*>(FaultAddress);
       SIZE_T TmpSize = 1;
+      if (IosGuestRwxDataMode()) {
+        TmpAddress = reinterpret_cast<void*>(UntrapBegin);
+        TmpSize = static_cast<SIZE_T>(UntrapEnd - UntrapBegin);
+        const auto N = IosHostPageUntraps.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (N <= 8 || !(N & 0xFFFF)) {
+          LogMan::Msg::EFmt("[rwx-data] ml2000 SMC untrap #{} fault={:#x} -> [{:#x},{:#x}) invalidated+unprotected "
+                            "(whole host page, clipped to the RWX interval)",
+                            N, FaultAddress, UntrapBegin, UntrapEnd);
+        }
+      }
       NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, UntrapProt, &TmpProt);
     }
     DetectMonoBackpatcherBlock(Thread, HostPc);
@@ -1111,6 +1242,20 @@ void InvalidationTracker::DetectMonoBackpatcherBlock(FEXCore::Core::InternalThre
    * that cannot change. The win here comes purely from MarkMonoBackpatcherBlock
    * plus the alias-directed MonoBackpatcherWrite. */
   DisableSMCDetection();
+#else
+  /* ml2000: in host-data mode the guest VA of anonymous RWX memory IS plain host RW memory, so
+   * upstream's reasoning applies again: once the runtime is known to flush the instruction cache
+   * after emitting code (Mono does), stop trapping and let FlushInstructionCache +
+   * MonoBackpatcherWrite provide coherence. This also guarantees that MonoBackpatcherWrite's
+   * direct store (no alias) never targets a trapped page while CodeInvalidationMutex is held. */
+  if (IosGuestRwxDataMode()) {
+    static std::atomic<uint32_t> DisableLogCount {0};
+    if (DisableLogCount.fetch_add(1, std::memory_order_relaxed) < 4) {
+      LogMan::Msg::EFmt("[rwx-data] ml2000 Mono backpatcher detected: SMC write-trapping DISABLED for this process "
+                        "(upstream behaviour; code coherence now via FlushInstructionCache)");
+    }
+    DisableSMCDetection();
+  }
 #endif
   {
     std::scoped_lock CodeLock(CTX.GetCodeInvalidationMutex());
@@ -1187,6 +1332,13 @@ void InvalidationTracker::InvalidateIntervalInternalLocked(uint64_t Address, uin
 }
 
 bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t Size, bool ForWriteLocked) {
+  // ml2000: host-data mode traps/untraps whole 16 KB host pages; the loop below already clips each
+  // protection to the RWX interval it hits. Identity when the mode is off.
+  {
+    const auto Host = IosHostPageRound(Address, Size);
+    Address = Host.Begin;
+    Size = Host.End - Host.Begin;
+  }
   const auto End = Address + Size;
   // ml760: NtProtectVirtualMemory runs inside this SHARED hold. Its NotifyMemoryProtect
   // callback wants IntervalsLock EXCLUSIVELY on this same thread, and std::shared_mutex has

@@ -1669,9 +1669,39 @@ static inline bool MonoBackpatcherBridgeArmed() {
   return ios_fex_mono_bridge_armed() != 0;
 }
 
+/* iOS-Madeira ml2000: host-data mode (MADEIRA_GUEST_RWX_DATA, ARM64EC module only; mirrors
+ * FEX::Windows::IosGuestRwxDataMode, re-read here because FEXCore cannot depend on the Windows
+ * frontend). In that mode anonymous x64-guest RWX memory has no JIT-pool alias, so:
+ *   - a MonoBackpatcherWrite that finds no alias is the NORMAL direct store, not a degraded one;
+ *   - the Mono backpatcher block must only be marked through InvalidationTracker's
+ *     DetectMonoBackpatcherBlock, which disables SMC write-trapping FIRST. Marking it from the
+ *     native alias capture below would let MonoBackpatcherWrite store directly into a page that is
+ *     still write-trapped while it holds CodeInvalidationMutex, and the resulting SMC fault needs
+ *     that same mutex. So the native activation is consumed and declined in this mode. */
+static bool IosCoreGuestRwxDataMode() {
+#if defined(ARCHITECTURE_arm64ec)
+  static std::atomic<int8_t> Cached {-1};
+  int8_t V = Cached.load(std::memory_order_relaxed);
+  if (V < 0) {
+    const char* E = getenv("MADEIRA_GUEST_RWX_DATA");
+    V = (E && E[0] == '0') ? 0 : 1;
+    Cached.store(V, std::memory_order_relaxed);
+  }
+  return V != 0;
+#else
+  return false;
+#endif
+}
+
 static void IosMonoTryActivate(ContextImpl* CTX, FEXCore::Core::InternalThreadState* Thread) {
   uint64_t BlockBegin = 0, HostPC = 0, FaultAddr = 0;
   if (!ios_fex_mono_take_pending(&BlockBegin, &HostPC, &FaultAddr)) {
+    return;
+  }
+  if (IosCoreGuestRwxDataMode()) {
+    LogMan::Msg::EFmt("[mono-bridge] ml2000 native activation DECLINED in host-data mode (block_begin={:#x} fault={:#x}); "
+                      "the SMC-fault detector marks the backpatcher after disabling write-trapping",
+                      BlockBegin, FaultAddr);
     return;
   }
 
@@ -2956,14 +2986,27 @@ void ContextImpl::MonoBackpatcherWrite(FEXCore::Core::CpuStateFrame* Frame, uint
      * anonymous alias table (NOT IosAliasEntries) and write the RW view.
      *
      * A miss is counted and falls through to the direct store, which faults and
-     * is emulated as before: degraded, never wrong. */
+     * is emulated as before: degraded, never wrong.
+     *
+     * ml2000: in host-data mode (IosCoreGuestRwxDataMode) anonymous RWX memory has
+     * no alias and is plain writable host memory once SMC trapping is disabled, so a
+     * miss is the normal direct store. It is counted as a helper call, not as an
+     * alias miss, and reported once. */
     // The alias table is keyed by the address actually mapped in this process, i.e. the host
     // address. Identical to `Address` for every identity-mapped configuration.
     const uint64_t RW = IosMonoResolveRW(Dest, Size);
     if (RW) {
       Dest = RW;
     }
-    ios_fex_mono_count_helper(RW ? 0 : 1);
+    if (!RW && IosCoreGuestRwxDataMode()) {
+      static std::atomic<bool> Reported {false};
+      if (!Reported.exchange(true, std::memory_order_relaxed)) {
+        LogMan::Msg::EFmt("[mono-bridge] ml2000 backpatch store direct to host-data page {:#x} (no alias needed; normal)", Dest);
+      }
+      ios_fex_mono_count_helper(0);
+    } else {
+      ios_fex_mono_count_helper(RW ? 0 : 1);
+    }
 #endif
 
     if (Size == 8) {

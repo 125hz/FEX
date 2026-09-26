@@ -1188,6 +1188,47 @@ public:
   }
 };
 
+#ifdef FEX_IOS_HOST
+extern "C" uint64_t IosMonoResolveRW(uint64_t GuestAddr, uint64_t Size);
+
+/* iOS-Madeira ml2000: does a handled SMC write still need the ml657/ml1018/ml1065 assist?
+ *
+ * Those paths exist because the faulting page STAYS read-execute on iOS: an anonymous JIT-pool
+ * alias (writes land through the RW view) or a copied image page. Retrying the store there can
+ * never succeed, so the access is completed or rewritten here.
+ *
+ * In host-data mode (MADEIRA_GUEST_RWX_DATA, see virtual_ios.c ios_guest_rwx_is_host_data) an
+ * anonymous x64-guest RWX page is plain host memory: HandleRWXAccessViolation has just made it
+ * genuinely writable, so upstream's contract holds again -- return without advancing Pc and the
+ * ORIGINAL instruction retries on the now-writable page. Running the assist there would backpatch
+ * JIT code for no reason (a half-barrier over PC[-1], or an in-place STLRB->STRB rewrite).
+ *
+ * Returns true (keep the assist) when the mode is off, when the page has an anonymous RW alias,
+ * when it belongs to an image, or when it cannot be classified. */
+static bool IosSmcNeedsLegacyAssist(uint64_t FaultAddress) {
+  if (!FEX::Windows::IosGuestRwxDataMode()) {
+    return true;
+  }
+  if (IosMonoResolveRW(FaultAddress, 1)) {
+    return true;
+  }
+  MEMORY_BASIC_INFORMATION Info;
+  if (!VirtualQuery(reinterpret_cast<LPCVOID>(FaultAddress), &Info, sizeof(Info))) {
+    return true;
+  }
+  if (Info.Type == MEM_IMAGE) {
+    return true;
+  }
+  static std::atomic<uint32_t> Count {0};
+  const auto N = Count.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (N <= 8 || !(N & 0xFFFF)) {
+    LogMan::Msg::EFmt("[rwx-data] ml2000 SMC write #{} at {:#x} on host-data page: upstream retry (no backpatch)", N,
+                      FaultAddress);
+  }
+  return false;
+}
+#endif
+
 // Returns true if exception dispatch should be halted and the execution context restored to NativeContext
 bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* Exception, CONTEXT* GuestContext, ARM64_NT_CONTEXT* NativeContext) {
   auto Thread = CPUArea.ThreadState();
@@ -1327,7 +1368,9 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
             (((Ml1018Insn & Ml1018LdaxrMask) == Ml1018StlrInst) ||
              ((Ml1018Insn & Ml1018Rcpc2Mask) == Ml1018StlurInst));
 
-        if (Ml1018IsByteRelStore) {
+        if (!IosSmcNeedsLegacyAssist(FaultAddress)) {
+          /* ml2000: host-data page, now genuinely writable -- upstream retry, Pc unchanged. */
+        } else if (Ml1018IsByteRelStore) {
           /* ml1065: ml1018 retried the SAME stlrb and relied on the page having become
            * writable. On iOS it never does (the mapping stays RX; plain stores into it
            * are emulated by Wine's Mach handler, but that emulator covers STR/STRB, not
