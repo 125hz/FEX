@@ -15,6 +15,13 @@
 #include <cstdint>
 #include <cstdlib>
 
+// MADEIRA 2026-09-19: [unaligned-atomic] totals, defined in Interface/Core/Core.cpp
+// alongside the other [fex-stats] accumulators (this file is arm64-host only).
+namespace FEXCore::Context::MadeiraStats {
+extern std::atomic<uint64_t> UnalignedAtomicEmulated;
+extern std::atomic<uint64_t> UnalignedAtomicPatched;
+} // namespace FEXCore::Context::MadeiraStats
+
 namespace FEXCore::ArchHelpers::Arm64 {
 constexpr uint32_t CASPAL_MASK = 0xBF'E0'FC'00;
 constexpr uint32_t CASPAL_INST = 0x08'60'FC'00;
@@ -173,6 +180,49 @@ static uint8_t LoadAcquire8(uint64_t Addr) {
 static bool StoreCAS8(uint8_t& Expected, uint8_t Val, uint64_t Addr) {
   auto Atom = std::atomic_ref<uint8_t>(*reinterpret_cast<uint8_t*>(Addr));
   return Atom.compare_exchange_strong(Expected, Val);
+}
+
+// MADEIRA ml2000: split-CAS tear repair.
+//
+// The dual-CAS paths below store the UPPER half first. When that succeeds and
+// the LOWER CAS then fails (another thread changed the lower half in between),
+// upstream leaves the upper half holding our desired bits and reports the
+// operation as failed (CAS) or returns half-applied (atomic memory ops, "XXX:
+// Resolve with TME"). A guest lock word crossing a 16-byte boundary is then
+// left torn: part new value, part old, which no guest thread will ever release.
+// Instead, CAS the upper half back from what we stored to what was there; if
+// that succeeds memory is exactly as before the attempt and the caller retries
+// the whole operation from a fresh load. If the rollback CAS fails too (a third
+// writer already consumed the torn value) the upstream behaviour is kept.
+// Pure helper, no allocation, no locks, no TLS: safe in the fault handler.
+// MADEIRA_SPLITLOCK_ROLLBACK=0 restores the upstream behaviour.
+static bool SplitCASRollbackEnabled() {
+  static std::atomic<int> State {-1};
+  int S = State.load(std::memory_order_relaxed);
+  if (S < 0) {
+    const char* E = getenv("MADEIRA_SPLITLOCK_ROLLBACK");
+    S = (E && E[0] == '0' && E[1] == '\0') ? 0 : 1;
+    State.store(S, std::memory_order_relaxed);
+    LogMan::Msg::IFmt("[splitlock] ml2000 split-CAS tear rollback {} (MADEIRA_SPLITLOCK_ROLLBACK=0 disables)", S ? "ON" : "OFF");
+  }
+  return S != 0;
+}
+
+template<typename T>
+static bool SplitCASRollback(T Stored, T Original, uint64_t AddrUpper, uint32_t Bits) {
+  if (!SplitCASRollbackEnabled()) {
+    return false;
+  }
+  auto Atom = std::atomic_ref<T>(*reinterpret_cast<T*>(AddrUpper));
+  T Current = Stored;
+  const bool Restored = Atom.compare_exchange_strong(Current, Original);
+  static std::atomic<uint32_t> Count {0};
+  const uint32_t N = Count.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (N <= 8 || (N % 4096) == 0) {
+    LogMan::Msg::IFmt("[splitlock] ml2000 torn {}-bit split CAS #{} upper={:#x}: rollback {}", Bits, N, AddrUpper,
+                      Restored ? "restored, retrying" : "FAILED (upper changed again), upstream tear path");
+  }
+  return Restored;
 }
 
 static uint16_t DoLoad16(uint64_t Addr) {
@@ -523,6 +573,9 @@ static bool RunCASPAL(uint64_t* GPRs, uint32_t Size, uint32_t DesiredReg1, uint3
             if (StoreCAS64(TmpExpectedLower, TmpDesiredLower, Addr)) {
               // Stored successfully
               return true;
+            } else if (SplitCASRollback<uint64_t>(TmpDesiredUpper, TmpExpectedUpper, AddrUpper, 64)) {
+              // MADEIRA ml2000: upper half restored; nothing was stored, retry from a fresh load
+              continue;
             } else {
               // CAS managed to tear, we can't really solve this
               // Continue down the path to let the guest know values weren't expected
@@ -868,6 +921,9 @@ static uint16_t DoCAS16(uint16_t DesiredSrc, uint16_t ExpectedSrc, uint64_t Addr
           if (StoreCAS8(ExpectedLower, DesiredLower, Addr)) {
             // Stored successfully
             return Expected;
+          } else if (SplitCASRollback<uint8_t>(DesiredUpper, ExpectedUpper, AddrUpper, 16)) {
+            // MADEIRA ml2000: upper byte restored; nothing was stored, retry from a fresh load
+            continue;
           } else {
             // CAS managed to tear, we can't really solve this
             // Continue down the path to let the guest know values weren't expected
@@ -1154,6 +1210,9 @@ static uint32_t DoCAS32(uint32_t DesiredSrc, uint32_t ExpectedSrc, uint64_t Addr
           if (StoreCAS32(TmpExpectedLower, TmpDesiredLower, Addr)) {
             // Stored successfully
             return Expected;
+          } else if (SplitCASRollback<uint32_t>(TmpDesiredUpper, TmpExpectedUpper, AddrUpper, 32)) {
+            // MADEIRA ml2000: upper word restored; nothing was stored, retry from a fresh load
+            continue;
           } else {
             // CAS managed to tear, we can't really solve this
             // Continue down the path to let the guest know values weren't expected
@@ -1388,6 +1447,9 @@ static uint64_t DoCAS64(uint64_t DesiredSrc, uint64_t ExpectedSrc, uint64_t Addr
           if (StoreCAS64(TmpExpectedLower, TmpDesiredLower, Addr)) {
             // Stored successfully
             return Expected;
+          } else if (SplitCASRollback<uint64_t>(TmpDesiredUpper, TmpExpectedUpper, AddrUpper, 64)) {
+            // MADEIRA ml2000: upper doubleword restored; nothing was stored, retry from a fresh load
+            continue;
           } else {
             // CAS managed to tear, we can't really solve this
             // Continue down the path to let the guest know values weren't expected
@@ -2139,9 +2201,96 @@ static uint64_t HandleAtomicLoadstoreExclusive(uintptr_t ProgramCounter, uint64_
   return NumInstructionsToSkip * 4;
 }
 
+/* MADEIRA 2026-09-19 [unaligned-atomic] census.
+ *
+ * Every unaligned atomic that reaches this file is either EMULATED in place
+ * (the handler performs the access itself and reports how far to advance) or
+ * BACK-PATCHED (the atomic is rewritten to a plain access plus a barrier and
+ * re-executed). Which one happened is fully determined by the return value —
+ * a byte count to skip means emulation, an instruction-relative 0 or -4 means
+ * the site was rewritten and must run again — so one wrapper covers all nine
+ * class branches without touching any of them.
+ *
+ * Why this is worth logging at all: FEX deliberately does NOT back-patch the
+ * LSE atomic-memory class (SWP/LDADD/LDCLR/LDEOR/LDSET), because no single
+ * ARM64 instruction has the semantics to replace one. Those sites therefore
+ * fault on EVERY execution, and a guest spin-acquire re-faults once per loop
+ * iteration. That is correct but slow, and it is the shape that has to be
+ * recognisable in a log before anyone concludes a lock is deadlocked. Sites
+ * are deduplicated by host PC and capped at 32 lines; the running totals go
+ * out on the periodic [fex-stats] line, which is never capped. */
+namespace Madeira {
+// Storage lives in Core.cpp next to the other [fex-stats] accumulators, because
+// this translation unit is only compiled for arm64 hosts and the stats line is
+// not.
+using FEXCore::Context::MadeiraStats::UnalignedAtomicEmulated;
+using FEXCore::Context::MadeiraStats::UnalignedAtomicPatched;
+
+static bool ClaimUnalignedSite(uint64_t PC) {
+  constexpr uint32_t MaxSites = 32;
+  static std::atomic<uint64_t> Sites[MaxSites] {};
+
+  for (uint32_t i = 0; i < MaxSites;) {
+    uint64_t Seen = Sites[i].load(std::memory_order_acquire);
+    if (Seen == PC) {
+      // Already reported once.
+      return false;
+    }
+    if (Seen == 0) {
+      uint64_t Expected = 0;
+      if (Sites[i].compare_exchange_strong(Expected, PC, std::memory_order_acq_rel)) {
+        return true;
+      }
+      // Another thread took this slot while we looked at it; re-read the same
+      // slot rather than skipping it, so a site can never be reported twice.
+      continue;
+    }
+    ++i;
+  }
+  // Table full: the 32-line cap is reached, counters keep going.
+  return false;
+}
+} // namespace Madeira
+
+[[nodiscard]]
+static std::optional<int32_t> HandleUnalignedAccessImpl(FEXCore::Core::InternalThreadState* Thread, UnalignedHandlerType HandleType,
+                                                       uintptr_t ProgramCounter, uint64_t* GPRs, bool IsJIT);
+
 [[nodiscard]]
 std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState* Thread, UnalignedHandlerType HandleType,
                                              uintptr_t ProgramCounter, uint64_t* GPRs, bool IsJIT) {
+  // Read the faulting encoding BEFORE the handler runs: a back-patch rewrites
+  // it in place, and the log has to name the instruction that actually faulted.
+  const uint32_t Instr = reinterpret_cast<const uint32_t*>(ProgramCounter)[0];
+  const auto Result = HandleUnalignedAccessImpl(Thread, HandleType, ProgramCounter, GPRs, IsJIT);
+  if (!Result.has_value()) {
+    return Result;
+  }
+
+  // 0 / -4 mean "the site was rewritten, run it again"; anything else is a
+  // byte count past an access this handler performed itself.
+  const bool Patched = (*Result == 0 || *Result == -4);
+  if (Patched) {
+    Madeira::UnalignedAtomicPatched.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    Madeira::UnalignedAtomicEmulated.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  if (Madeira::ClaimUnalignedSite(ProgramCounter)) {
+    const uint32_t AddrReg = (Instr >> 5) & 0x1F;
+    LogMan::Msg::EFmt("[unaligned-atomic] pc=0x{:x} insn=0x{:08x} addr=0x{:x} handled by {} "
+                      "(jit={} emulated={} patched={}) rev=2026-09-19",
+                      ProgramCounter, Instr, AddrReg == 31 ? 0 : GPRs[AddrReg], Patched ? "patch" : "emulation", IsJIT ? 1 : 0,
+                      Madeira::UnalignedAtomicEmulated.load(std::memory_order_relaxed),
+                      Madeira::UnalignedAtomicPatched.load(std::memory_order_relaxed));
+  }
+
+  return Result;
+}
+
+[[nodiscard]]
+static std::optional<int32_t> HandleUnalignedAccessImpl(FEXCore::Core::InternalThreadState* Thread, UnalignedHandlerType HandleType,
+                                                        uintptr_t ProgramCounter, uint64_t* GPRs, bool IsJIT) {
 #ifdef ARCHITECTURE_arm64
   constexpr bool is_arm64 = true;
 #else
@@ -2322,7 +2471,27 @@ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState*
   // thread identity into the word (waiters only ever test zero/nonzero); on
   // timeout, emulate this one access with the same helpers the !IsJIT path
   // uses and leave the code unpatched.
-  uint32_t* BPFutex = &InlineTail->SpinLockFutex;
+  /* iOS-Madeira 2026-09-23: THE BACKPATCH LOCK LIVES IN THE CODE BUFFER, AND ON
+   * iOS THE CODE BUFFER IS EXECUTE-ONLY.
+   *
+   * JITCodeTail is emitted after each block's code, so &SpinLockFutex is an
+   * address in the dual-mapped pool's RX view. The acquire below is a real
+   * LDAXR/STLXR pair; the load reads fine (RX is readable) and the STORE takes a
+   * permission fault. A device log caught precisely that, INSIDE this function:
+   * the handler faulted while handling a fault and the process died on the
+   * second one. It is also the one place a Mach-side emulator cannot rescue
+   * cheaply, because an exclusive pair cannot be completed instruction by
+   * instruction once the monitor has been lost to the exception.
+   *
+   * The lock word is only ever reached through this pointer (the CAS here and
+   * SpinWaitLock::Wait/Wake below all take it), so moving the WHOLE lock to the
+   * writable alias keeps every participant agreeing on one address — which is
+   * what a futex keyed on an address requires. Both views map the same physical
+   * page, so an exclusive pair on the alias is a genuine hardware atomic against
+   * anything else touching the same memory.
+   *
+   * Off iOS, DualMap::WriteAddr is the identity. */
+  uint32_t* BPFutex = FEXCore::DualMap::WriteAddr(&InlineTail->SpinLockFutex);
   const uint32_t BPStamp = 0x80000000u | (static_cast<uint32_t>(reinterpret_cast<uintptr_t>(Thread) >> 4) & 0x7FFFFFFFu);
   bool BPLocked = false;
   for (int Attempt = 0; Attempt < 8; ++Attempt) {
@@ -2375,6 +2544,14 @@ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState*
   }
   FEXCore::Utils::SpinWaitLock::UniqueSpinMutex lk(BPFutex, FEXCore::Utils::SpinWaitLock::adopt_lock);
 
+  // MADEIRA: every backpatch below re-encodes the faulting instruction keeping the SAME AddrReg and
+  // the SAME immediate, and every address this file handles is read straight out of GPRs[AddrReg].
+  // That is correct under the 32-bit guest window only because the JIT materialises the complete
+  // host address into a single base register before every atomic (see Arm64JITCore::GetGuestMemReg;
+  // the address register already holds GuestBase + EA at fault time, so nothing here may add the
+  // base again). If an atomic path is ever given a `[Xbase, Xoffset]` register-offset form - e.g.
+  // by folding the window base into the addressing mode instead of an explicit add - these
+  // rewrites would silently emit an instruction with a different effective address.
   if ((Instr & LDAXR_MASK) == LDAR_INST ||  // LDAR*
       (Instr & LDAXR_MASK) == LDAPR_INST) { // LDAPR*
     uint32_t LDR = LDR_INST;
