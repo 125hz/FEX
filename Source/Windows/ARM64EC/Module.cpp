@@ -86,10 +86,38 @@ extern "C" uint64_t IosSubfloorClipSize(uint64_t LowAddr, uint64_t Size);  // ml
  * target. Read by the [ffs-bypass] reporter in Core.cpp's CompileBlock. */
 extern "C" uint64_t IosFfsBypassLog[4];
 
+/* 2026-09-23: defined in Module.S inside `#ifdef FEX_IOS_HOST`. Referencing it
+ * from this TU (which only compiles when the define is set) makes a build whose
+ * assembler never saw the define fail at LINK time. See the tripwire comment in
+ * Module.S and the CMakeLists note next to target_compile_definitions. */
+extern "C" const uint64_t IosEcAsmIosBuilt;
+
+/* ExitFunctionEC's inline alias translation keeps score: [0] translated to the
+ * JIT-pool copy, [1] left in PE space (each of those IS a Mach exec fault),
+ * [2] ml990: already a pool address, nothing to translate. See IosJitAlias.cpp
+ * for why [1] and [2] had to be separated. */
+extern "C" uint64_t IosAliasStats[4];
+
+/* Bisect switch for ExitToX64's fast-forward-sequence bypass; see IosJitAlias.cpp.
+ * Namespace scope, because a linkage-specification is ill-formed at block scope —
+ * clang then resolved the name against the nearest visible array and reported the
+ * mistake as a pointer-to-bool warning three errors later. */
+extern "C" volatile int IosFfsBypassEnable;
+
+/* ml990: MADEIRA_EC_POOL_FASTOUT=0 disables the in-pool fast-out in
+ * ExitFunctionEC by keeping IosAliasJitSpan zero. Same namespace-scope reason
+ * as IosFfsBypassEnable above. */
+extern "C" volatile int IosEcPoolFastOut;
+
 /* Raw TSD byte offset (from TPIDRRO_EL0 & ~7) of the slot holding the TEB.
  * Discovered and published by wine's ntdll-unix; imported in ProcessInit.
  * Defined in FEXCore Arm64Emitter.cpp, where the JIT emitters also read it. */
 extern "C" uint32_t IosTebTsdOffset;
+/* MADEIRA: the dual-mapped JIT pool's RX range, defined in rpmalloc.c beside ios_fex_band_base.
+ * Published in ProcessInit next to FEXCore::DualMap::WriteOffset; read by
+ * FEXCore::Allocator::VirtualAlloc to reject an executable allocation outside the pool. */
+extern "C" uintptr_t ios_fex_jit_pool_rx;
+extern "C" uintptr_t ios_fex_jit_pool_end;
 /* uint32_t, not bool: a 1-byte global here misaligned the adrp/ldr pair
  * lld generates for the neighbouring word ("misaligned ldr/str offset"). */
 static uint32_t IosTebTsdImportFound = 0;
@@ -949,8 +977,30 @@ NTSTATUS ProcessInit() {
  * __DATE__/__TIME__ below is compiler-generated and therefore the
  * authoritative identity; if the two disagree, the tag is wrong, not the
  * build. */
-#define MADEIRA_REV "ml908"
+#define MADEIRA_REV "ml1000"
   LogMan::Msg::EFmt("[build-id] xtajit64 rev=" MADEIRA_REV " compiled " __DATE__ " " __TIME__);
+#ifdef FEX_IOS_HOST
+  /* The load is what keeps the tripwire reference alive through -O2; the value
+   * itself is only interesting as proof on the device that the assembler and
+   * the compiler agreed about FEX_IOS_HOST for this binary. */
+  {
+    const char* Bypass = getenv("MADEIRA_EC_FFS_BYPASS");
+    if (Bypass && Bypass[0] == '0') {
+      IosFfsBypassEnable = 0;
+    }
+    /* ml990: the in-pool fast-out in ExitFunctionEC. Read here so it is set
+     * before the first BTCpu64IosAddAliasMapping can publish a span; with it
+     * off the span stays 0 and Module.S takes the pre-ml990 path. */
+    const char* PoolOut = getenv("MADEIRA_EC_POOL_FASTOUT");
+    if (PoolOut && PoolOut[0] == '0') {
+      IosEcPoolFastOut = 0;
+    }
+    LogMan::Msg::EFmt("[build-id] Module.S iOS paths present (stamp {}) -- alias xlate and sweep "
+                      "gate are compiled in; ExitToX64 FFS bypass {}; EC in-pool fast-out {}",
+                      IosEcAsmIosBuilt, IosFfsBypassEnable ? "ENABLED" : "disabled by MADEIRA_EC_FFS_BYPASS=0",
+                      IosEcPoolFastOut ? "ENABLED" : "disabled by MADEIRA_EC_POOL_FASTOUT=0");
+  }
+#endif
 #ifdef FEX_IOS_HOST
   /* ml751: flush the VA band selector's beacons.
    *
@@ -1019,9 +1069,19 @@ NTSTATUS ProcessInit() {
   {
     const char *rw_env = getenv("WINE_IOS_JIT_RW");
     const char *rx_env = getenv("WINE_IOS_JIT_RX");
+    const char *size_env = getenv("WINE_IOS_JIT_SIZE");
     uint64_t rw = rw_env ? strtoull(rw_env, nullptr, 16) : 0;
     uint64_t rx = rx_env ? strtoull(rx_env, nullptr, 16) : 0;
+    uint64_t pool_size = size_env ? strtoull(size_env, nullptr, 16) : 0;
     int64_t off = (rw && rx) ? (int64_t)(rw - rx) : 0;
+    /* MADEIRA: publish the pool's RX range so FEXCore::Allocator::VirtualAlloc can refuse an
+     * executable allocation that did not come from the pool (see the check there). Both values
+     * are needed or the check stays off; it never weakens an allocation that already succeeds,
+     * so the ARM64EC path behaves exactly as before on a healthy pool. */
+    if (rx && pool_size) {
+      ios_fex_jit_pool_rx = (uintptr_t)rx;
+      ios_fex_jit_pool_end = (uintptr_t)(rx + pool_size);
+    }
     HANDLE stderr_h = NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters
         ? reinterpret_cast<HANDLE>(reinterpret_cast<RTL_USER_PROCESS_PARAMETERS64*>(
               NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters)->hStdError)
@@ -1127,6 +1187,47 @@ public:
     GetCPUArea().Area->InSyscallCallback = Prev;
   }
 };
+
+#ifdef FEX_IOS_HOST
+extern "C" uint64_t IosMonoResolveRW(uint64_t GuestAddr, uint64_t Size);
+
+/* iOS-Madeira ml2000: does a handled SMC write still need the ml657/ml1018/ml1065 assist?
+ *
+ * Those paths exist because the faulting page STAYS read-execute on iOS: an anonymous JIT-pool
+ * alias (writes land through the RW view) or a copied image page. Retrying the store there can
+ * never succeed, so the access is completed or rewritten here.
+ *
+ * In host-data mode (MADEIRA_GUEST_RWX_DATA, see virtual_ios.c ios_guest_rwx_is_host_data) an
+ * anonymous x64-guest RWX page is plain host memory: HandleRWXAccessViolation has just made it
+ * genuinely writable, so upstream's contract holds again -- return without advancing Pc and the
+ * ORIGINAL instruction retries on the now-writable page. Running the assist there would backpatch
+ * JIT code for no reason (a half-barrier over PC[-1], or an in-place STLRB->STRB rewrite).
+ *
+ * Returns true (keep the assist) when the mode is off, when the page has an anonymous RW alias,
+ * when it belongs to an image, or when it cannot be classified. */
+static bool IosSmcNeedsLegacyAssist(uint64_t FaultAddress) {
+  if (!FEX::Windows::IosGuestRwxDataMode()) {
+    return true;
+  }
+  if (IosMonoResolveRW(FaultAddress, 1)) {
+    return true;
+  }
+  MEMORY_BASIC_INFORMATION Info;
+  if (!VirtualQuery(reinterpret_cast<LPCVOID>(FaultAddress), &Info, sizeof(Info))) {
+    return true;
+  }
+  if (Info.Type == MEM_IMAGE) {
+    return true;
+  }
+  static std::atomic<uint32_t> Count {0};
+  const auto N = Count.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (N <= 8 || !(N & 0xFFFF)) {
+    LogMan::Msg::EFmt("[rwx-data] ml2000 SMC write #{} at {:#x} on host-data page: upstream retry (no backpatch)", N,
+                      FaultAddress);
+  }
+  return false;
+}
+#endif
 
 // Returns true if exception dispatch should be halted and the execution context restored to NativeContext
 bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* Exception, CONTEXT* GuestContext, ARM64_NT_CONTEXT* NativeContext) {
@@ -1267,7 +1368,9 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
             (((Ml1018Insn & Ml1018LdaxrMask) == Ml1018StlrInst) ||
              ((Ml1018Insn & Ml1018Rcpc2Mask) == Ml1018StlurInst));
 
-        if (Ml1018IsByteRelStore) {
+        if (!IosSmcNeedsLegacyAssist(FaultAddress)) {
+          /* ml2000: host-data page, now genuinely writable -- upstream retry, Pc unchanged. */
+        } else if (Ml1018IsByteRelStore) {
           /* ml1065: ml1018 retried the SAME stlrb and relied on the page having become
            * writable. On iOS it never does (the mapping stays RX; plain stores into it
            * are emulated by Wine's Mach handler, but that emulator covers STR/STRB, not

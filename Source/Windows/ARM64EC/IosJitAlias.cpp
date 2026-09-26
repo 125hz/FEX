@@ -41,6 +41,90 @@ constexpr int kMaxEntries = 256;
 extern "C" {
 IosAliasEntry IosAliasEntries[kMaxEntries];
 volatile int IosAliasCount = 0;
+
+// 2026-09-23 LAST-HIT CACHE. Index of the entry that satisfied the most recent
+// lookup, probed by Module.S BEFORE the linear scan.
+//
+// Race-free by construction, which is why it is an INDEX and not a copy of the
+// entry: a single naturally-aligned 32-bit load/store is atomic on AArch64, so a
+// reader sees some index that was published at some point, never a torn one. The
+// probe then RE-TESTS that entry's PeBase/Size against the target, so a stale or
+// retired index simply misses and falls into the scan. No generation counter, no
+// barrier, and nothing a wrong value can do beyond costing one extra compare.
+//
+// Module.S masks the value with 0xFF instead of range-checking it, so kMaxEntries
+// must stay a power of two no larger than 256.
+volatile int IosAliasHot = 0;
+
+// [0] = calls whose target was translated to its JIT-pool copy inline,
+// [1] = targets left in PE space (no entry matched, and not already in the
+//       pool) — each of those really does cost a Mach exception round trip
+//       through the unix-side exec-fault redirect,
+// [2] = ml990: targets that were ALREADY pool addresses and needed no
+//       translation at all (see IosAliasJitSpan below),
+// [3] = reserved.
+// Printed as `[ec-call] translated=N faulted=M inpool=P` by the ntdll-unix
+// stats reporter, which reads this array through the pool copy of this image.
+// Plain increments: a lost count under contention is cheaper than a bus-locked
+// RMW on this path, and the number is a diagnostic, not a decision input.
+//
+// ml990 SPLIT [1] IN TWO BECAUSE IT WAS MEASURING THE WRONG THING. Device log
+// q1 reported faulted climbing by ~14 M per 10 s window while "exec-fault
+// redirects" — the ntdll-unix counter for exec faults the Mach handler
+// actually fixed up — moved by ~2100 in the same window. Four orders of
+// magnitude apart, so those were never faults: they were the RETURN half of
+// the transition, whose target is already running out of the pool.
+uint64_t IosAliasStats[4] = {0, 0, 0, 0};
+
+/* ml990: {lo, hi - lo} over every registered JitBase..JitBase+Size, i.e. the
+ * part of the JIT pool that alias translation can ever PRODUCE.
+ *
+ * WHY. ExitFunctionEC is reached on two kinds of transition and only one of
+ * them has anything to translate:
+ *
+ *   CALL   x9 is a PE virtual address (it came from the EcCodeBitMap or from a
+ *          relocation), and the whole point of the table is to turn it into the
+ *          pool copy that iOS will actually let us execute.
+ *   RETURN x9 is the instruction after a `blr x16` inside an exit thunk that is
+ *          ALREADY EXECUTING — so it is already a pool address.
+ *
+ * The scan in Module.S only ever matches a PeBase range, so a return address
+ * walked all ~50 entries, matched nothing, bumped IosAliasStats[1] and fell
+ * through with x9 unchanged.  Unchanged is the correct answer; the walk is the
+ * most expensive imaginable way to reach it, and q1 measured 1.4 M of them per
+ * second with `ExitFunctionEC+0xc` at 6.4 % of ALL CPU.
+ *
+ * A single unsigned compare answers it: (x9 - lo) < span.
+ *
+ * SAFETY. The fast-out changes behaviour only if some address inside the Jit
+ * span would ALSO have matched a PeBase range in the scan.  PE images and the
+ * pool live in different bands of the address space, so that cannot happen —
+ * but the invariant is CHECKED rather than asserted: MaintainSpan() drops the
+ * span to zero the moment a registration makes a PeBase range intersect it,
+ * and a zero span makes the compare in Module.S always fail, which is the
+ * pre-ml990 path instruction for instruction.  The same zero is what
+ * MADEIRA_EC_POOL_FASTOUT=0 installs, so the knob and the safety net share one
+ * mechanism and one tested code path.
+ *
+ * 16-byte aligned so Module.S can take both halves with one ldp. */
+__attribute__((aligned(16))) uint64_t IosAliasJitSpan[2] = {0, 0};
+
+/* ml990: MADEIRA_EC_POOL_FASTOUT=0 turns the above off (span stays 0). Read
+ * once in ProcessInit, like IosFfsBypassEnable. */
+volatile int IosEcPoolFastOut = 1;
+
+// 2026-09-23 BISECT SWITCH for ExitToX64's fast-forward-sequence bypass.
+//
+// Enabling FEX_IOS_HOST for Module.S switched on four mechanisms at once that
+// had never executed on a device: the TEB-from-TSD reads, the JIT-pool alias
+// translation (the fix), the code-buffer sweep gate, and this bypass. Three of
+// them are either verified statically or are the counterpart of C++ code that
+// was already running one-sided. The bypass is the one that CHANGES DISPATCH
+// BEHAVIOUR for native EC callers, so it gets an off switch:
+// MADEIRA_EC_FFS_BYPASS=0 restores the plain emulation round trip without
+// giving up the alias translation. Read once in ProcessInit; the asm tests it
+// with two instructions on a path that is about to clobber x16 anyway.
+volatile int IosFfsBypassEnable = 1;
 /* ml1116: the entry that satisfied the last translation, checked first by
  * Module.S before the walk. A pointer (one atomic 8-byte store) rather than a
  * copy of the fields, so a reader can never see a torn entry; a retired entry
@@ -50,6 +134,8 @@ volatile int IosAliasCount = 0;
  * x64->EC call at up to a million calls a second. */
 IosAliasEntry* volatile IosAliasLast = nullptr;
 }
+
+static_assert(kMaxEntries == 256, "Module.S bounds IosAliasHot with `and #0xff`");
 
 namespace {
 IosAliasEntry* const g_Entries = IosAliasEntries;
@@ -218,6 +304,68 @@ void ios_fex_mono_count_helper(int Miss) {
 }
 /* ========================== end ml648 MONO BRIDGE ========================= */
 
+/* ml990: recompute IosAliasJitSpan from the live table.
+ *
+ * Called only from BTCpu64IosAddAliasMapping (once per image load/unload), so
+ * this O(N) sweep is off every hot path.  Recomputing from scratch rather than
+ * widening incrementally is what lets the span SHRINK when images retire, and
+ * it is what makes the intersection test below exact rather than historical.
+ *
+ * The span is published with the size LAST and a barrier before it, matching
+ * the discipline the entries themselves use.  A reader that sees a new `lo'
+ * with an old `span' (or the reverse) can only get a wrong ANSWER to "is this
+ * already a pool address", and both wrong answers are benign: a false negative
+ * falls into the scan, which is the old path; a false positive is impossible,
+ * because the guard below has already established that no PeBase range
+ * intersects the span, so an address that would have matched the scan cannot
+ * be inside any lo..lo+span this function ever publishes. */
+static void MaintainJitSpan(int count) {
+  uint64_t lo = ~0ull, hi = 0;
+  int i;
+
+  if (!IosEcPoolFastOut) {
+    goto disable;
+  }
+  for (i = 0; i < count; i++) {
+    const uint64_t jb = g_Entries[i].JitBase;
+    const uint64_t sz = g_Entries[i].Size;
+    if (!sz) {
+      continue;
+    }
+    if (jb < lo) {
+      lo = jb;
+    }
+    if (jb + sz > hi) {
+      hi = jb + sz;
+    }
+  }
+  if (lo >= hi) {
+    goto disable;
+  }
+  /* THE GUARD. If any live PE range overlaps [lo, hi) then an address inside
+   * the span could also satisfy the scan, and skipping the scan would change
+   * the answer. Refuse the optimisation outright rather than reason about
+   * which of the two the caller meant. */
+  for (i = 0; i < count; i++) {
+    const uint64_t pb = g_Entries[i].PeBase;
+    const uint64_t sz = g_Entries[i].Size;
+    if (!sz) {
+      continue;
+    }
+    if (pb < hi && lo < pb + sz) {
+      goto disable;
+    }
+  }
+  IosAliasJitSpan[0] = lo;
+  __sync_synchronize();
+  IosAliasJitSpan[1] = hi - lo;
+  return;
+
+disable:
+  IosAliasJitSpan[1] = 0; /* size first: a zero span is never consulted again */
+  __sync_synchronize();
+  IosAliasJitSpan[0] = 0;
+}
 /* ========================= ml951 SUB-FLOOR WINDOWS =======================
  *
  * iOS reserves the low 4GB of every task, so a PE whose preferred base is below
@@ -391,6 +539,7 @@ void BTCpu64IosAddAliasMapping(uint64_t PeBase, uint64_t JitBase, uint64_t Size)
       g_Entries[i].JitBase = JitBase;
       __sync_synchronize();
       g_Entries[i].Size = Size; // published last: readers see a complete entry
+      MaintainJitSpan(count);
       return;
     }
   }
@@ -410,6 +559,7 @@ void BTCpu64IosAddAliasMapping(uint64_t PeBase, uint64_t JitBase, uint64_t Size)
   g_Entries[count].Size = Size;
   __sync_synchronize();
   g_EntryCount = count + 1;
+  MaintainJitSpan(count + 1);
 }
 
 uint64_t IosJitTranslate(uint64_t Addr) {
