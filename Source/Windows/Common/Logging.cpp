@@ -13,6 +13,8 @@
 #include <unistd.h>
 #endif
 
+#include "Logging.h"
+
 namespace {
 void (*WineDbgOut)(const char* Message);
 FILE* LogFile;
@@ -28,30 +30,7 @@ FILE* LogFile;
  * process's real hStdError is the path already proven to work here (see the FEX-iOS FATAL
  * message in ARM64EC/Module.cpp). */
 static void IosLogWrite(const char* Str, size_t Len) {
-  /* ml195: hStdError is NULL in this context, so the WriteFile path produced nothing
-   * (which also means the pre-existing "[FEX-iOS] FATAL" message was never functional).
-   * Prefer __wine_dbg_output: it IS exported by our PE ntdll (export table ordinal 1464)
-   * and is exactly what that ntdll's own ERR() lines go through — those reach
-   * madeira-log.txt reliably. Keep WriteFile as a fallback. */
-  static int (__cdecl *DbgOut)(const char*);
-  static bool Resolved;
-  if (!Resolved) {
-    Resolved = true;
-    DbgOut = reinterpret_cast<decltype(DbgOut)>(
-        GetProcAddress(GetModuleHandleA("ntdll.dll"), "__wine_dbg_output"));
-  }
-  if (DbgOut) {
-    DbgOut(Str);
-    return;
-  }
-  HANDLE h = NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters
-                 ? reinterpret_cast<HANDLE>(reinterpret_cast<RTL_USER_PROCESS_PARAMETERS64*>(
-                       NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters)->hStdError)
-                 : nullptr;
-  if (h) {
-    ULONG Written = 0;
-    WriteFile(h, Str, static_cast<DWORD>(Len), &Written, nullptr);
-  }
+  FEX::Windows::Logging::RawWrite(Str, Len);
 }
 
 static void MsgHandler(LogMan::DebugLevels Level, const char* Message) {
@@ -85,6 +64,43 @@ static void AssertHandler(const char* Message) {
 } // namespace
 
 namespace FEX::Windows::Logging {
+/* ml195: hStdError is NULL in this context, so the WriteFile path produced nothing
+ * (which also means the pre-existing "[FEX-iOS] FATAL" message was never functional).
+ * Prefer __wine_dbg_output: it IS exported by our PE ntdll (export table ordinal 1464)
+ * and is exactly what that ntdll's own ERR() lines go through — those reach
+ * madeira-log.txt reliably. Keep WriteFile as a fallback.
+ *
+ * MADEIRA ml800: promoted out of the anonymous namespace so a module can report a fatal
+ * reason BEFORE Init() has installed the LogMan handlers. Nothing here depends on LogMan,
+ * on the config layer, or on a usable TEB TLS slot. */
+void RawWrite(const char* Str, size_t Len) {
+  static int (__cdecl *DbgOut)(const char*);
+  static bool Resolved;
+  if (!Resolved) {
+    Resolved = true;
+    DbgOut = reinterpret_cast<decltype(DbgOut)>(GetProcAddress(GetModuleHandleA("ntdll.dll"), "__wine_dbg_output"));
+  }
+  if (DbgOut) {
+    DbgOut(Str);
+    return;
+  }
+  /* MADEIRA: NtCurrentTeb() is a bare x18 read, and this is the fallback path of the function a
+   * module uses to report why it is about to die - so it must never be the thing that kills it.
+   * iOS zeroes x18 on the paths where a fatal report is most likely (pre-init, in a Mach handler),
+   * and the chain below would then fault twice before printing anything. No output is a worse
+   * answer than a printed message, but it is a far better one than a second fault with no message
+   * at all. */
+  auto* Teb = reinterpret_cast<__TEB*>(NtCurrentTeb());
+  if (!Teb || !Teb->Peb || !Teb->Peb->ProcessParameters) {
+    return;
+  }
+  HANDLE h = reinterpret_cast<HANDLE>(reinterpret_cast<RTL_USER_PROCESS_PARAMETERS64*>(Teb->Peb->ProcessParameters)->hStdError);
+  if (h) {
+    ULONG Written = 0;
+    WriteFile(h, Str, static_cast<DWORD>(Len), &Written, nullptr);
+  }
+}
+
 void Init() {
 #ifndef FEX_IOS_HOST
   FEX_CONFIG_OPT(SilentLog, SILENTLOG);

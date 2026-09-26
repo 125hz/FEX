@@ -8,6 +8,9 @@
 
 #include <windows.h>
 
+#include <cstdlib>
+#include <cstring>
+
 #include "CPUFeatures.h"
 
 namespace {
@@ -75,6 +78,95 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostF
   HostFeatures.SupportsFlagM = true;
   HostFeatures.SupportsFlagM2 = true;
   HostFeatures.SupportsAFP = true;
+
+  /* MADEIRA 2026-09-23: the list above is an ASSUMPTION that is only true of
+   * the newest cores, and a wrong `true` is silent corruption rather than a
+   * crash -- FEAT_AFP claimed on a core without it leaves FPCR.NEP RES0, so
+   * every scalar SSE operation zeroes the upper lanes of its destination
+   * instead of preserving them.  This module cannot call sysctl, but the app
+   * can: it publishes `FEX_MADEIRA_HOSTPROBE=AFP=0,FLAGM=1,...` ("?" when the
+   * sysctl does not exist).  Only an explicit `=0` turns a feature off; an
+   * absent variable or a "?" keeps the old assumption. */
+  if (const char* Probe = getenv("FEX_MADEIRA_HOSTPROBE")) {
+    const auto Absent = [Probe](const char* Key) {
+      const size_t Len = strlen(Key);
+      for (const char* p = Probe; (p = strstr(p, Key)) != nullptr; p += Len) {
+        const bool AtStart = p == Probe || p[-1] == ',';
+        if (AtStart && p[Len] == '=' ) {
+          return p[Len + 1] == '0';
+        }
+      }
+      return false;
+    };
+    if (Absent("AFP")) HostFeatures.SupportsAFP = false;
+    if (Absent("FLAGM")) HostFeatures.SupportsFlagM = false;
+    if (Absent("FLAGM2")) HostFeatures.SupportsFlagM2 = false;
+    if (Absent("FCMA")) HostFeatures.SupportsFCMA = false;
+    if (Absent("RCPC")) HostFeatures.SupportsRCPC = false;
+    if (Absent("AES")) HostFeatures.SupportsAES = false;
+    if (Absent("PMULL")) HostFeatures.SupportsPMULL_128Bit = false;
+    if (Absent("SHA")) HostFeatures.SupportsSHA = false;
+    if (Absent("CRC")) HostFeatures.SupportsCRC = false;
+    if (Absent("ATOMICS")) HostFeatures.SupportsAtomics = false;
+  }
+
+  /* MADEIRA ml970: FEAT_LRCPC2 (SupportsTSOImm9) is OPT-IN here, and off by
+   * default, because this branch cannot probe for it.
+   *
+   * ml998 CORRECTION -- IT BUYS NOTHING ON THIS PORT, AND COSTS A LITTLE.
+   * The paragraph that used to sit here described upstream's IDENTITY-MAPPED
+   * behaviour and was quietly wrong about ours.  It claimed a guest
+   * `add [ebp-516], reg' would have four address instructions absorbed by
+   * `ldapur/stlur wR, [x24, #-516]'.  That fold cannot happen behind a guest
+   * window: Arm64JITCore::GetGuestMemAddr (FEXCore JIT MemoryOps.cpp) returns
+   * NoOffset on every non-identity path, deliberately, because the base must
+   * be applied as `Base + zext32(EA + disp)' and an imm9 would add the
+   * displacement on the FAR side of the window (`Base + zext32(EA) + disp'),
+   * which leaves the window whenever an x86 effective address wraps at 4 GiB.
+   * Only the `if (!GuestBase)' early return preserves Offset, and that is the
+   * Linux-host path we never take.
+   *
+   * So with SupportsTSOImm9 true, LoadMemTSO/StoreMemTSO still see
+   * Guest.Offset invalid and emit `ldapur/stlur wR, [Xn, #0]' -- the same
+   * access as `ldapr/stlr wR, [Xn]', one encoding further up the architecture
+   * version.  The displacement is still materialised, just in a worse place:
+   *   OFF: one IR Add computes EA+disp and CSEs across the load and the store
+   *        of a load-modify-store, plus one ApplyGuestBase per access  = 3.
+   *   ON:  SelectAddressMode peels the displacement off, so there is no
+   *        shared IR Add left, and each access re-emits `sub Tmp, base, #516'
+   *        and `add Tmp, REG_GUEST_BASE, Tmp, UXTW'                    = 4.
+   * One extra instruction per load-modify-store, on a workload whose [prof]
+   * hot blocks are 95.1 % TSO-carrying.  The knob therefore stays OFF, and
+   * the app now probes `hw.optional.arm.FEAT_LRCPC2' and REPORTS it as
+   * [fex-cfg] without applying it (ContentView.swift, FEX knob block).
+   *
+   * Making it a win is a GetGuestMemAddr change, not a feature-bit change: it
+   * would have to carry a window-safe displacement through to the emitter.
+   * The back-patcher is already ready for that day -- it decodes and rewrites
+   * both forms (FEXCore/Source/Utils/ArchHelpers/Arm64.cpp: LDAPUR_INST /
+   * STLUR_INST at :2202, :2352, :2412) -- so the blocker is purely the 4 GiB
+   * wrap rule in the addressing path.
+   *
+   * WHY IT IS NOT ON BY DEFAULT.  FEAT_LRCPC2 is ARMv8.4; the app's iOS 18
+   * floor admits A12/A13, which are ARMv8.3 and implement LRCPC but NOT
+   * LRCPC2, so an unconditional `true' here would emit an undefined
+   * instruction in every JIT block on those devices.  Detecting it properly
+   * needs `hw.optional.arm.FEAT_LRCPC2' from sysctl, which is a unix-side
+   * call this PE module cannot make (FEXUnixLib's func table is not
+   * registered on the iOS host -- see TryEnableHardwareTSO), so until that
+   * table exists the honest form of this knob is a user opt-in that the
+   * device owner sets after checking their own silicon.
+   *
+   * Spelling matches upstream's own FEX_HOSTFEATURES token so nothing new
+   * has to be learned: `HOSTFEATURES=ENABLELRCPC2' in
+   * Documents/madeira-fex.txt.  FEX::FetchHostFeatures/OverrideFeatures --
+   * which is what parses that variable on a Linux host -- is never reached
+   * on this branch, which is why it is read directly here. */
+  if (const char* HostFeaturesEnv = getenv("FEX_HOSTFEATURES");
+      HostFeaturesEnv && strstr(HostFeaturesEnv, "ENABLELRCPC2")) {
+    HostFeatures.SupportsTSOImm9 = true;
+  }
+
   HostFeatures.CPUMIDRs.push_back(0u);
   HostFeatures.HostType = HostType;
   return HostFeatures;
