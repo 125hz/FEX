@@ -2047,6 +2047,10 @@ NTSTATUS ThreadInit() {
 #ifdef FEX_IOS_HOST
   IosTiLog("[FEX-iOS] TI:createthread\n");
 #endif
+  if (Thread->CurrentFrame->IosBlockRing) {
+    /* ml1205: TEB+0x1710 (ActivityId, unused by Wine) names this thread's block ring for ntdll's reporters. */
+    *reinterpret_cast<uint64_t**>(reinterpret_cast<uintptr_t>(IOSLoadTEB()) + 0x1710) = Thread->CurrentFrame->IosBlockRing;
+  }
 
   // Default segment setup.
   auto Frame = Thread->CurrentFrame;
