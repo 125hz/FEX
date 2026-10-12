@@ -591,6 +591,24 @@ ContextImpl::CreateThread(uint64_t InitialRIP, uint64_t StackPointer, const FEXC
 
   // Set up the thread manager state
   Thread->CurrentFrame->Thread = Thread;
+#ifdef FEX_IOS_HOST
+  /* ml1205: the block-entry ring, when MADEIRA_BLOCK_RING is set (32 KB per thread, never freed). */
+  {
+    static int RingOn = -1;
+    if (RingOn < 0) {
+      const char* E = getenv("MADEIRA_BLOCK_RING");
+      RingOn = (E && *E && *E != '0') ? 1 : 0;
+    }
+    if (RingOn) {
+      const size_t Bytes = (FEXCore::Core::IosBlockRingEntries + 1) * sizeof(uint64_t);
+      auto* Ring = static_cast<uint64_t*>(FEXCore::Allocator::aligned_alloc(64, Bytes));
+      if (Ring) {
+        memset(Ring, 0, Bytes);
+      }
+      Thread->CurrentFrame->IosBlockRing = Ring;
+    }
+  }
+#endif
 
   InitializeCompiler(Thread);
 
