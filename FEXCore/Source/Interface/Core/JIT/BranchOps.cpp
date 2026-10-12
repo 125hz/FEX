@@ -10,6 +10,7 @@ $end_info$
 #include "Interface/Core/LookupCache.h"
 
 #include "Interface/Core/JIT/JITClass.h"
+#include "Interface/Core/JIT/DebugData.h"
 
 #include <FEXCore/Core/Thunks.h>
 #include <FEXCore/Core/X86Enums.h>
@@ -46,6 +47,36 @@ DEF_OP(CallbackReturn) {
 DEF_OP(ExitFunction) {
   auto Op = IROp->C<IR::IROp_ExitFunction>();
 
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+  /* madeira-bcd: guest branch history v1. Executed exits, not a stack scan.
+   * Reserved TMP1-3 only; ADD/AND/loads/stores leave guest NZCV untouched.
+   * Save the real target and the last mapped guest opcode; commit Serial last. */
+  if (FEXCore::Core::IosGuestBranchTraceEnabled) {
+    using Frame = FEXCore::Core::CpuStateFrame;
+    constexpr auto History = offsetof(Frame, IosGuestBranchHistory);
+    constexpr auto Edges = History + offsetof(Frame::IosGuestBranchHistoryType, Edges);
+    ldr(TMP2, STATE, History + 8);
+    and_(ARMEmitter::Size::i64Bit, TMP3, TMP2, 7);
+    add(TMP3, STATE, TMP3, ARMEmitter::ShiftType::LSL, 5);
+    uint64_t Target;
+    if (IsInlineConstant(Op->NewRIP, &Target) || IsInlineEntrypointOffset(Op->NewRIP, &Target)) {
+      InsertGuestRIPMove(TMP1, Target);
+      str(TMP1, TMP3, Edges + 8);
+    } else {
+      str(GetReg(Op->NewRIP).X(), TMP3, Edges + 8);
+    }
+    const uint64_t Source = DebugData->GuestOpcodes.empty() ? 0 : Entry + DebugData->GuestOpcodes.back().GuestEntryOffset;
+    InsertGuestRIPMove(TMP1, Source);
+    str(TMP1, TMP3, Edges);
+    ldr(TMP1, STATE, offsetof(Frame, State.InlineJITBlockHeader));
+    str(TMP1, TMP3, Edges + 16);
+    movz(ARMEmitter::Size::i64Bit, TMP1, static_cast<uint64_t>(Op->Hint));
+    str(TMP1, TMP3, Edges + 24);
+    add(ARMEmitter::Size::i64Bit, TMP2, TMP2, 1);
+    str(TMP2, STATE, History + 8);
+  }
+#endif
+
   ResetStack();
 
   if (CTX->HostFeatures.IsInstCountCI) [[unlikely]] {
@@ -81,11 +112,23 @@ DEF_OP(ExitFunction) {
   if (IsInlineConstant(Op->NewRIP, &NewRIP) || IsInlineEntrypointOffset(Op->NewRIP, &NewRIP)) {
 #ifdef ARCHITECTURE_arm64ec
     if (NewRIP < EC_CODE_BITMAP_MAX_ADDRESS && RtlIsEcCode(NewRIP)) {
-      str(REG_CALLRET_SP, STATE_PTR(CpuStateFrame, State.callret_sp));
+      if (CallRetStackUsed()) {
+        str(REG_CALLRET_SP, STATE_PTR(CpuStateFrame, State.callret_sp));
+      }
       add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, StaticRegisters[X86State::REG_RSP], 0);
       InsertGuestRIPMove(EC_CALL_CHECKER_PC_REG, NewRIP);
       ldr(TMP2, STATE_PTR(CpuStateFrame, Pointers.ExitFunctionEC));
+#ifdef FEX_IOS_HOST
+      if (Op->Hint == IR::BranchHint::Call && IosEcReturnWithRet) {
+        // Push the return-address predictor entry the RET in EnterEC pops (IosEcReturnWithRet in
+        // Arm64Emitter.h). ExitFunctionEC loads LR itself on every path that uses it.
+        blr(TMP2);
+      } else {
+        br(TMP2);
+      }
+#else
       br(TMP2);
+#endif
     } else {
 #endif
       // In order to support direct branches without constantly hitting the L1 cache, we emit a call to a block linker,
@@ -162,17 +205,17 @@ DEF_OP(ExitFunction) {
       ARMEmitter::ForwardLabel l_CallReturn;
       if (Op->Hint == IR::BranchHint::Call) {
 #ifdef ARCHITECTURE_arm64ec
-        // iOS-Madeira 2026-05-13: REG_CALLRET_SP (x17) gets clobbered when a
-        // previous BLR returns from native ARM64EC code (DXMT vtable methods,
-        // ARM64EC entry thunks). Reload from State.callret_sp before pushing
-        // the call-return frame so we don't stp to wherever x17 was left.
-        ldr(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
-        // iOS-Madeira 2026-05-18: inline bounds-guard (Tier-2). iOS doesn't
-        // honor PAGE_NOACCESS on the callret stack's guard pages, so the
-        // SEH-driven HandleAccessViolation never resets the stack on
-        // underflow. Detect-and-reset inline before the `stp` to keep stack
-        // pointer in-range. Uses TMP1 as scratch; adr below re-initializes it.
-        {
+        if (CallRetStackUsed()) {
+          // iOS-Madeira 2026-05-13: REG_CALLRET_SP (x17) gets clobbered when a
+          // previous BLR returns from native ARM64EC code (DXMT vtable methods,
+          // ARM64EC entry thunks). Reload from State.callret_sp before pushing
+          // the call-return frame so we don't stp to wherever x17 was left.
+          ldr(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
+          // iOS-Madeira 2026-05-18: inline bounds-guard (Tier-2). iOS doesn't
+          // honor PAGE_NOACCESS on the callret stack's guard pages, so the
+          // SEH-driven HandleAccessViolation never resets the stack on
+          // underflow. Detect-and-reset inline before the `stp` to keep stack
+          // pointer in-range. Uses TMP1 as scratch; adr below re-initializes it.
           ARMEmitter::ForwardLabel l_callret_ok;
           /* iOS-Madeira ml263: the >>24 test only fires when the pointer leaves the
            * ENTIRE 16MB region, so a large-but-in-range leak sails straight through.
@@ -202,16 +245,15 @@ DEF_OP(ExitFunction) {
           (void)Bind(&l_callret_ok);
         }
 #endif
-#ifdef FEX_CALLRET_STACK_UNUSED
-        // Nothing reads the call-ret shadow stack in this module (see FEX_CALLRET_STACK_UNUSED in
-        // Arm64Emitter.h), so there is no push. The adr stays: it is the known-call marker that
-        // ExitFunctionLink looks for to relink this callsite as a `bl`.
-        if (!Op->CallReturnBlock.IsInvalid()) {
-          PendingCallReturnTargetLabel = &CallReturnTargets.try_emplace(Op->CallReturnBlock.ID()).first->second;
-          (void)adr(TMP1, &l_CallReturn);
-        }
-#else
-        if (!Op->CallReturnBlock.IsInvalid()) {
+        if (!CallRetStackUsed()) {
+          // Nothing reads the call-ret shadow stack in this module (see CallRetStackUsed in
+          // Arm64Emitter.h), so there is no push. The adr stays: it is the known-call marker that
+          // ExitFunctionLink looks for to relink this callsite as a `bl`.
+          if (!Op->CallReturnBlock.IsInvalid()) {
+            PendingCallReturnTargetLabel = &CallReturnTargets.try_emplace(Op->CallReturnBlock.ID()).first->second;
+            (void)adr(TMP1, &l_CallReturn);
+          }
+        } else if (!Op->CallReturnBlock.IsInvalid()) {
           auto CallReturnAddressReg = GetReg(Op->CallReturnAddress).X();
           PendingCallReturnTargetLabel = &CallReturnTargets.try_emplace(Op->CallReturnBlock.ID()).first->second;
           (void)adr(TMP1, &l_CallReturn);
@@ -219,12 +261,13 @@ DEF_OP(ExitFunction) {
         } else {
           stp<ARMEmitter::IndexType::PRE>(ARMEmitter::XReg::zr, ARMEmitter::XReg::zr, REG_CALLRET_SP, -0x10);
         }
-#endif
 #ifdef ARCHITECTURE_arm64ec
-        /* Write back post-push x17 so dispatcher LoopTop's reload picks
-         * up the new top. Without this, in-register PUSH changes get
-         * lost on next dispatcher iteration and the entry leaks. */
-        str(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
+        if (CallRetStackUsed()) {
+          /* Write back post-push x17 so dispatcher LoopTop's reload picks
+           * up the new top. Without this, in-register PUSH changes get
+           * lost on next dispatcher iteration and the entry leaks. */
+          str(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
+        }
 #endif
       } else if (Op->Hint == IR::BranchHint::CheckTF) {
         ARMEmitter::ForwardLabel TFUnset;
@@ -247,7 +290,7 @@ DEF_OP(ExitFunction) {
     auto RipReg = GetReg(Op->NewRIP);
 
 #ifndef FEX_CALLRET_STACK_UNUSED
-    if (Op->Hint == IR::BranchHint::Return) {
+    if (Op->Hint == IR::BranchHint::Return && CallRetStackUsed()) {
       // First try to pop from the call-ret stack, otherwise follow the normal path (but ending in a ret)
 #ifdef ARCHITECTURE_arm64ec
       // iOS-Madeira 2026-05-15: POP-side x17 reload + state sync. ARM64EC
@@ -335,13 +378,13 @@ DEF_OP(ExitFunction) {
     if (Op->Hint == IR::BranchHint::Call) {
       ARMEmitter::ForwardLabel l_CallReturn;
 #ifdef ARCHITECTURE_arm64ec
-      // iOS-Madeira 2026-05-13: see note above — reload REG_CALLRET_SP (x17)
-      // from State.callret_sp before pushing the call-return frame, since
-      // native ARM64EC returns leave x17 pointing at an arbitrary RX page.
-      ldr(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
-      // iOS-Madeira 2026-05-18: inline bounds-guard (Tier-2). Same as
-      // linked-path CALL push.
-      {
+      if (CallRetStackUsed()) {
+        // iOS-Madeira 2026-05-13: see note above — reload REG_CALLRET_SP (x17)
+        // from State.callret_sp before pushing the call-return frame, since
+        // native ARM64EC returns leave x17 pointing at an arbitrary RX page.
+        ldr(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
+        // iOS-Madeira 2026-05-18: inline bounds-guard (Tier-2). Same as
+        // linked-path CALL push.
         ARMEmitter::ForwardLabel l_callret_ok;
         /* iOS-Madeira ml263: tightened to a 4MB window -- see the first CALL push site. */
         ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp_base));
@@ -354,14 +397,13 @@ DEF_OP(ExitFunction) {
         (void)Bind(&l_callret_ok);
       }
 #endif
-#ifdef FEX_CALLRET_STACK_UNUSED
-      // No shadow-stack push in this module; this callsite is a register blr that is never
-      // backpatched, so no marker is needed either.
-      if (!Op->CallReturnBlock.IsInvalid()) {
-        PendingCallReturnTargetLabel = &CallReturnTargets.try_emplace(Op->CallReturnBlock.ID()).first->second;
-      }
-#else
-      if (!Op->CallReturnBlock.IsInvalid()) {
+      if (!CallRetStackUsed()) {
+        // No shadow-stack push in this module; this callsite is a register blr that is never
+        // backpatched, so no marker is needed either.
+        if (!Op->CallReturnBlock.IsInvalid()) {
+          PendingCallReturnTargetLabel = &CallReturnTargets.try_emplace(Op->CallReturnBlock.ID()).first->second;
+        }
+      } else if (!Op->CallReturnBlock.IsInvalid()) {
         auto CallReturnAddressReg = GetReg(Op->CallReturnAddress).X();
         PendingCallReturnTargetLabel = &CallReturnTargets.try_emplace(Op->CallReturnBlock.ID()).first->second;
         (void)adr(TMP1, &l_CallReturn);
@@ -369,10 +411,11 @@ DEF_OP(ExitFunction) {
       } else {
         stp<ARMEmitter::IndexType::PRE>(ARMEmitter::XReg::zr, ARMEmitter::XReg::zr, REG_CALLRET_SP, -0x10);
       }
-#endif
 #ifdef ARCHITECTURE_arm64ec
-      /* Write back post-push x17 so dispatcher LoopTop reload sees it. */
-      str(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
+      if (CallRetStackUsed()) {
+        /* Write back post-push x17 so dispatcher LoopTop reload sees it. */
+        str(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
+      }
 #endif
       blr(TMP2);
       (void)Bind(&l_CallReturn);

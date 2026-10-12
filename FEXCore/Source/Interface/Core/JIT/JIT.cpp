@@ -628,16 +628,11 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
   auto BranchOffset = HostCode / 4 - CallerAddress / 4;
 
   // The known-call marker is the `adr TMP1, <l_CallReturn>` a linked CALL emits before its branch.
-  // Without the shadow-stack push (FEX_CALLRET_STACK_UNUSED) it sits one instruction closer to the
-  // callsite and its immediate is 4 bytes smaller; both values come from the same macro as the
+  // Without the shadow-stack push (CallRetStackUsed() false) it sits one instruction closer to the
+  // callsite and its immediate is 4 bytes smaller; both values follow the same switch as the
   // emission in BranchOps.cpp.
-#ifdef FEX_CALLRET_STACK_UNUSED
-  constexpr uint32_t KnownCallMarkerImm = 0x8;
-  constexpr uintptr_t KnownCallMarkerDisp = 0x4;
-#else
-  constexpr uint32_t KnownCallMarkerImm = 0xC;
-  constexpr uintptr_t KnownCallMarkerDisp = 0x8;
-#endif
+  const uint32_t KnownCallMarkerImm = CallRetStackUsed() ? 0xC : 0x8;
+  const uintptr_t KnownCallMarkerDisp = CallRetStackUsed() ? 0x8 : 0x4;
   uint32_t ExpectedKnownCallMarkerInst = 0;
   ARMEmitter::Emitter ExpectedKnownCallMarkerEmit(reinterpret_cast<uint8_t*>(&ExpectedKnownCallMarkerInst), 4);
   ExpectedKnownCallMarkerEmit.adr(TMP1, KnownCallMarkerImm);

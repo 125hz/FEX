@@ -39,6 +39,12 @@
 #include <bit>
 #include <cstring>
 
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+// Set by ARM64EC/Module.cpp before the dispatcher is emitted, once every thread's frame carries
+// PEB->EcCodeBitMap (CpuStateFrame::IosEcCodeBitMap): the loop top's EC code check loads it from there.
+extern "C" uint32_t IosEcCodeBitMapCached = 0;
+#endif
+
 namespace FEXCore::CPU {
 
 static void SleepThread(FEXCore::Context::ContextImpl* CTX, FEXCore::Core::CpuStateFrame* Frame) {
@@ -178,7 +184,9 @@ void Dispatcher::EmitDispatcher() {
   add(ARMEmitter::Size::i64Bit, StaticRegisters[X86State::REG_RSP], ARMEmitter::Reg::rsp, 0);
   add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, TMP1, 0);
 
-  ldr(REG_CALLRET_SP, STATE_PTR(CpuStateFrame, State.callret_sp));
+  if (CallRetStackUsed()) {
+    ldr(REG_CALLRET_SP, STATE_PTR(CpuStateFrame, State.callret_sp));
+  }
 
   FillSpecialRegs(TMP1, TMP2, false, true);
 
@@ -195,7 +203,24 @@ void Dispatcher::EmitDispatcher() {
    * DllMain at unix_calls=4523 (same shape as the dispatcher-guard regression
    * in feedback_fex_dispatcher_guard_regression.md). Reverted. The host-PC
    * leak needs a different angle. */
-  (void)b(&LoopTop);
+  if (IosEcReturnWithRet) {
+    // An L1 hit is a block compiled for this address, never ARM64EC code: enter it with RET, which pops the
+    // predictor entry the guest CALL pushed when it left the JIT with BLR. The trap flag, a miss and an
+    // ARM64EC target (never in L1) take the loop top as before.
+    ldrb(TMP1, STATE_PTR(CpuStateFrame, State.flags[X86State::RFLAG_TF_RAW_LOC]));
+    (void)cbnz(ARMEmitter::Size::i32Bit, TMP1, &LoopTop);
+    ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
+    and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, EC_CALL_CHECKER_PC_REG, ARMEmitter::ShiftType::LSL,
+         FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+    add(TMP1, TMP1, TMP2);
+    ldp<ARMEmitter::IndexType::OFFSET>(TMP4, TMP2, TMP1, 0);
+    sub(TMP2, TMP2, EC_CALL_CHECKER_PC_REG);
+    (void)cbnz(ARMEmitter::Size::i64Bit, TMP2, &LoopTop);
+    (void)cbz(ARMEmitter::Size::i64Bit, TMP4, &LoopTop);
+    ret(TMP4);
+  } else {
+    (void)b(&LoopTop);
+  }
 #else
   // As ARM64EC uses this as an entrypoint for both guest calls and host returns, opportunistically try to return
   // using the call-ret stack to avoid unbalancing it.
@@ -226,15 +251,21 @@ void Dispatcher::EmitDispatcher() {
   // Check the EC code bitmap incase we need to exit the JIT to call into native code.
   ARMEmitter::ForwardLabel l_NotECCode;
 #ifdef FEX_IOS_HOST
-  // iOS clobbers x18 — read TEB from TPIDRRO_EL0+TSD slot 275 instead.
-  mrs(TMP1, ARMEmitter::SystemRegister::TPIDRRO_EL0);
-  and_(ARMEmitter::Size::i64Bit, TMP1, TMP1, ~7ULL);
-  ldr(TMP1, TMP1, IosTebTsdOffset);
-  ldr(TMP1, TMP1, TEB_PEB_OFFSET);
+  if (IosEcCodeBitMapCached) {
+    // PEB->EcCodeBitMap as stored in this thread's frame: one load instead of the TEB/PEB walk below.
+    ldr(TMP1, STATE_PTR(CpuStateFrame, IosEcCodeBitMap));
+  } else {
+    // iOS clobbers x18 — read TEB from TPIDRRO_EL0+TSD slot 275 instead.
+    mrs(TMP1, ARMEmitter::SystemRegister::TPIDRRO_EL0);
+    and_(ARMEmitter::Size::i64Bit, TMP1, TMP1, ~7ULL);
+    ldr(TMP1, TMP1, IosTebTsdOffset);
+    ldr(TMP1, TMP1, TEB_PEB_OFFSET);
+    ldr(TMP1, TMP1, PEB_EC_CODE_BITMAP_OFFSET);
+  }
 #else
   ldr(TMP1, ARMEmitter::XReg::x18, TEB_PEB_OFFSET);
-#endif
   ldr(TMP1, TMP1, PEB_EC_CODE_BITMAP_OFFSET);
+#endif
 
   lsr(ARMEmitter::Size::i64Bit, TMP2, RipReg, 18);
   ldr(TMP1, TMP1, TMP2, ARMEmitter::ExtendedType::LSL_64, 3);
@@ -242,7 +273,9 @@ void Dispatcher::EmitDispatcher() {
   lsrv(ARMEmitter::Size::i64Bit, TMP1, TMP1, TMP2);
   (void)tbz(TMP1, 0, &l_NotECCode);
 
-  str(REG_CALLRET_SP, STATE_PTR(CpuStateFrame, State.callret_sp));
+  if (CallRetStackUsed()) {
+    str(REG_CALLRET_SP, STATE_PTR(CpuStateFrame, State.callret_sp));
+  }
 
   add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, StaticRegisters[X86State::REG_RSP], 0);
   mov(EC_CALL_CHECKER_PC_REG, RipReg);
@@ -707,7 +740,7 @@ void Dispatcher::EmitDispatcher() {
     // ARM64EC reloads x17 from State.callret_sp. If State has drifted OOB
     // (e.g. underflow during prior dispatch), reset before stp to avoid
     // writing the sentinel into JIT code memory.
-    {
+    if (CallRetStackUsed()) {
       ARMEmitter::ForwardLabel l_callret_ok;
       ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp_base));
       sub(ARMEmitter::Size::i64Bit, TMP1, REG_CALLRET_SP, TMP1);
@@ -718,11 +751,11 @@ void Dispatcher::EmitDispatcher() {
       (void)Bind(&l_callret_ok);
     }
 #endif
-#ifndef FEX_CALLRET_STACK_UNUSED
-    // The sentinel makes a RET taken inside the callback pop {0,0} and mispredict. Without a
-    // shadow stack there is neither a push nor a pop, so there is nothing to seed.
-    stp<ARMEmitter::IndexType::PRE>(ARMEmitter::XReg::zr, ARMEmitter::XReg::zr, REG_CALLRET_SP, -0x10);
-#endif
+    if (CallRetStackUsed()) {
+      // The sentinel makes a RET taken inside the callback pop {0,0} and mispredict. Without a
+      // shadow stack there is neither a push nor a pop, so there is nothing to seed.
+      stp<ARMEmitter::IndexType::PRE>(ARMEmitter::XReg::zr, ARMEmitter::XReg::zr, REG_CALLRET_SP, -0x10);
+    }
 
     // Now go back to the regular dispatcher loop
     (void)b(&LoopTop);

@@ -80,16 +80,24 @@ extern "C" uint64_t IosJitReverseTranslate(uint64_t Addr);
 extern "C" uint64_t IosSubfloorToReal(uint64_t Addr);   // ml951
 extern "C" uint64_t IosSubfloorToLow(uint64_t Addr);    // ml951
 extern "C" uint64_t IosSubfloorClipSize(uint64_t LowAddr, uint64_t Size);  // ml951
+/* Defined in FEXCore Dispatcher.cpp; read when the dispatcher is emitted. */
+extern "C" uint32_t IosEcCodeBitMapCached;
+/* PEB->EcCodeBitMap as read in ProcessInit; ThreadInit stores it in every thread's frame. */
+static uint64_t IosEcCodeBitMapValue = 0;
 /* ml316: FFS-bypass diagnostics, written by ExitToX64's bypass path in Module.S:
  * [0] = native short-circuits taken, [1] = last EC target,
  * [2] = FFS matched but target not EC (fell through to emulation), [3] = last such
  * target. Read by the [ffs-bypass] reporter in Core.cpp's CompileBlock. */
 extern "C" uint64_t IosFfsBypassLog[4];
+/* Defined in FEXCore Arm64Emitter.cpp; read when the dispatcher and blocks are emitted. */
+extern "C" uint32_t IosEcReturnWithRet;
 
 /* Raw TSD byte offset (from TPIDRRO_EL0 & ~7) of the slot holding the TEB.
  * Discovered and published by wine's ntdll-unix; imported in ProcessInit.
  * Defined in FEXCore Arm64Emitter.cpp, where the JIT emitters also read it. */
 extern "C" uint32_t IosTebTsdOffset;
+/* Defined in FEXCore Arm64Emitter.cpp; read when the dispatcher and blocks are emitted. */
+extern "C" uint32_t IosCallRetStackElided;
 /* uint32_t, not bool: a 1-byte global here misaligned the adrp/ldr pair
  * lld generates for the neighbouring word ("misaligned ldr/str offset"). */
 static uint32_t IosTebTsdImportFound = 0;
@@ -102,9 +110,17 @@ uint64_t IosFfsBypassLog[4] {};
  *   2112  EC->x64 calls through ExitToX64 (not the FFS bypass), 16 shards
  *   3136  ring index (every 64th x64->EC call of a shard appends its target)
  *   3200  ring[4096] of target addresses (as the x64 caller called them)
+ * ExitFunctionECJit adds its thread's x64->EC calls 64 at a time and rings every
+ * 64th call of the thread instead.
  * Keep in sync with Module.S and build/ntdll-unix/server_ios.c (ios_xp_fex_*). */
 extern "C" __attribute__((aligned(64))) uint64_t IosXpFex[4496];
 __attribute__((aligned(64))) uint64_t IosXpFex[4496] {};
+/* Non-zero when JIT exits use ExitFunctionECJit (Module.S) instead of ExitFunctionEC; set in ProcessInit. */
+static uint32_t IosEcExitLean = 0;
+/* Defined in Module.S and read by RetToEntryThunk: non-zero enters the JIT without testing the EC code
+ * bitmap there. (Kept out of this file's data: another word here shifted a neighbour into a misaligned
+ * adrp/ldr pair at link time.) */
+extern "C" uint32_t IosRetToJit;
 #endif // FEX_IOS_HOST
 
 namespace Exception {
@@ -115,6 +131,9 @@ extern "C" {
 extern IMAGE_DOS_HEADER __ImageBase; // Provided by the linker
 
 extern void* ExitFunctionEC;
+#ifdef FEX_IOS_HOST
+extern void* ExitFunctionECJit;
+#endif
 extern void* CheckCall;
 extern void* ExitFunctionSuspendPoint;
 extern void* ExitFunctionSuspendResumePoint;
@@ -850,6 +869,60 @@ int64_t WriteOffset = 0;
 } // namespace FEXCore::DualMap
 #endif
 
+#ifdef FEX_IOS_HOST
+/* madeira-bcd: smc-store-fastpath v1. On the iOS SMC path (ml657 below) a
+ * plain store, or one FEX already backpatched to DMB + STR, used to enter
+ * HandleUnalignedAccess, which takes the backpatch lock in the code buffer
+ * (a CASAL and a release store into the RX view: two Mach exceptions that
+ * Wine emulates) only to decline with "Unhandled JIT SIGBUS" or to return -4.
+ * Decide those encodings here from the same words, with the same result for
+ * Pc; everything else still goes to HandleUnalignedAccess. The masks are
+ * FEXCore's (Arm64.cpp: LDSTUNSCALED_MASK/STUR_INST, LDSTREGISTER_MASK/
+ * STR_INST, DMB); the build overlay refuses a changed handler. */
+static bool IosSmcFastPath = true;
+
+static bool IosSmcStoreFastPath(FEXCore::Core::InternalThreadState* Thread, ARM64_NT_CONTEXT& Context) {
+  if (!IosSmcFastPath) {
+    return false;
+  }
+  constexpr uint32_t IosStrImmMask = 0x3FC0'0000, IosStrImmInst = 0x3900'0000;  // STR/STRB/STRH Rt, [Xn, #uimm12]
+  constexpr uint32_t IosSturMask = 0x3BE0'0C00, IosSturInst = 0x3800'0000;      // STUR*, including STURB
+  constexpr uint32_t IosStrRegMask = 0x3FFF'FC00, IosStrRegInst = 0x383F'6800;  // STR* [Xn, xzr], the backpatch form
+  constexpr uint32_t IosDmbIsh = 0xD503'3BBF;
+  const auto* Pc = reinterpret_cast<const uint32_t*>(Context.Pc);
+  const uint32_t Instr = __atomic_load_n(&Pc[0], __ATOMIC_ACQUIRE);
+  if ((Instr & IosStrImmMask) == IosStrImmInst) {
+    return true;  // no handler family matches: it declines, Pc unchanged
+  }
+  if ((Instr & IosSturMask) != IosSturInst && (Instr & IosStrRegMask) != IosStrRegInst) {
+    return false;  // an atomic or anything else: unchanged path
+  }
+  if (__atomic_load_n(&Pc[-1], __ATOMIC_ACQUIRE) != IosDmbIsh) {
+    return true;  // declines, or returns 0 for NonAtomic: Pc unchanged either way
+  }
+  if (!CTX->IsAddressInCodeBuffer(Thread, Context.Pc)) {
+    return true;  // the non-JIT path has no case for these: it declines
+  }
+  if (Exception::HandlerConfig->GetUnalignedHandlerType() != FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::NonAtomic) {
+    Context.Pc -= 4;  // backpatched DMB + STR: rerun the half-barrier, as HandleUnalignedAccess returns -4
+  }
+  return true;
+}
+#endif
+
+
+#ifdef FEX_IOS_HOST
+/* madeira-bcd: guest branch history v1. DATA, never a native-callable thunk. */
+/* Keep a word-sized global, matching the module's iOS relocation guards. */
+namespace FEXCore::Core { uint32_t IosGuestBranchTraceEnabled = 0; }
+extern "C" const uint64_t IosGuestBranchTraceLayout[3] = {
+  0x314744454742444dULL,
+  offsetof(FEXCore::Core::CpuStateFrame, IosGuestBranchHistory) |
+    (static_cast<uint64_t>(sizeof(FEXCore::Core::CpuStateFrame)) << 32),
+  sizeof(FEXCore::Core::CpuStateFrame::IosGuestBranchHistoryType) | (8ULL << 32),
+};
+#endif
+
 NTSTATUS ProcessInit() {
   /* iOS-Madeira: DualMap::WriteOffset (RX→RW alias distance) is set below,
    * after InitCRTProcess() populates the environment, and BEFORE InitCore().
@@ -896,6 +969,17 @@ NTSTATUS ProcessInit() {
   FEX::Config::LoadConfig(fextl::string {ExecutableName}, _environ, FEX::ReadPortabilityInformation());
   FEXCore::Config::ReloadMetaLayer();
   FEX::Windows::Logging::Init();
+
+#ifdef FEX_IOS_HOST
+  /* Recorder emitted only for this executable, before CTX/JIT creation. */
+  const auto HistoryName = fextl::string {ExecutableName};
+  const char* HistoryOpt = getenv("MADEIRA_FEX_BRANCH_HISTORY");
+  FEXCore::Core::IosGuestBranchTraceEnabled =
+    _stricmp(HistoryName.c_str(), "Launcher.exe") == 0 && !(HistoryOpt && HistoryOpt[0] == '0');
+  LogMan::Msg::IFmt("FEX: branch-history-v1 madeira-bcd enabled={} exe={}",
+                   FEXCore::Core::IosGuestBranchTraceEnabled != 0, ExecutableName);
+#endif
+
 
 #if defined(FEX_IOS_HOST) && defined(MADEIRA_ARENA_SELFTEST)
   /* Runs only when MADEIRA_ARENA_TEST is set, and only in builds that link the
@@ -999,10 +1083,44 @@ NTSTATUS ProcessInit() {
   {
     auto HostFeatures = FEX::Windows::CPUFeatures::FetchHostFeatures(IsWine, FEXCore::HostFeatures::HostTypeEnum::Arm64ec);
     CTX = FEXCore::Context::Context::CreateNewContext(HostFeatures);
+#ifdef FEX_IOS_HOST
+    /* ExitFunctionECJit (Module.S) leaves out ExitFunctionEC's FPCR test, so it is used only without AFP,
+     * when FEX never sets FPCR.NEP or FPCR.AH. MADEIRA_FEX_EC_EXIT_LEAN=0 keeps ExitFunctionEC. */
+    const char* LeanOpt = getenv("MADEIRA_FEX_EC_EXIT_LEAN");
+    IosEcExitLean = !HostFeatures.SupportsAFP && !(LeanOpt && strcmp(LeanOpt, "0") == 0);
+    LogMan::Msg::IFmt("FEX: ec-exit-lean-v1 madeira-bcd enabled={} afp={}", IosEcExitLean != 0, HostFeatures.SupportsAFP);
+#endif
   }
+
+#ifdef FEX_IOS_HOST
+  {
+    /* PEB->EcCodeBitMap is set when the first ARM64EC image is mapped, before this module loads, and
+     * never moves, so every thread's frame carries it (ThreadInit) and the dispatcher's EC code check
+     * loads it from there. Set before InitCore, which emits the dispatcher.
+     * MADEIRA_FEX_EC_BITMAP_CACHE=0 keeps the TPIDRRO_EL0 -> TEB -> PEB walk. */
+    static_assert(offsetof(__TEB, Peb) == 0x60 && offsetof(__PEB, EcCodeBitMap) == 0x368,
+                  "the TEB_PEB_OFFSET and PEB_EC_CODE_BITMAP_OFFSET the dispatcher walks");
+    const char* BitMapOpt = getenv("MADEIRA_FEX_EC_BITMAP_CACHE");
+    IosEcCodeBitMapValue = reinterpret_cast<uint64_t>(reinterpret_cast<__TEB*>(IOSLoadTEB())->Peb->EcCodeBitMap);
+    IosEcCodeBitMapCached = IosEcCodeBitMapValue && !(BitMapOpt && strcmp(BitMapOpt, "0") == 0);
+    LogMan::Msg::IFmt("FEX: ec-bitmap-cache-v1 madeira-bcd enabled={} map={:#x}", IosEcCodeBitMapCached != 0,
+                      IosEcCodeBitMapValue);
+  }
+#endif
 
   CTX->SetSignalDelegator(SignalDelegator.get());
   CTX->SetSyscallHandler(SyscallHandler.get());
+
+#ifdef FEX_IOS_HOST
+  {
+    /* Guest calls into ARM64EC code leave the JIT with BLR and their returns re-enter it with RET, so the
+     * host return-address predictor stays balanced (IosEcReturnWithRet in Arm64Emitter.h). Set before
+     * InitCore, which emits the dispatcher. MADEIRA_FEX_EC_RET=0 keeps BR and the loop-top re-entry. */
+    const char* EcRetOpt = getenv("MADEIRA_FEX_EC_RET");
+    IosEcReturnWithRet = !(EcRetOpt && strcmp(EcRetOpt, "0") == 0);
+    LogMan::Msg::IFmt("FEX: ec-ret-v1 madeira-bcd enabled={}", IosEcReturnWithRet != 0);
+  }
+#endif
 
 #ifdef FEX_IOS_HOST
   /* Set DualMap::WriteOffset BEFORE InitCore (the dispatcher's emit path
@@ -1052,8 +1170,35 @@ NTSTATUS ProcessInit() {
   }
 #endif
 
+#ifdef FEX_IOS_HOST
+  {
+    /* Nothing on iOS reads the call-ret shadow stack (CallRetStackUsed in Arm64Emitter.h), so the JIT
+     * does not maintain it. Set before InitCore, which emits the dispatcher.
+     * MADEIRA_FEX_CALLRET_ELIDE=0 keeps the stack. */
+    const char* CallRetOpt = getenv("MADEIRA_FEX_CALLRET_ELIDE");
+    IosCallRetStackElided = !(CallRetOpt && strcmp(CallRetOpt, "0") == 0);
+    LogMan::Msg::IFmt("FEX: callret-elide-v1 madeira-bcd enabled={}", IosCallRetStackElided != 0);
+  }
+#endif
   CTX->InitCore();
   Exception::HandlerConfig.emplace(*CTX);
+#ifdef FEX_IOS_HOST
+  {
+    /* RetToEntryThunk (Module.S) enters the JIT without testing the EC code bitmap itself: the loop top
+     * tests it on an L1 miss. MADEIRA_FEX_EC_RET_DIRECT=0 keeps the test in RetToEntryThunk. */
+    const char* RetDirectOpt = getenv("MADEIRA_FEX_EC_RET_DIRECT");
+    IosRetToJit = !(RetDirectOpt && strcmp(RetDirectOpt, "0") == 0);
+    LogMan::Msg::IFmt("FEX: ec-ret-direct-v1 madeira-bcd enabled={}", IosRetToJit != 0);
+  }
+#endif
+#ifdef FEX_IOS_HOST
+  {
+    /* madeira-bcd: smc-store-fastpath v1. MADEIRA_FEX_SMC_FASTPATH=0 restores the locked path. */
+    const char* SmcFastOpt = getenv("MADEIRA_FEX_SMC_FASTPATH");
+    IosSmcFastPath = !(SmcFastOpt && strcmp(SmcFastOpt, "0") == 0);
+    LogMan::Msg::IFmt("FEX: smc-store-fastpath-v1 madeira-bcd enabled={}", IosSmcFastPath);
+  }
+#endif
   InvalidationTracker.emplace(*CTX, Threads);
   ImageTracker.emplace(*CTX, false);
 
@@ -1297,6 +1442,8 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
                               "store (fault {:X}); preserved PC[-1]={:08X} PC[+1]={:08X}; retrying at the same pc",
                               ++Ml1018Count, Ml1018Insn, SmcPc, FaultAddress, Ml1018Pc[-1], Ml1018Pc[1]);
           }
+        } else if (IosSmcStoreFastPath(Thread, *NativeContext)) {
+          /* madeira-bcd: smc-store-fastpath v1: decided without the backpatch lock */
         } else if (Exception::HandleUnalignedAccess(CPUArea, *NativeContext, CTX->IsAddressInCodeBuffer(Thread, SmcPc))) {
           static unsigned SmcAtomicCount;
           if (SmcAtomicCount < 16) {
@@ -1875,6 +2022,10 @@ NTSTATUS ThreadInit() {
 
   Frame->State.cs_idx = FEXCore::Core::CPUState::DEFAULT_USER_CS << 3;
   Frame->State.cs_cached = FEXCore::Core::CPUState::CalculateGDTBase(GDT);
+#ifdef FEX_IOS_HOST
+  // For the dispatcher's EC code check (CpuStateFrame::IosEcCodeBitMap).
+  Frame->IosEcCodeBitMap = IosEcCodeBitMapValue;
+#endif
 
 #ifdef FEX_IOS_HOST
   /* iOS-Madeira: set up GS base for x86_64 TLS access. On Windows x64 the
@@ -1943,7 +2094,18 @@ NTSTATUS ThreadInit() {
 #ifdef FEX_IOS_HOST
   IosTiLog("[FEX-iOS] TI:callret\n");
 #endif
+#ifdef FEX_IOS_HOST
+  static_assert(offsetof(FEXCore::Core::CpuStateFrame, SuspendDoorbell) == 1512, "IOS_FRAME_SUSPEND_DOORBELL in Module.S");
+  static_assert(offsetof(FEXCore::Core::CpuStateFrame, IosCpuArea) == 4080, "IOS_FRAME_CPU_AREA in Module.S");
+  static_assert(offsetof(FEXCore::Core::CpuStateFrame, IosXpCallCount) == 4088, "IOS_FRAME_XP_COUNT in Module.S");
+  static_assert(offsetof(FEXCore::Core::CpuStateFrame, IosAliasHint) == 4096, "IOS_FRAME_ALIAS_HINT in Module.S");
+  // ExitFunctionECJit reads the CPU area from the frame; the doorbell it reads is the frame's own
+  // SuspendDoorbell, which CPUArea.Area->SuspendDoorbell points at (set below).
+  Thread->CurrentFrame->IosCpuArea = reinterpret_cast<uint64_t>(CPUArea.Area);
+  Thread->CurrentFrame->Pointers.ExitFunctionEC = reinterpret_cast<uintptr_t>(IosEcExitLean ? &ExitFunctionECJit : &ExitFunctionEC);
+#else
   Thread->CurrentFrame->Pointers.ExitFunctionEC = reinterpret_cast<uintptr_t>(&ExitFunctionEC);
+#endif
   CPUArea.StateFrame() = Thread->CurrentFrame;
 
   uint64_t EnterEC = Thread->CurrentFrame->Pointers.DispatcherLoopTopEnterEC;

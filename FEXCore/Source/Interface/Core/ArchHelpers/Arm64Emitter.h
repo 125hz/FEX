@@ -107,6 +107,14 @@ constexpr size_t CPU_AREA_EMULATOR_DATA_OFFSET = 0x30;
 // before any code is emitted. It is zero until then, and emitting a read
 // against zero is a bug, not a fallback -- see the check at its import site.
 extern "C" uint32_t IosTebTsdOffset;
+
+// Keeps the host return-address predictor balanced across guest calls into ARM64EC code. The indirect
+// CALL path reaches such a callee through the dispatcher with BLR (an ARM64EC target never hits L1),
+// while the callee's return re-entered the JIT through the loop top with BR, so every such call left an
+// entry behind that later guest RETs were predicted from. When set, the direct CALL path leaves with BLR
+// as well and EnterEC enters an L1 hit with RET: each call pushes one entry and its return pops it.
+// Set by the frontend before the dispatcher is emitted; 0 keeps BR and the loop-top re-entry.
+extern "C" uint32_t IosEcReturnWithRet;
 #endif
 
 constexpr uint64_t EC_CODE_BITMAP_MAX_ADDRESS = 1ULL << 47;
@@ -146,6 +154,26 @@ constexpr auto REG_GUEST_ADDR_TMP = ARMEmitter::XReg::x24;
 // CALL, the known-call marker Arm64JITCore::ExitFunctionLink reads to relink the callsite as `bl`.
 #if defined(FEX_IOS_HOST) && !defined(ARCHITECTURE_arm64ec)
 #define FEX_CALLRET_STACK_UNUSED 1
+#endif
+
+// The iOS ARM64EC module does not read the shadow stack either: the RET-side shortcut is compiled out
+// on iOS and EnterEC branches straight to the loop top instead of popping it. Its pushes and pops only
+// maintain a structure nothing reads, so the frontend may elide them before the dispatcher is emitted
+// (IosCallRetStackElided != 0 selects the FEX_CALLRET_STACK_UNUSED sequence at emission time; 0 keeps
+// the shadow stack byte for byte).
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+extern "C" uint32_t IosCallRetStackElided;
+inline bool CallRetStackUsed() {
+  return IosCallRetStackElided == 0;
+}
+#elif defined(FEX_CALLRET_STACK_UNUSED)
+constexpr bool CallRetStackUsed() {
+  return false;
+}
+#else
+constexpr bool CallRetStackUsed() {
+  return true;
+}
 #endif
 
 // Will force one single instruction block to be generated first if set when entering the JIT filling SRA.
