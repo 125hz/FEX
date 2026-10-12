@@ -10,6 +10,7 @@ $end_info$
 #include "Interface/Core/LookupCache.h"
 
 #include "Interface/Core/JIT/JITClass.h"
+#include "Interface/Core/JIT/DebugData.h"
 
 #include <FEXCore/Core/Thunks.h>
 #include <FEXCore/Core/X86Enums.h>
@@ -45,6 +46,36 @@ DEF_OP(CallbackReturn) {
 
 DEF_OP(ExitFunction) {
   auto Op = IROp->C<IR::IROp_ExitFunction>();
+
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+  /* madeira-bcd: guest branch history v1. Executed exits, not a stack scan.
+   * Reserved TMP1-3 only; ADD/AND/loads/stores leave guest NZCV untouched.
+   * Save the real target and the last mapped guest opcode; commit Serial last. */
+  if (FEXCore::Core::IosGuestBranchTraceEnabled) {
+    using Frame = FEXCore::Core::CpuStateFrame;
+    constexpr auto History = offsetof(Frame, IosGuestBranchHistory);
+    constexpr auto Edges = History + offsetof(Frame::IosGuestBranchHistoryType, Edges);
+    ldr(TMP2, STATE, History + 8);
+    and_(ARMEmitter::Size::i64Bit, TMP3, TMP2, 7);
+    add(TMP3, STATE, TMP3, ARMEmitter::ShiftType::LSL, 5);
+    uint64_t Target;
+    if (IsInlineConstant(Op->NewRIP, &Target) || IsInlineEntrypointOffset(Op->NewRIP, &Target)) {
+      InsertGuestRIPMove(TMP1, Target);
+      str(TMP1, TMP3, Edges + 8);
+    } else {
+      str(GetReg(Op->NewRIP).X(), TMP3, Edges + 8);
+    }
+    const uint64_t Source = DebugData->GuestOpcodes.empty() ? 0 : Entry + DebugData->GuestOpcodes.back().GuestEntryOffset;
+    InsertGuestRIPMove(TMP1, Source);
+    str(TMP1, TMP3, Edges);
+    ldr(TMP1, STATE, offsetof(Frame, State.InlineJITBlockHeader));
+    str(TMP1, TMP3, Edges + 16);
+    movz(ARMEmitter::Size::i64Bit, TMP1, static_cast<uint64_t>(Op->Hint));
+    str(TMP1, TMP3, Edges + 24);
+    add(ARMEmitter::Size::i64Bit, TMP2, TMP2, 1);
+    str(TMP2, STATE, History + 8);
+  }
+#endif
 
   ResetStack();
 

@@ -850,6 +850,19 @@ int64_t WriteOffset = 0;
 } // namespace FEXCore::DualMap
 #endif
 
+
+#ifdef FEX_IOS_HOST
+/* madeira-bcd: guest branch history v1. DATA, never a native-callable thunk. */
+/* Keep a word-sized global, matching the module's iOS relocation guards. */
+namespace FEXCore::Core { uint32_t IosGuestBranchTraceEnabled = 0; }
+extern "C" const uint64_t IosGuestBranchTraceLayout[3] = {
+  0x314744454742444dULL,
+  offsetof(FEXCore::Core::CpuStateFrame, IosGuestBranchHistory) |
+    (static_cast<uint64_t>(sizeof(FEXCore::Core::CpuStateFrame)) << 32),
+  sizeof(FEXCore::Core::CpuStateFrame::IosGuestBranchHistoryType) | (8ULL << 32),
+};
+#endif
+
 NTSTATUS ProcessInit() {
   /* iOS-Madeira: DualMap::WriteOffset (RX→RW alias distance) is set below,
    * after InitCRTProcess() populates the environment, and BEFORE InitCore().
@@ -896,6 +909,17 @@ NTSTATUS ProcessInit() {
   FEX::Config::LoadConfig(fextl::string {ExecutableName}, _environ, FEX::ReadPortabilityInformation());
   FEXCore::Config::ReloadMetaLayer();
   FEX::Windows::Logging::Init();
+
+#ifdef FEX_IOS_HOST
+  /* Recorder emitted only for this executable, before CTX/JIT creation. */
+  const auto HistoryName = fextl::string {ExecutableName};
+  const char* HistoryOpt = getenv("MADEIRA_FEX_BRANCH_HISTORY");
+  FEXCore::Core::IosGuestBranchTraceEnabled =
+    _stricmp(HistoryName.c_str(), "Launcher.exe") == 0 && !(HistoryOpt && HistoryOpt[0] == '0');
+  LogMan::Msg::IFmt("FEX: branch-history-v1 madeira-bcd enabled={} exe={}",
+                   FEXCore::Core::IosGuestBranchTraceEnabled != 0, ExecutableName);
+#endif
+
 
 #if defined(FEX_IOS_HOST) && defined(MADEIRA_ARENA_SELFTEST)
   /* Runs only when MADEIRA_ARENA_TEST is set, and only in builds that link the

@@ -482,7 +482,22 @@ struct CpuStateFrame {
    * offline. That makes the real bug "the dispatcher is being entered at the wrong address", of
    * which the State.rip corruption is only the visible consequence. */
   uint64_t IosLastCallbackLR {};
+
+  /* madeira-bcd: guest branch history v1. Appended after all existing fields;
+   * no implicit TLS, and no architectural or prebuilt ntdll offsets move. */
+  struct IosGuestBranchHistoryType {
+    uint64_t Magic {0x314744454742444dULL};
+    uint64_t Serial {};
+    struct Edge { uint64_t Source, Target, Block, Hint; } Edges[8] {};
+  } IosGuestBranchHistory {};
 };
+
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+extern uint32_t IosGuestBranchTraceEnabled;
+static_assert(sizeof(CpuStateFrame::IosGuestBranchHistoryType) == 272);
+static_assert(offsetof(CpuStateFrame, IosGuestBranchHistory) % 8 == 0);
+static_assert(offsetof(CpuStateFrame, IosGuestBranchHistory) + 272 <= 32760);
+#endif
 static_assert(offsetof(CpuStateFrame, State) == 0, "CPUState must be first member in CpuStateFrame");
 static_assert(offsetof(CpuStateFrame, Pointers) % 8 == 0, "JITPointers need to be aligned to 8 bytes");
 static_assert(offsetof(CpuStateFrame, Pointers) + sizeof(CpuStateFrame::Pointers) <= 32760, "JITPointers maximum pointer needs to be less "
