@@ -35,6 +35,14 @@
   and \reg, \reg, #~7
   ldr \reg, [\reg, #0x898]
 .endm
+
+// Read by RetToEntryThunk below; ARM64EC/Module.cpp sets it at process init.
+.data
+.balign 8
+.globl IosRetToJit
+IosRetToJit:
+  .word 0
+.text
 #endif
 
   // __os_arm64x_x64_jump in ARM64EC docs
@@ -49,6 +57,14 @@ DispatchJump:
 .globl RetToEntryThunk
 RetToEntryThunk:
   mov x9, lr
+#ifdef FEX_IOS_HOST
+  // An entry thunk returns to the x64 caller of its function. Enter the JIT at once: the dispatcher
+  // tests the EC code bitmap at the loop top on an L1 miss, and an ARM64EC address is never in L1.
+  // IosRetToJit is set at process init; 0 keeps the test here.
+  adrp x16, IosRetToJit
+  ldr w16, [x16, #:lo12:IosRetToJit]
+  cbnz w16, enter_jit
+#endif
 
 check_target_ec:
   // Check if target is in fact x86 code

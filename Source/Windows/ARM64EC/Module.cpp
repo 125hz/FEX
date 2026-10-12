@@ -117,6 +117,10 @@ extern "C" __attribute__((aligned(64))) uint64_t IosXpFex[4496];
 __attribute__((aligned(64))) uint64_t IosXpFex[4496] {};
 /* Non-zero when JIT exits use ExitFunctionECJit (Module.S) instead of ExitFunctionEC; set in ProcessInit. */
 static uint32_t IosEcExitLean = 0;
+/* Defined in Module.S and read by RetToEntryThunk: non-zero enters the JIT without testing the EC code
+ * bitmap there. (Kept out of this file's data: another word here shifted a neighbour into a misaligned
+ * adrp/ldr pair at link time.) */
+extern "C" uint32_t IosRetToJit;
 #endif // FEX_IOS_HOST
 
 namespace Exception {
@@ -1178,6 +1182,15 @@ NTSTATUS ProcessInit() {
 #endif
   CTX->InitCore();
   Exception::HandlerConfig.emplace(*CTX);
+#ifdef FEX_IOS_HOST
+  {
+    /* RetToEntryThunk (Module.S) enters the JIT without testing the EC code bitmap itself: the loop top
+     * tests it on an L1 miss. MADEIRA_FEX_EC_RET_DIRECT=0 keeps the test in RetToEntryThunk. */
+    const char* RetDirectOpt = getenv("MADEIRA_FEX_EC_RET_DIRECT");
+    IosRetToJit = !(RetDirectOpt && strcmp(RetDirectOpt, "0") == 0);
+    LogMan::Msg::IFmt("FEX: ec-ret-direct-v1 madeira-bcd enabled={}", IosRetToJit != 0);
+  }
+#endif
 #ifdef FEX_IOS_HOST
   {
     /* madeira-bcd: smc-store-fastpath v1. MADEIRA_FEX_SMC_FASTPATH=0 restores the locked path. */
