@@ -411,10 +411,13 @@ void BTCpu64IosAddAliasMapping(uint64_t PeBase, uint64_t JitBase, uint64_t Size)
     /* ml1106: a silent refusal here means ExitFunctionEC never translates this
      * image, so EVERY x64->EC call into it pays a Mach exec-fault redirect
      * (ph-rdr59: 69k of every 100k redirects were one kernelbase export). */
-    static int said = 0;
-    if (said++ < 8) {
-      LogMan::Msg::EFmt("[jit-alias] ml1106 IosAliasEntries FULL ({} entries): image 0x{:x}+0x{:x} NOT registered -- its calls will fault-redirect", count, PeBase, Size);
-    }
+    /* madeira-bcd: no logging here -- this runs inside unix-side syscalls
+     * (ios_jit_add_mapping, the alias drain), and LogMan output is a nested
+     * unix call that corrupted the running syscall's frame (gta-2237:
+     * RockstarService died at pc == its syscall frame). Count only
+     * (tools/patch-fex-ios-alias-full-quiet.py). */
+    static uint64_t refused = 0;
+    __atomic_fetch_add(&refused, 1, __ATOMIC_RELAXED);
     return;
   }
   g_Entries[count].PeBase = PeBase;
