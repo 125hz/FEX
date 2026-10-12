@@ -28,6 +28,10 @@
 // ARM64EC/Module.cpp at process init. See IosTebTsdOffset in Arm64Emitter.h.
 extern "C" uint32_t IosTebTsdOffset = 0;
 #endif
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+// Set by ARM64EC/Module.cpp before the dispatcher is emitted. See CallRetStackUsed in Arm64Emitter.h.
+extern "C" uint32_t IosCallRetStackElided = 0;
+#endif
 
 namespace FEXCore::CPU {
 
@@ -777,9 +781,9 @@ void Arm64Emitter::SpillStaticRegs(ARMEmitter::Register TmpReg, SpillStaticRegOp
   unsigned PFAFSpillMask = Options.GPRSpillMask & PFAFMask;
   Options.GPRSpillMask &= ~PFAFSpillMask;
 
-#ifndef FEX_CALLRET_STACK_UNUSED
-  str(REG_CALLRET_SP, STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
-#endif
+  if (CallRetStackUsed()) {
+    str(REG_CALLRET_SP, STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
+  }
 
   for (size_t i = 0; i < StaticRegisters.size(); i += 2) {
     auto Reg1 = StaticRegisters[i];
@@ -884,9 +888,9 @@ void Arm64Emitter::FillStaticRegs(FillStaticRegOptions Options) {
   ldr(STATE, TmpReg, CPU_AREA_EMULATOR_DATA_OFFSET);
 #endif
 
-#ifndef FEX_CALLRET_STACK_UNUSED
-  ldr(REG_CALLRET_SP, STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
-#endif
+  if (CallRetStackUsed()) {
+    ldr(REG_CALLRET_SP, STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
+  }
 
 #ifdef FEX_GUEST_WINDOW
   // No-op unless a guest window is configured.

@@ -178,7 +178,9 @@ void Dispatcher::EmitDispatcher() {
   add(ARMEmitter::Size::i64Bit, StaticRegisters[X86State::REG_RSP], ARMEmitter::Reg::rsp, 0);
   add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, TMP1, 0);
 
-  ldr(REG_CALLRET_SP, STATE_PTR(CpuStateFrame, State.callret_sp));
+  if (CallRetStackUsed()) {
+    ldr(REG_CALLRET_SP, STATE_PTR(CpuStateFrame, State.callret_sp));
+  }
 
   FillSpecialRegs(TMP1, TMP2, false, true);
 
@@ -242,7 +244,9 @@ void Dispatcher::EmitDispatcher() {
   lsrv(ARMEmitter::Size::i64Bit, TMP1, TMP1, TMP2);
   (void)tbz(TMP1, 0, &l_NotECCode);
 
-  str(REG_CALLRET_SP, STATE_PTR(CpuStateFrame, State.callret_sp));
+  if (CallRetStackUsed()) {
+    str(REG_CALLRET_SP, STATE_PTR(CpuStateFrame, State.callret_sp));
+  }
 
   add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, StaticRegisters[X86State::REG_RSP], 0);
   mov(EC_CALL_CHECKER_PC_REG, RipReg);
@@ -707,7 +711,7 @@ void Dispatcher::EmitDispatcher() {
     // ARM64EC reloads x17 from State.callret_sp. If State has drifted OOB
     // (e.g. underflow during prior dispatch), reset before stp to avoid
     // writing the sentinel into JIT code memory.
-    {
+    if (CallRetStackUsed()) {
       ARMEmitter::ForwardLabel l_callret_ok;
       ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp_base));
       sub(ARMEmitter::Size::i64Bit, TMP1, REG_CALLRET_SP, TMP1);
@@ -718,11 +722,11 @@ void Dispatcher::EmitDispatcher() {
       (void)Bind(&l_callret_ok);
     }
 #endif
-#ifndef FEX_CALLRET_STACK_UNUSED
-    // The sentinel makes a RET taken inside the callback pop {0,0} and mispredict. Without a
-    // shadow stack there is neither a push nor a pop, so there is nothing to seed.
-    stp<ARMEmitter::IndexType::PRE>(ARMEmitter::XReg::zr, ARMEmitter::XReg::zr, REG_CALLRET_SP, -0x10);
-#endif
+    if (CallRetStackUsed()) {
+      // The sentinel makes a RET taken inside the callback pop {0,0} and mispredict. Without a
+      // shadow stack there is neither a push nor a pop, so there is nothing to seed.
+      stp<ARMEmitter::IndexType::PRE>(ARMEmitter::XReg::zr, ARMEmitter::XReg::zr, REG_CALLRET_SP, -0x10);
+    }
 
     // Now go back to the regular dispatcher loop
     (void)b(&LoopTop);

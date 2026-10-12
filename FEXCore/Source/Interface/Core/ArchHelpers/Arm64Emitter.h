@@ -148,6 +148,26 @@ constexpr auto REG_GUEST_ADDR_TMP = ARMEmitter::XReg::x24;
 #define FEX_CALLRET_STACK_UNUSED 1
 #endif
 
+// The iOS ARM64EC module does not read the shadow stack either: the RET-side shortcut is compiled out
+// on iOS and EnterEC branches straight to the loop top instead of popping it. Its pushes and pops only
+// maintain a structure nothing reads, so the frontend may elide them before the dispatcher is emitted
+// (IosCallRetStackElided != 0 selects the FEX_CALLRET_STACK_UNUSED sequence at emission time; 0 keeps
+// the shadow stack byte for byte).
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+extern "C" uint32_t IosCallRetStackElided;
+inline bool CallRetStackUsed() {
+  return IosCallRetStackElided == 0;
+}
+#elif defined(FEX_CALLRET_STACK_UNUSED)
+constexpr bool CallRetStackUsed() {
+  return false;
+}
+#else
+constexpr bool CallRetStackUsed() {
+  return true;
+}
+#endif
+
 // Will force one single instruction block to be generated first if set when entering the JIT filling SRA.
 // FillStaticRegs must preserve this
 constexpr auto ENTRY_FILL_SRA_SINGLE_INST_REG = TMP2;

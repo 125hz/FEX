@@ -90,6 +90,8 @@ extern "C" uint64_t IosFfsBypassLog[4];
  * Discovered and published by wine's ntdll-unix; imported in ProcessInit.
  * Defined in FEXCore Arm64Emitter.cpp, where the JIT emitters also read it. */
 extern "C" uint32_t IosTebTsdOffset;
+/* Defined in FEXCore Arm64Emitter.cpp; read when the dispatcher and blocks are emitted. */
+extern "C" uint32_t IosCallRetStackElided;
 /* uint32_t, not bool: a 1-byte global here misaligned the adrp/ldr pair
  * lld generates for the neighbouring word ("misaligned ldr/str offset"). */
 static uint32_t IosTebTsdImportFound = 0;
@@ -1117,6 +1119,16 @@ NTSTATUS ProcessInit() {
   }
 #endif
 
+#ifdef FEX_IOS_HOST
+  {
+    /* Nothing on iOS reads the call-ret shadow stack (CallRetStackUsed in Arm64Emitter.h), so the JIT
+     * does not maintain it. Set before InitCore, which emits the dispatcher.
+     * MADEIRA_FEX_CALLRET_ELIDE=0 keeps the stack. */
+    const char* CallRetOpt = getenv("MADEIRA_FEX_CALLRET_ELIDE");
+    IosCallRetStackElided = !(CallRetOpt && strcmp(CallRetOpt, "0") == 0);
+    LogMan::Msg::IFmt("FEX: callret-elide-v1 madeira-bcd enabled={}", IosCallRetStackElided != 0);
+  }
+#endif
   CTX->InitCore();
   Exception::HandlerConfig.emplace(*CTX);
 #ifdef FEX_IOS_HOST
