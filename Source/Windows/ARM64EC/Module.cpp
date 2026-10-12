@@ -80,6 +80,10 @@ extern "C" uint64_t IosJitReverseTranslate(uint64_t Addr);
 extern "C" uint64_t IosSubfloorToReal(uint64_t Addr);   // ml951
 extern "C" uint64_t IosSubfloorToLow(uint64_t Addr);    // ml951
 extern "C" uint64_t IosSubfloorClipSize(uint64_t LowAddr, uint64_t Size);  // ml951
+/* Defined in FEXCore Dispatcher.cpp; read when the dispatcher is emitted. */
+extern "C" uint32_t IosEcCodeBitMapCached;
+/* PEB->EcCodeBitMap as read in ProcessInit; ThreadInit stores it in every thread's frame. */
+static uint64_t IosEcCodeBitMapValue = 0;
 /* ml316: FFS-bypass diagnostics, written by ExitToX64's bypass path in Module.S:
  * [0] = native short-circuits taken, [1] = last EC target,
  * [2] = FFS matched but target not EC (fell through to emulation), [3] = last such
@@ -1070,6 +1074,22 @@ NTSTATUS ProcessInit() {
     CTX = FEXCore::Context::Context::CreateNewContext(HostFeatures);
   }
 
+#ifdef FEX_IOS_HOST
+  {
+    /* PEB->EcCodeBitMap is set when the first ARM64EC image is mapped, before this module loads, and
+     * never moves, so every thread's frame carries it (ThreadInit) and the dispatcher's EC code check
+     * loads it from there. Set before InitCore, which emits the dispatcher.
+     * MADEIRA_FEX_EC_BITMAP_CACHE=0 keeps the TPIDRRO_EL0 -> TEB -> PEB walk. */
+    static_assert(offsetof(__TEB, Peb) == 0x60 && offsetof(__PEB, EcCodeBitMap) == 0x368,
+                  "the TEB_PEB_OFFSET and PEB_EC_CODE_BITMAP_OFFSET the dispatcher walks");
+    const char* BitMapOpt = getenv("MADEIRA_FEX_EC_BITMAP_CACHE");
+    IosEcCodeBitMapValue = reinterpret_cast<uint64_t>(reinterpret_cast<__TEB*>(IOSLoadTEB())->Peb->EcCodeBitMap);
+    IosEcCodeBitMapCached = IosEcCodeBitMapValue && !(BitMapOpt && strcmp(BitMapOpt, "0") == 0);
+    LogMan::Msg::IFmt("FEX: ec-bitmap-cache-v1 madeira-bcd enabled={} map={:#x}", IosEcCodeBitMapCached != 0,
+                      IosEcCodeBitMapValue);
+  }
+#endif
+
   CTX->SetSignalDelegator(SignalDelegator.get());
   CTX->SetSyscallHandler(SyscallHandler.get());
 
@@ -1942,6 +1962,10 @@ NTSTATUS ThreadInit() {
 
   Frame->State.cs_idx = FEXCore::Core::CPUState::DEFAULT_USER_CS << 3;
   Frame->State.cs_cached = FEXCore::Core::CPUState::CalculateGDTBase(GDT);
+#ifdef FEX_IOS_HOST
+  // For the dispatcher's EC code check (CpuStateFrame::IosEcCodeBitMap).
+  Frame->IosEcCodeBitMap = IosEcCodeBitMapValue;
+#endif
 
 #ifdef FEX_IOS_HOST
   /* iOS-Madeira: set up GS base for x86_64 TLS access. On Windows x64 the

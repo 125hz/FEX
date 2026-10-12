@@ -39,6 +39,12 @@
 #include <bit>
 #include <cstring>
 
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+// Set by ARM64EC/Module.cpp before the dispatcher is emitted, once every thread's frame carries
+// PEB->EcCodeBitMap (CpuStateFrame::IosEcCodeBitMap): the loop top's EC code check loads it from there.
+extern "C" uint32_t IosEcCodeBitMapCached = 0;
+#endif
+
 namespace FEXCore::CPU {
 
 static void SleepThread(FEXCore::Context::ContextImpl* CTX, FEXCore::Core::CpuStateFrame* Frame) {
@@ -245,15 +251,21 @@ void Dispatcher::EmitDispatcher() {
   // Check the EC code bitmap incase we need to exit the JIT to call into native code.
   ARMEmitter::ForwardLabel l_NotECCode;
 #ifdef FEX_IOS_HOST
-  // iOS clobbers x18 — read TEB from TPIDRRO_EL0+TSD slot 275 instead.
-  mrs(TMP1, ARMEmitter::SystemRegister::TPIDRRO_EL0);
-  and_(ARMEmitter::Size::i64Bit, TMP1, TMP1, ~7ULL);
-  ldr(TMP1, TMP1, IosTebTsdOffset);
-  ldr(TMP1, TMP1, TEB_PEB_OFFSET);
+  if (IosEcCodeBitMapCached) {
+    // PEB->EcCodeBitMap as stored in this thread's frame: one load instead of the TEB/PEB walk below.
+    ldr(TMP1, STATE_PTR(CpuStateFrame, IosEcCodeBitMap));
+  } else {
+    // iOS clobbers x18 — read TEB from TPIDRRO_EL0+TSD slot 275 instead.
+    mrs(TMP1, ARMEmitter::SystemRegister::TPIDRRO_EL0);
+    and_(ARMEmitter::Size::i64Bit, TMP1, TMP1, ~7ULL);
+    ldr(TMP1, TMP1, IosTebTsdOffset);
+    ldr(TMP1, TMP1, TEB_PEB_OFFSET);
+    ldr(TMP1, TMP1, PEB_EC_CODE_BITMAP_OFFSET);
+  }
 #else
   ldr(TMP1, ARMEmitter::XReg::x18, TEB_PEB_OFFSET);
-#endif
   ldr(TMP1, TMP1, PEB_EC_CODE_BITMAP_OFFSET);
+#endif
 
   lsr(ARMEmitter::Size::i64Bit, TMP2, RipReg, 18);
   ldr(TMP1, TMP1, TMP2, ARMEmitter::ExtendedType::LSL_64, 3);

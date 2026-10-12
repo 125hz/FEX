@@ -490,6 +490,12 @@ struct CpuStateFrame {
     uint64_t Serial {};
     struct Edge { uint64_t Source, Target, Block, Hint; } Edges[8] {};
   } IosGuestBranchHistory {};
+
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+  // PEB->EcCodeBitMap for the dispatcher's EC code check, stored by the frontend at thread init. The
+  // pointer does not change once the first ARM64EC image is mapped, before any thread enters the JIT.
+  uint64_t IosEcCodeBitMap {};
+#endif
 };
 
 #if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
@@ -497,6 +503,8 @@ extern uint32_t IosGuestBranchTraceEnabled;
 static_assert(sizeof(CpuStateFrame::IosGuestBranchHistoryType) == 272);
 static_assert(offsetof(CpuStateFrame, IosGuestBranchHistory) % 8 == 0);
 static_assert(offsetof(CpuStateFrame, IosGuestBranchHistory) + 272 <= 32760);
+static_assert(offsetof(CpuStateFrame, IosEcCodeBitMap) % 8 == 0 && offsetof(CpuStateFrame, IosEcCodeBitMap) <= 32760,
+              "IosEcCodeBitMap is loaded with a scaled LDR");
 #endif
 static_assert(offsetof(CpuStateFrame, State) == 0, "CPUState must be first member in CpuStateFrame");
 static_assert(offsetof(CpuStateFrame, Pointers) % 8 == 0, "JITPointers need to be aligned to 8 bytes");
