@@ -1526,6 +1526,39 @@ NTSTATUS NotifyMapViewOfSection(void* Unk1, void* Address, void* Unk2, SIZE_T Si
     return STATUS_SUCCESS;
   }
 
+  /* madeira-bcd: self-shared map notification (tools/patch-fex-ios-mapview-selfshared.py).
+   * A thread executing translated code holds CodeInvalidationMutex SHARED; the
+   * ImageTracker half of HandleImageMap would take it EXCLUSIVELY and wait on
+   * itself forever (no read-to-write upgrade) with wine's loader lock held.
+   * Register the intervals only, as NotifyImageMap does, in that case. */
+  if (CTX) {
+    uint64_t Teb = 0;
+    __asm__ volatile("mov %0, x18" : "=r"(Teb));
+    const uint64_t Stamp = CTX->GetCodeInvalidationMutex().IosStampAddress();
+    auto SelfShared = [Stamp](uint64_t T) {
+      return T && *reinterpret_cast<const uint32_t*>(T + 0x16f0) != 0 &&
+             *reinterpret_cast<const uint64_t*>(T + 0x16f8) == Stamp;
+    };
+#ifdef FEX_IOS_HOST
+    const uint64_t TebTsd = reinterpret_cast<uint64_t>(IOSLoadTEB());
+#else
+    const uint64_t TebTsd = 0;
+#endif
+    if (SelfShared(Teb) || (TebTsd != Teb && SelfShared(TebTsd))) {
+      static std::atomic<uint32_t> Skips {0};
+      const auto N = ++Skips;
+      fextl::string ModulePath = FEX::Windows::GetSectionFilePath(reinterpret_cast<uint64_t>(Address));
+      fextl::string ModuleName = fextl::string {FEX::Windows::BaseName(ModulePath)};
+      InvalidationTracker->HandleImageMap(ModuleName, reinterpret_cast<uint64_t>(Address));
+      if (N <= 32) {
+        LogMan::Msg::EFmt("[img-map] madeira-bcd #{} {} base={}: thread holds the code-invalidation mutex "
+                          "shared -- intervals only, no ImageTracker (would wait on itself)",
+                          N, ModuleName, Address);
+      }
+      return STATUS_SUCCESS;
+    }
+  }
+
   {
     std::scoped_lock Lock(ThreadCreationMutex);
     HandleImageMap(reinterpret_cast<uint64_t>(Address));
