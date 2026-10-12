@@ -54,6 +54,22 @@ IosAliasEntry* volatile IosAliasLast = nullptr;
 namespace {
 IosAliasEntry* const g_Entries = IosAliasEntries;
 volatile int& g_EntryCount = IosAliasCount;
+
+/* The lowest JitBase and the highest JitBase + Size of any entry ever added, widened before the entry
+ * is published and never narrowed: an address outside them is in no entry, so IosJitReverseTranslate
+ * answers it without walking the table (every block lookup the dispatcher misses asks it). */
+uint64_t g_JitLow = ~0ULL;
+uint64_t g_JitHigh = 0;
+
+void WidenJitBounds(uint64_t JitBase, uint64_t Size) {
+  uint64_t Low = __atomic_load_n(&g_JitLow, __ATOMIC_RELAXED);
+  while (JitBase < Low && !__atomic_compare_exchange_n(&g_JitLow, &Low, JitBase, true, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+  }
+  uint64_t High = __atomic_load_n(&g_JitHigh, __ATOMIC_RELAXED);
+  while (JitBase + Size > High &&
+         !__atomic_compare_exchange_n(&g_JitHigh, &High, JitBase + Size, true, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+  }
+}
 }  // namespace
 
 extern "C" {
@@ -382,6 +398,8 @@ void BTCpu64IosAddAliasMapping(uint64_t PeBase, uint64_t JitBase, uint64_t Size)
     }
   }
 
+  WidenJitBounds(JitBase, Size);
+
   // Retire every entry whose PE range overlaps the incoming image: a live
   // image proves any overlapping entry is dead (two images cannot share a VA).
   for (int i = 0; i < count; i++) {
@@ -443,6 +461,9 @@ uint64_t IosJitTranslate(uint64_t Addr) {
 }
 
 uint64_t IosJitReverseTranslate(uint64_t Addr) {
+  if (Addr < __atomic_load_n(&g_JitLow, __ATOMIC_ACQUIRE) || Addr >= __atomic_load_n(&g_JitHigh, __ATOMIC_ACQUIRE)) {
+    return Addr;
+  }
   int count = g_EntryCount;
   for (int i = 0; i < count; i++) {
     uint64_t jb = g_Entries[i].JitBase;
