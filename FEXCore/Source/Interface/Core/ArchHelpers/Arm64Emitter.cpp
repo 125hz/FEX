@@ -23,6 +23,11 @@
 #include <tuple>
 #include <utility>
 
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+// Set by ARM64EC/Module.cpp before the dispatcher is emitted. See IosEcReturnWithRet in Arm64Emitter.h.
+extern "C" uint32_t IosEcReturnWithRet = 0;
+#endif
+
 #ifdef FEX_IOS_HOST
 // Published by wine's ntdll (data export `ios_teb_tsd_offset`), imported in
 // ARM64EC/Module.cpp at process init. See IosTebTsdOffset in Arm64Emitter.h.

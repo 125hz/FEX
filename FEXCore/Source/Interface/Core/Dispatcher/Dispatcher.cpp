@@ -197,7 +197,24 @@ void Dispatcher::EmitDispatcher() {
    * DllMain at unix_calls=4523 (same shape as the dispatcher-guard regression
    * in feedback_fex_dispatcher_guard_regression.md). Reverted. The host-PC
    * leak needs a different angle. */
-  (void)b(&LoopTop);
+  if (IosEcReturnWithRet) {
+    // An L1 hit is a block compiled for this address, never ARM64EC code: enter it with RET, which pops the
+    // predictor entry the guest CALL pushed when it left the JIT with BLR. The trap flag, a miss and an
+    // ARM64EC target (never in L1) take the loop top as before.
+    ldrb(TMP1, STATE_PTR(CpuStateFrame, State.flags[X86State::RFLAG_TF_RAW_LOC]));
+    (void)cbnz(ARMEmitter::Size::i32Bit, TMP1, &LoopTop);
+    ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
+    and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, EC_CALL_CHECKER_PC_REG, ARMEmitter::ShiftType::LSL,
+         FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+    add(TMP1, TMP1, TMP2);
+    ldp<ARMEmitter::IndexType::OFFSET>(TMP4, TMP2, TMP1, 0);
+    sub(TMP2, TMP2, EC_CALL_CHECKER_PC_REG);
+    (void)cbnz(ARMEmitter::Size::i64Bit, TMP2, &LoopTop);
+    (void)cbz(ARMEmitter::Size::i64Bit, TMP4, &LoopTop);
+    ret(TMP4);
+  } else {
+    (void)b(&LoopTop);
+  }
 #else
   // As ARM64EC uses this as an entrypoint for both guest calls and host returns, opportunistically try to return
   // using the call-ret stack to avoid unbalancing it.

@@ -85,6 +85,8 @@ extern "C" uint64_t IosSubfloorClipSize(uint64_t LowAddr, uint64_t Size);  // ml
  * [2] = FFS matched but target not EC (fell through to emulation), [3] = last such
  * target. Read by the [ffs-bypass] reporter in Core.cpp's CompileBlock. */
 extern "C" uint64_t IosFfsBypassLog[4];
+/* Defined in FEXCore Arm64Emitter.cpp; read when the dispatcher and blocks are emitted. */
+extern "C" uint32_t IosEcReturnWithRet;
 
 /* Raw TSD byte offset (from TPIDRRO_EL0 & ~7) of the slot holding the TEB.
  * Discovered and published by wine's ntdll-unix; imported in ProcessInit.
@@ -1070,6 +1072,17 @@ NTSTATUS ProcessInit() {
 
   CTX->SetSignalDelegator(SignalDelegator.get());
   CTX->SetSyscallHandler(SyscallHandler.get());
+
+#ifdef FEX_IOS_HOST
+  {
+    /* Guest calls into ARM64EC code leave the JIT with BLR and their returns re-enter it with RET, so the
+     * host return-address predictor stays balanced (IosEcReturnWithRet in Arm64Emitter.h). Set before
+     * InitCore, which emits the dispatcher. MADEIRA_FEX_EC_RET=0 keeps BR and the loop-top re-entry. */
+    const char* EcRetOpt = getenv("MADEIRA_FEX_EC_RET");
+    IosEcReturnWithRet = !(EcRetOpt && strcmp(EcRetOpt, "0") == 0);
+    LogMan::Msg::IFmt("FEX: ec-ret-v1 madeira-bcd enabled={}", IosEcReturnWithRet != 0);
+  }
+#endif
 
 #ifdef FEX_IOS_HOST
   /* Set DualMap::WriteOffset BEFORE InitCore (the dispatcher's emit path

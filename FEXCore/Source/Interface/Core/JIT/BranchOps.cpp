@@ -118,7 +118,17 @@ DEF_OP(ExitFunction) {
       add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, StaticRegisters[X86State::REG_RSP], 0);
       InsertGuestRIPMove(EC_CALL_CHECKER_PC_REG, NewRIP);
       ldr(TMP2, STATE_PTR(CpuStateFrame, Pointers.ExitFunctionEC));
+#ifdef FEX_IOS_HOST
+      if (Op->Hint == IR::BranchHint::Call && IosEcReturnWithRet) {
+        // Push the return-address predictor entry the RET in EnterEC pops (IosEcReturnWithRet in
+        // Arm64Emitter.h). ExitFunctionEC loads LR itself on every path that uses it.
+        blr(TMP2);
+      } else {
+        br(TMP2);
+      }
+#else
       br(TMP2);
+#endif
     } else {
 #endif
       // In order to support direct branches without constantly hitting the L1 cache, we emit a call to a block linker,

@@ -107,6 +107,14 @@ constexpr size_t CPU_AREA_EMULATOR_DATA_OFFSET = 0x30;
 // before any code is emitted. It is zero until then, and emitting a read
 // against zero is a bug, not a fallback -- see the check at its import site.
 extern "C" uint32_t IosTebTsdOffset;
+
+// Keeps the host return-address predictor balanced across guest calls into ARM64EC code. The indirect
+// CALL path reaches such a callee through the dispatcher with BLR (an ARM64EC target never hits L1),
+// while the callee's return re-entered the JIT through the loop top with BR, so every such call left an
+// entry behind that later guest RETs were predicted from. When set, the direct CALL path leaves with BLR
+// as well and EnterEC enters an L1 hit with RET: each call pushes one entry and its return pops it.
+// Set by the frontend before the dispatcher is emitted; 0 keeps BR and the loop-top re-entry.
+extern "C" uint32_t IosEcReturnWithRet;
 #endif
 
 constexpr uint64_t EC_CODE_BITMAP_MAX_ADDRESS = 1ULL << 47;
