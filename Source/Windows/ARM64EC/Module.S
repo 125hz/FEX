@@ -262,6 +262,71 @@ BeginSimulation:
   mov x11, #0 // Zero ENTRY_FILL_SRA_SINGLE_INST_REG to avoid single step
   br x16 // DispatcherLoopTopEnterECFillSRA(SingleInst:x10, CPUArea:x17)
 
+#ifdef FEX_IOS_HOST
+// FEXCore::Core::CpuStateFrame offsets read below; ARM64EC/Module.cpp checks them with static_asserts.
+#define IOS_FRAME_SUSPEND_DOORBELL 1512
+#define IOS_FRAME_CPU_AREA 4080
+#define IOS_FRAME_XP_COUNT 4088
+#define IOS_FRAME_ALIAS_HINT 4096
+
+  // ExitFunctionEC for exits from JIT code, where x28 is this thread's CpuStateFrame; installed as
+  // Pointers.ExitFunctionEC when AFP is off, so FPCR.NEP and FPCR.AH are never set and there is
+  // nothing to clear. The CPU area and the suspend doorbell come from the frame, the x64->EC call
+  // is counted per thread and added to IosXpFex 64 at a time (each 64th target goes to the ring),
+  // and the alias lookup starts at this thread's last hit. Same contract and clobbers as
+  // ExitFunctionEC, whose tail it shares.
+.global ExitFunctionECJit
+ExitFunctionECJit:
+  ldr x16, [x28, #IOS_FRAME_XP_COUNT]
+  add x16, x16, #1
+  str x16, [x28, #IOS_FRAME_XP_COUNT]
+  tst x16, #63
+  b.ne 2f
+  adrp x16, IosXpFex
+  add x16, x16, #:lo12:IosXpFex
+  mov x23, sp
+  ubfx x23, x23, #16, #4
+  add x17, x16, x23, lsl #6
+  add x17, x17, #64
+  mov x4, #64
+  stadd x4, [x17]
+  add x17, x16, #3136
+  mov x4, #1
+  ldadd x4, x23, [x17]
+  and x23, x23, #4095
+  add x17, x16, #3200
+  str x9, [x17, x23, lsl #3]
+2:
+  ldr x17, [x28, #IOS_FRAME_CPU_AREA]
+  strb wzr, [x17, #0x0] // ChpeV2CpuAreaInfo->InSimulation
+  ldr w17, [x28, #IOS_FRAME_SUSPEND_DOORBELL] // *ChpeV2CpuAreaInfo->SuspendDoorbell
+  cbnz w17, ExitFunctionSuspendPoint
+  ldr x16, [x28, #IOS_FRAME_ALIAS_HINT]
+  cbz x16, ios_ec_jit_xlate_walk
+  ldr x23, [x16]        // Entry.PeBase
+  sub x23, x9, x23
+  ldr x4, [x16, #16]    // Entry.Size
+  cmp x23, x4
+  b.lo ios_ec_xlate_hit
+ios_ec_jit_xlate_walk:
+  adrp x17, IosAliasCount
+  ldr w17, [x17, #:lo12:IosAliasCount]
+  adrp x16, IosAliasEntries
+  add x16, x16, #:lo12:IosAliasEntries
+  add x16, x16, x17, lsl #5   // one past the last entry
+ios_ec_jit_xlate_loop:
+  cbz w17, ios_ec_xlate_done
+  sub x16, x16, #32
+  sub w17, w17, #1
+  ldr x23, [x16]        // Entry.PeBase
+  sub x23, x9, x23
+  ldr x4, [x16, #16]    // Entry.Size
+  cmp x23, x4
+  b.hs ios_ec_jit_xlate_loop
+  str x16, [x28, #IOS_FRAME_ALIAS_HINT]
+  b ios_ec_xlate_hit
+#endif
+
   // Called into by FEXCore
   // Expects the target code address in x9
 .global ExitFunctionEC

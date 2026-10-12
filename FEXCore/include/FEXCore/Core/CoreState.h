@@ -496,6 +496,15 @@ struct CpuStateFrame {
   // pointer does not change once the first ARM64EC image is mapped, before any thread enters the JIT.
   uint64_t IosEcCodeBitMap {};
 #endif
+
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+  // Read by ExitFunctionECJit in ARM64EC/Module.S at fixed offsets (checked in ARM64EC/Module.cpp): this
+  // thread's ChpeV2CpuAreaInfo, its x64 -> ARM64EC calls not yet added to IosXpFex, and the alias table
+  // entry its last translation used.
+  uint64_t IosCpuArea {};
+  uint64_t IosXpCallCount {};
+  uint64_t IosAliasHint {};
+#endif
 };
 
 #if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)

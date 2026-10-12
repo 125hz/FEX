@@ -110,9 +110,13 @@ uint64_t IosFfsBypassLog[4] {};
  *   2112  EC->x64 calls through ExitToX64 (not the FFS bypass), 16 shards
  *   3136  ring index (every 64th x64->EC call of a shard appends its target)
  *   3200  ring[4096] of target addresses (as the x64 caller called them)
+ * ExitFunctionECJit adds its thread's x64->EC calls 64 at a time and rings every
+ * 64th call of the thread instead.
  * Keep in sync with Module.S and build/ntdll-unix/server_ios.c (ios_xp_fex_*). */
 extern "C" __attribute__((aligned(64))) uint64_t IosXpFex[4496];
 __attribute__((aligned(64))) uint64_t IosXpFex[4496] {};
+/* Non-zero when JIT exits use ExitFunctionECJit (Module.S) instead of ExitFunctionEC; set in ProcessInit. */
+static uint32_t IosEcExitLean = 0;
 #endif // FEX_IOS_HOST
 
 namespace Exception {
@@ -123,6 +127,9 @@ extern "C" {
 extern IMAGE_DOS_HEADER __ImageBase; // Provided by the linker
 
 extern void* ExitFunctionEC;
+#ifdef FEX_IOS_HOST
+extern void* ExitFunctionECJit;
+#endif
 extern void* CheckCall;
 extern void* ExitFunctionSuspendPoint;
 extern void* ExitFunctionSuspendResumePoint;
@@ -1072,6 +1079,13 @@ NTSTATUS ProcessInit() {
   {
     auto HostFeatures = FEX::Windows::CPUFeatures::FetchHostFeatures(IsWine, FEXCore::HostFeatures::HostTypeEnum::Arm64ec);
     CTX = FEXCore::Context::Context::CreateNewContext(HostFeatures);
+#ifdef FEX_IOS_HOST
+    /* ExitFunctionECJit (Module.S) leaves out ExitFunctionEC's FPCR test, so it is used only without AFP,
+     * when FEX never sets FPCR.NEP or FPCR.AH. MADEIRA_FEX_EC_EXIT_LEAN=0 keeps ExitFunctionEC. */
+    const char* LeanOpt = getenv("MADEIRA_FEX_EC_EXIT_LEAN");
+    IosEcExitLean = !HostFeatures.SupportsAFP && !(LeanOpt && strcmp(LeanOpt, "0") == 0);
+    LogMan::Msg::IFmt("FEX: ec-exit-lean-v1 madeira-bcd enabled={} afp={}", IosEcExitLean != 0, HostFeatures.SupportsAFP);
+#endif
   }
 
 #ifdef FEX_IOS_HOST
@@ -2034,7 +2048,18 @@ NTSTATUS ThreadInit() {
 #ifdef FEX_IOS_HOST
   IosTiLog("[FEX-iOS] TI:callret\n");
 #endif
+#ifdef FEX_IOS_HOST
+  static_assert(offsetof(FEXCore::Core::CpuStateFrame, SuspendDoorbell) == 1512, "IOS_FRAME_SUSPEND_DOORBELL in Module.S");
+  static_assert(offsetof(FEXCore::Core::CpuStateFrame, IosCpuArea) == 4080, "IOS_FRAME_CPU_AREA in Module.S");
+  static_assert(offsetof(FEXCore::Core::CpuStateFrame, IosXpCallCount) == 4088, "IOS_FRAME_XP_COUNT in Module.S");
+  static_assert(offsetof(FEXCore::Core::CpuStateFrame, IosAliasHint) == 4096, "IOS_FRAME_ALIAS_HINT in Module.S");
+  // ExitFunctionECJit reads the CPU area from the frame; the doorbell it reads is the frame's own
+  // SuspendDoorbell, which CPUArea.Area->SuspendDoorbell points at (set below).
+  Thread->CurrentFrame->IosCpuArea = reinterpret_cast<uint64_t>(CPUArea.Area);
+  Thread->CurrentFrame->Pointers.ExitFunctionEC = reinterpret_cast<uintptr_t>(IosEcExitLean ? &ExitFunctionECJit : &ExitFunctionEC);
+#else
   Thread->CurrentFrame->Pointers.ExitFunctionEC = reinterpret_cast<uintptr_t>(&ExitFunctionEC);
+#endif
   CPUArea.StateFrame() = Thread->CurrentFrame;
 
   uint64_t EnterEC = Thread->CurrentFrame->Pointers.DispatcherLoopTopEnterEC;
