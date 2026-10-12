@@ -161,6 +161,10 @@ private:
   bool CountSMCWriteFault(uint64_t Page);
   // Forgets hot pages in [Begin, End) when their memory is freed.
   void ForgetHotSMCPages(uint64_t Begin, uint64_t End);
+
+  // MADEIRA: locks CodeInvalidationMutex exclusively unless this thread already write-owns it.
+  // Returns whether it locked; the caller unlocks only then.
+  bool LockCodeInvalidationUnlessHeld(const char* Path, uint64_t Address);
   static constexpr size_t HotFaultSlots = 64;
   static constexpr size_t MaxHotPages = 64;
   struct HotFaultSlot {
