@@ -850,6 +850,47 @@ int64_t WriteOffset = 0;
 } // namespace FEXCore::DualMap
 #endif
 
+#ifdef FEX_IOS_HOST
+/* madeira-bcd: smc-store-fastpath v1. On the iOS SMC path (ml657 below) a
+ * plain store, or one FEX already backpatched to DMB + STR, used to enter
+ * HandleUnalignedAccess, which takes the backpatch lock in the code buffer
+ * (a CASAL and a release store into the RX view: two Mach exceptions that
+ * Wine emulates) only to decline with "Unhandled JIT SIGBUS" or to return -4.
+ * Decide those encodings here from the same words, with the same result for
+ * Pc; everything else still goes to HandleUnalignedAccess. The masks are
+ * FEXCore's (Arm64.cpp: LDSTUNSCALED_MASK/STUR_INST, LDSTREGISTER_MASK/
+ * STR_INST, DMB); the build overlay refuses a changed handler. */
+static bool IosSmcFastPath = true;
+
+static bool IosSmcStoreFastPath(FEXCore::Core::InternalThreadState* Thread, ARM64_NT_CONTEXT& Context) {
+  if (!IosSmcFastPath) {
+    return false;
+  }
+  constexpr uint32_t IosStrImmMask = 0x3FC0'0000, IosStrImmInst = 0x3900'0000;  // STR/STRB/STRH Rt, [Xn, #uimm12]
+  constexpr uint32_t IosSturMask = 0x3BE0'0C00, IosSturInst = 0x3800'0000;      // STUR*, including STURB
+  constexpr uint32_t IosStrRegMask = 0x3FFF'FC00, IosStrRegInst = 0x383F'6800;  // STR* [Xn, xzr], the backpatch form
+  constexpr uint32_t IosDmbIsh = 0xD503'3BBF;
+  const auto* Pc = reinterpret_cast<const uint32_t*>(Context.Pc);
+  const uint32_t Instr = __atomic_load_n(&Pc[0], __ATOMIC_ACQUIRE);
+  if ((Instr & IosStrImmMask) == IosStrImmInst) {
+    return true;  // no handler family matches: it declines, Pc unchanged
+  }
+  if ((Instr & IosSturMask) != IosSturInst && (Instr & IosStrRegMask) != IosStrRegInst) {
+    return false;  // an atomic or anything else: unchanged path
+  }
+  if (__atomic_load_n(&Pc[-1], __ATOMIC_ACQUIRE) != IosDmbIsh) {
+    return true;  // declines, or returns 0 for NonAtomic: Pc unchanged either way
+  }
+  if (!CTX->IsAddressInCodeBuffer(Thread, Context.Pc)) {
+    return true;  // the non-JIT path has no case for these: it declines
+  }
+  if (Exception::HandlerConfig->GetUnalignedHandlerType() != FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::NonAtomic) {
+    Context.Pc -= 4;  // backpatched DMB + STR: rerun the half-barrier, as HandleUnalignedAccess returns -4
+  }
+  return true;
+}
+#endif
+
 
 #ifdef FEX_IOS_HOST
 /* madeira-bcd: guest branch history v1. DATA, never a native-callable thunk. */
@@ -1078,6 +1119,14 @@ NTSTATUS ProcessInit() {
 
   CTX->InitCore();
   Exception::HandlerConfig.emplace(*CTX);
+#ifdef FEX_IOS_HOST
+  {
+    /* madeira-bcd: smc-store-fastpath v1. MADEIRA_FEX_SMC_FASTPATH=0 restores the locked path. */
+    const char* SmcFastOpt = getenv("MADEIRA_FEX_SMC_FASTPATH");
+    IosSmcFastPath = !(SmcFastOpt && strcmp(SmcFastOpt, "0") == 0);
+    LogMan::Msg::IFmt("FEX: smc-store-fastpath-v1 madeira-bcd enabled={}", IosSmcFastPath);
+  }
+#endif
   InvalidationTracker.emplace(*CTX, Threads);
   ImageTracker.emplace(*CTX, false);
 
@@ -1321,6 +1370,8 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
                               "store (fault {:X}); preserved PC[-1]={:08X} PC[+1]={:08X}; retrying at the same pc",
                               ++Ml1018Count, Ml1018Insn, SmcPc, FaultAddress, Ml1018Pc[-1], Ml1018Pc[1]);
           }
+        } else if (IosSmcStoreFastPath(Thread, *NativeContext)) {
+          /* madeira-bcd: smc-store-fastpath v1: decided without the backpatch lock */
         } else if (Exception::HandleUnalignedAccess(CPUArea, *NativeContext, CTX->IsAddressInCodeBuffer(Thread, SmcPc))) {
           static unsigned SmcAtomicCount;
           if (SmcAtomicCount < 16) {
