@@ -399,6 +399,8 @@ struct JITPointers {
 };
 
 // Each guest JIT frame has one of these
+constexpr uint32_t IosBlockRingEntries = 4096;   /* ml1205, power of two */
+
 struct CpuStateFrame {
   CPUState State;
 
@@ -482,6 +484,12 @@ struct CpuStateFrame {
    * offline. That makes the real bug "the dispatcher is being entered at the wrong address", of
    * which the State.rip corruption is only the visible consequence. */
   uint64_t IosLastCallbackLR {};
+
+  /* iOS-Madeira ml1205: per-thread ring of executed block-entry RIPs, on when
+   * MADEIRA_BLOCK_RING is set. ring[0] is the next index, ring[1..N] the entries;
+   * null when the ring is off. Published to the thread's TEB at 0x1710 (the
+   * ActivityId field, unused by Wine) so the fault reporters can dump it. */
+  uint64_t* IosBlockRing {};
 };
 static_assert(offsetof(CpuStateFrame, State) == 0, "CPUState must be first member in CpuStateFrame");
 static_assert(offsetof(CpuStateFrame, Pointers) % 8 == 0, "JITPointers need to be aligned to 8 bytes");
