@@ -1106,7 +1106,9 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
         CodeData.EntryPoints.emplace(BlockStartRIP, GetCursorAddress<uint8_t*>());
         DebugData->GuestOpcodes.push_back({BlockIROp->GuestEntryOffset, GetCursorAddress<uint8_t*>() - CodeData.BlockBegin});
 
-        IosRingEntryRIP = BlockStartRIP;   /* ml1205 */
+        /* ml1206: the high 16 bits carry the bytes left in this translation from the block start, so the
+         * dump can print the whole block (guest addresses stay below 2^48). */
+        IosRingEntryRIP = BlockStartRIP | (std::min<uint64_t>(Entry + Size - BlockStartRIP, 0xffff) << 48);   /* ml1205 */
         EmitEntryPoint(JITCodeHeaderLabel, CheckTF);
         // [iOS-Madeira] verbose EmitEntryPoint-done log suppressed
       }
