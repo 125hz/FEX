@@ -547,7 +547,7 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
     }
     // IntervalsLock cannot be held during invalidation
     {
-      std::scoped_lock Lock(CTX.GetCodeInvalidationMutex());
+      const bool Locked = LockCodeInvalidationUnlessHeld("write-fault", FaultAddress);
 
       InvalidateIntervalInternalLocked(FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE);
 
@@ -556,6 +556,9 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
       void* TmpAddress = reinterpret_cast<void*>(FaultAddress);
       SIZE_T TmpSize = 1;
       NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, UntrapProt, &TmpProt);
+      if (Locked) {
+        CTX.GetCodeInvalidationMutex().unlock();
+      }
     }
     DetectMonoBackpatcherBlock(Thread, HostPc);
     return true;
@@ -863,9 +866,43 @@ ULONG InvalidationTracker::GetUntrapProt(uint64_t Address) const {
   return PAGE_EXECUTE_READWRITE;
 }
 
+/* MADEIRA: CodeInvalidationMutex is not recursive. When this thread already write-owns it, a second
+ * exclusive lock parks the thread behind itself, and every other thread queues behind it for good
+ * (log 56: one thread waiting on the lock it held, a second one behind it, no further progress). A
+ * write owner already has exclusive access, so these invalidations run under the hold it has.
+ * MADEIRA_INVALIDATION_NESTED=0 restores the plain lock. */
+static bool NestedInvalidationAllowed() {
+  static const bool Allowed = [] {
+    const char* Value = getenv("MADEIRA_INVALIDATION_NESTED");
+    return !(Value && Value[0] == '0');
+  }();
+  return Allowed;
+}
+
+bool InvalidationTracker::LockCodeInvalidationUnlessHeld(const char* Path, uint64_t Address) {
+  auto& CodeMutex = CTX.GetCodeInvalidationMutex();
+  if (NestedInvalidationAllowed() && CodeMutex.IosHeldExclusiveByThisThread()) {
+    static std::atomic<uint32_t> NestedCount {0};
+    const auto N = NestedCount.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (N <= 16 || (N % 4096) == 0) {
+      const uint64_t* Ra = CodeMutex.IosOwnerReturnAddresses();
+      LogMan::Msg::EFmt("[inval-nested] #{} {} {:#x}: this thread already holds the code invalidation lock, taken at "
+                        "ra={:x} {:x} {:x} {:x}, here={:x} anchor={:x} (MADEIRA_INVALIDATION_NESTED=0 disables)",
+                        N, Path, Address, Ra ? Ra[0] : 0, Ra ? Ra[1] : 0, Ra ? Ra[2] : 0, Ra ? Ra[3] : 0,
+                        reinterpret_cast<uint64_t>(__builtin_return_address(0)), reinterpret_cast<uint64_t>(&NestedInvalidationAllowed));
+    }
+    return false;
+  }
+  CodeMutex.lock();
+  return true;
+}
+
 void InvalidationTracker::InvalidateIntervalInternal(uint64_t Address, uint64_t Size) {
-  std::scoped_lock CodeLock(CTX.GetCodeInvalidationMutex());
+  const bool Locked = LockCodeInvalidationUnlessHeld("invalidate", Address);
   InvalidateIntervalInternalLocked(Address, Size);
+  if (Locked) {
+    CTX.GetCodeInvalidationMutex().unlock();
+  }
 }
 
 void InvalidationTracker::InvalidateIntervalInternalLocked(uint64_t Address, uint64_t Size) {
