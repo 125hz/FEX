@@ -387,10 +387,13 @@ void BTCpu64IosAddAliasMapping(uint64_t PeBase, uint64_t JitBase, uint64_t Size)
   for (int i = 0; i < count; i++) {
     const uint64_t pb = g_Entries[i].PeBase;
     const uint64_t sz = g_Entries[i].Size;
+    const uint64_t jb = g_Entries[i].JitBase;
     if (!sz) {
       continue;
     }
-    if (pb < PeBase + Size && PeBase < pb + sz) {
+    /* madeira-bcd: a reused JIT range retires the dead entry too
+     * (tools/patch-fex-ios-alias-retire-jit.py). */
+    if ((pb < PeBase + Size && PeBase < pb + sz) || (jb < JitBase + Size && JitBase < jb + sz)) {
       g_Entries[i].Size = 0;
       __sync_synchronize();
     }
