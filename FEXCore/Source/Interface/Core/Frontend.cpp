@@ -151,6 +151,9 @@ std::pair<uint64_t, bool> Decoder::ReadData(uint8_t Size) {
     ReadByte();
   }
 #else
+  if (InstructionSize + Size <= MAX_INST_SIZE) {
+    std::memcpy(&Instruction[InstructionSize], &Res, Size);
+  }
   SkipBytes(Size);
 #endif
 
@@ -673,6 +676,7 @@ Decoder::DecodedBlockStatus Decoder::NormalOp(const FEXCore::X86Tables::X86InstI
   LOGMAN_THROW_A_FMT(Bytes == 0, "Inst at 0x{:x}: 0x{:04x} '{}' Had an instruction of size {} with {} remaining", DecodeInst->PC,
                      DecodeInst->OP, DecodeInst->TableInfo->Name ?: "UND", InstructionSize, Bytes);
   DecodeInst->InstSize = InstructionSize;
+  std::memcpy(DecodeInst->InstBytes, Instruction.data(), InstructionSize);
   return DecodedBlockStatus::SUCCESS;
 }
 
