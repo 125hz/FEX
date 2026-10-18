@@ -93,6 +93,8 @@ int rpm_cas_snapshot_take(struct rpm_cas_snapshot* out);
 #include <utility>
 #include <xxhash.h>
 
+/* MADEIRA: gated like the HOT RIP probe in CompileBlock, the only user of these globals. */
+#if defined(FEX_IOS_HOST) || !defined(_WIN32)
 /* iOS-Madeira HOTRIP telemetry — plain globals (no constructors/guard vars).
  * 2026-05-14: per-thread callret tracking (GPT diagnosis: FMOD worker
  * thread leaks callret entries; need to confirm WHICH thread leaks and
@@ -116,6 +118,7 @@ static volatile uint64_t g_madeira_thr_crsp_max[4] = {0,0,0,0};
 static volatile uint64_t g_madeira_thr_crsp_last[4] = {0,0,0,0};
 static volatile uint64_t g_madeira_thr_count[4] = {0,0,0,0};
 static volatile uint64_t g_madeira_thr_last_rip[4] = {0,0,0,0};
+#endif
 
 /* iOS-Madeira 2026-05-18 low-noise CompileBlock instrumentation counters. */
 static volatile uint64_t g_cb_total = 0;
@@ -1988,6 +1991,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     }
   }
 
+  /* MADEIRA: the HOT RIP probe below calls time(), which FEX's own Windows CRT (the non-iOS module
+   * link line) does not provide, so those modules are built without it. */
+#if defined(FEX_IOS_HOST) || !defined(_WIN32)
   /* iOS-Madeira 2026-05-14: per-thread callret tracking (runs for EVERY
    * block dispatch, not just hot RIPs). 4-slot hash table keyed by Frame
    * pointer (unique per FEX thread). Identifies WHICH thread is leaking
@@ -2111,6 +2117,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
       }
     }
   }
+#endif
 
   static_cast<ContextImpl*>(Thread->CTX)->SyscallHandler->PreCompile();
 

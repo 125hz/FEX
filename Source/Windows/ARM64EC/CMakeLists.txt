@@ -1,8 +1,16 @@
+# MADEIRA: the iOS-host build exports more: libarm64ecfex_ios.def adds the symbols that only exist under
+# FEX_IOS_HOST, and a .def entry for a symbol that does not exist is a link error.
+if (FEX_IOS_HOST_BUILD)
+  set(ARM64ECFEX_DEF libarm64ecfex_ios.def)
+else()
+  set(ARM64ECFEX_DEF libarm64ecfex.def)
+endif()
+
 add_library(arm64ecfex SHARED
   Module.cpp
   Module.S
   IosJitAlias.cpp
-  libarm64ecfex.def
+  ${ARM64ECFEX_DEF}
   $<TARGET_OBJECTS:FEXCore_object>)
 
 patch_library_wine(arm64ecfex)

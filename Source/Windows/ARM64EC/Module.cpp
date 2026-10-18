@@ -103,7 +103,7 @@ extern "C" uint32_t IosCallRetStackElided;
 static uint32_t IosTebTsdImportFound = 0;
 uint64_t IosFfsBypassLog[4] {};
 /* ml1131: transition probe, written by Module.S and read by wine's ntdll-unix
- * sampler through this DATA export (libarm64ecfex.def). Layout in bytes:
+ * sampler through this DATA export (libarm64ecfex_ios.def). Layout in bytes:
  *   0     magic 'MADXPFEX' (set in ProcessInit)
  *   64    x64->EC calls, 16 shards x 64 bytes (shard = bits 16..19 of sp), LSE add
  *   1088  FPCR writes actually performed in ExitFunctionEC, 16 shards
@@ -694,6 +694,7 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
   Args->Context = StoreStateToPackedECContext(Thread, Context.Fpcr, Context.Fpsr);
   LogMan::Msg::DFmt("pc: {:X} rip: {:X}", Context.Pc, Args->Context.Pc);
 
+#ifdef FEX_IOS_HOST
   // ml341: same gap as #52 but on the exception path — the reconstructed rip can be a
   // module POOL-COPY alias (block metadata predating the CompileBlock redirect, or a
   // branch target captured mid-lookup). Handing a pool-band rip to KiUserExceptionDispatcher
@@ -709,6 +710,7 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
       Args->Context.Pc = PeRip;
     }
   }
+#endif
 
   // X64 Windows always clears TF, DF and AF when handling an exception, restoring after.
   // Current ARM64EC windows can only restore NZCV+SS when returning from an exception and other flags are left untouched from the handler context.
@@ -2079,10 +2081,15 @@ NTSTATUS ThreadInit() {
      * a band that just proved it has nothing left to give. The caller releases
      * the loader lock and terminates only this thread, so the process survives
      * to report the failure instead of wedging. */
+#ifdef FEX_IOS_HOST
     LogMan::Msg::EFmt("[FEX-iOS] ThreadInit: call-ret stack unavailable (band [{:#x},{:#x}]) "
                       "-- unwinding thread {:#x} and returning STATUS_NO_MEMORY",
                       (unsigned long long)ios_fex_band_base, (unsigned long long)ios_fex_band_end,
                       (unsigned long long)GetCurrentThreadId());
+#else
+    LogMan::Msg::EFmt("ThreadInit: call-ret stack unavailable -- unwinding thread {:#x} and returning STATUS_NO_MEMORY",
+                      (unsigned long long)GetCurrentThreadId());
+#endif
 
     Frame->State.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_GDT] = nullptr;
     Frame->State.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_LDT] = nullptr;
