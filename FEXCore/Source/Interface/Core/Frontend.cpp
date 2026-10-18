@@ -1341,12 +1341,16 @@ void Decoder::AddBranchTarget(uint64_t Target) {
 
       if (SplitAddr == Target) {
         // Split at the boundary
+        // The tail keeps the block's full SMC detection: a branch to itself (`jmp $`) is the
+        // block's last instruction and its own target, so it always lands in the tail, and the
+        // spin would otherwise never reread the code it waits on.
         DecodedBlocks SplitBlock {
           .Entry = SplitAddr,
           .Size = BlockIt->Size - SplitOffset,
           .NumInstructions = BlockIt->NumInstructions - SplitIdx,
           .DecodedInstructions = BlockIt->DecodedInstructions + SplitIdx,
           .BlockStatus = BlockIt->BlockStatus,
+          .ForceFullSMCDetection = BlockIt->ForceFullSMCDetection,
         };
 
         BlockIt->Size = SplitOffset;
