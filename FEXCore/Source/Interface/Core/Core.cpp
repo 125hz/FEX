@@ -93,7 +93,7 @@ int rpm_cas_snapshot_take(struct rpm_cas_snapshot* out);
 #include <utility>
 #include <xxhash.h>
 
-/* MADEIRA: gated like the HOT RIP probe in CompileBlock, the only user of these globals. */
+/* MADEIRA: gated like the HOT RIP telemetry in CompileBlock, the only user of these globals. */
 #if defined(FEX_IOS_HOST) || !defined(_WIN32)
 /* iOS-Madeira HOTRIP telemetry — plain globals (no constructors/guard vars).
  * 2026-05-14: per-thread callret tracking (GPT diagnosis: FMOD worker
@@ -1992,7 +1992,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   }
 
   /* MADEIRA: the HOT RIP probe below calls time(), which FEX's own Windows CRT (the non-iOS module
-   * link line) does not provide, so those modules are built without it. */
+   * link line) does not provide, so those modules leave out it and the callret tracking it prints. */
 #if defined(FEX_IOS_HOST) || !defined(_WIN32)
   /* iOS-Madeira 2026-05-14: per-thread callret tracking (runs for EVERY
    * block dispatch, not just hot RIPs). 4-slot hash table keyed by Frame
